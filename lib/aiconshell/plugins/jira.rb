@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require "base64"
+require "date"
 require "json"
+require "time"
 require "uri"
 
 module Aiconshell
@@ -21,7 +23,8 @@ module Aiconshell
     class Jira < Base
       plugin_id "jira"
       required_env "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_API_TOKEN_FILE",
-                   "JIRA_SITE_URL", "JIRA_CLOUD_ID", "JIRA_BASE_URL"
+                   "JIRA_SITE_URL", "JIRA_CLOUD_ID", "JIRA_BASE_URL",
+                   "JIRA_SERVICE_ACCOUNT_ID"
 
       operation "latest_events",
                 input_schema: Schemas::LATEST_EVENTS_INPUT,
@@ -40,8 +43,9 @@ module Aiconshell
       RESOURCE_PATTERN = %r{\Aissue:(?<key>[A-Za-z][A-Za-z0-9_]*-\d+)\z}
       SCOPED_HOST = "api.atlassian.com"
       MAX_PAGES = 25
-      MAX_EXPANDED_ISSUES = 50
       PER_PAGE = 50
+      OVERLAP_SECONDS = 300
+      TIMESTAMP_PATTERN = /\A\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\z/
 
       # email + token + exactly one endpoint source (base URL wins, then site,
       # then cloud id).
@@ -64,23 +68,52 @@ module Aiconshell
 
         cursor = validated_cursor(input, "latest_events")
         since = cursor_since(cursor)
+        if project.nil? && since.nil?
+          raise InputInvalid.new(plugin: plugin_id, operation: "latest_events",
+                                 details: ['scope "*" requires cursor.since; use a project scope for an initial import'])
+        end
+        cutoff = since && since - OVERLAP_SECONDS
         base = base_url(ctx.env)
-        allow = [URI.parse(base).host.to_s.downcase]
         headers = auth_headers(ctx.env)
-
-        jql = +""
-        jql << "project = #{project} AND " if project
-        jql << %(updated >= "#{since}" ORDER BY updated ASC) if since
-        jql << "ORDER BY updated ASC" unless since
 
         events = []
         watermark = since
-        page_token = nil
-        page_count = 0
+        # Comment edits need not move the parent issue's updated timestamp.
+        # Scan both partitions, including old issues, before returning a cursor.
+        boundary = cutoff && cutoff.utc.strftime("%Y-%m-%d %H:%M")
+        clauses = boundary ? [%(updated >= "#{boundary}"), %(updated < "#{boundary}")] : [nil]
+        seen_issues = {}
+        clauses.each do |clause|
+          predicates = [project && "project = #{project}", clause].compact
+          jql = [predicates.join(" AND "), "ORDER BY updated ASC"].reject(&:empty?).join(" ")
+          search_issues(ctx, headers, base, jql).each do |issue|
+            unless issue.is_a?(Hash) && RESOURCE_PATTERN.match?("issue:#{issue['key']}") &&
+                   issue["fields"].is_a?(Hash)
+              invalid_output!("Jira issue response had an unexpected shape")
+            end
+            # A concurrently updated issue can appear in both partitions.
+            version = [issue["key"], issue.dig("fields", "updated")]
+            next if seen_issues[version]
 
+            seen_issues[version] = true
+            watermark = emit_issue_events(ctx, headers, base, issue, cutoff, watermark, events)
+          end
+        end
+
+        events.uniq! { |event| [event["event_id"], event["fingerprint"]] }
+        events.sort_by! { |event| parse_timestamp(event["occurred_at"]) }
+        watermark ||= ctx.clock.now
+        { "events" => events, "cursor" => { "since" => timestamp_string(watermark) } }
+      end
+
+      def search_issues(ctx, headers, base, jql)
+        issues = []
+        page_token = nil
+        seen_tokens = {}
+        page_count = 0
         loop do
           body = { "jql" => jql, "maxResults" => PER_PAGE,
-                   "fields" => %w[summary description status comment updated created project],
+                   "fields" => %w[summary description status updated created project],
                    "fieldsByKeys" => false }
           body["nextPageToken"] = page_token if page_token
           response = ctx.transport.request(
@@ -88,85 +121,87 @@ module Aiconshell
             headers: post_headers(headers), body: JSON.generate(body)
           )
           payload = response.json
-          issues = payload.is_a?(Hash) ? payload["issues"] : nil
-          unless issues.is_a?(Array)
-            raise OutputInvalid.new(plugin: plugin_id, operation: "latest_events",
-                                    details: ["Jira /search/jql response had an unexpected shape"])
+          page_issues = payload.is_a?(Hash) ? payload["issues"] : nil
+          unless page_issues.is_a?(Array)
+            invalid_output!("Jira /search/jql response had an unexpected shape")
           end
+          issues.concat(page_issues)
 
-          issues.first(MAX_EXPANDED_ISSUES).each do |issue|
-            watermark = emit_issue_events(ctx, headers, base, allow, issue, since, watermark, events)
+          page_token = payload["nextPageToken"]
+          if page_token.nil? || page_token == ""
+            incomplete!("Jira search omitted the next page token") if payload["isLast"] == false
+            break
           end
-
-          page_token = payload.is_a?(Hash) ? payload["nextPageToken"] : nil
+          invalid_output!("Jira next page token must be a string") unless page_token.is_a?(String)
           page_count += 1
-          break if page_token.nil? || page_token.to_s.empty? || page_count >= MAX_PAGES
+          incomplete!("Jira search exceeded the page limit") if page_count >= MAX_PAGES
+          incomplete!("Jira search pagination did not advance") if seen_tokens[page_token]
+          seen_tokens[page_token] = true
         end
-
-        events.sort_by! { |event| event["occurred_at"].to_s }
-        watermark ||= utc_iso8601(ctx.clock.now)
-        { "events" => events, "cursor" => { "since" => watermark } }
+        issues
       end
 
-      def emit_issue_events(ctx, headers, base, allow, issue, since, watermark, events)
+      def emit_issue_events(ctx, headers, base, issue, cutoff, watermark, events)
         key = issue["key"].to_s
         fields = issue["fields"] || {}
-        updated = fields["updated"].to_s
+        updated = parse_timestamp(fields["updated"])
         summary = fields["summary"].to_s
         description_text = adf_text(fields["description"])
         status = fields.dig("status", "name").to_s
 
         events << {
           "event_id" => "jira:issue:#{key}",
-          "fingerprint" => fingerprint(updated, summary, description_text, status),
+          "fingerprint" => fingerprint(timestamp_string(updated), summary, description_text, status),
           "event_type" => "jira.issue",
           "resource_id" => "issue:#{key}",
           "actor_id" => "unknown",
           "actor_type" => "system",
-          "occurred_at" => updated,
+          "occurred_at" => timestamp_string(updated),
           "payload" => {
             "key" => key, "summary" => summary, "text" => description_text,
             "status" => status, "url" => browse_url(base, key)
           }
-        }
+        } unless cutoff && updated < cutoff
         watermark = max_time(watermark, updated)
 
         comments_url = "#{base}/rest/api/3/issue/#{uri_escape(key)}/comment" \
-                       "?maxResults=#{PER_PAGE}&orderBy=created"
-        paged_get(ctx, headers, comments_url, allow, "comments").each do |comment|
-          cu = (comment["updated"] || comment["created"]).to_s
-          next if since && cu <= since
+                       "?startAt=0&maxResults=#{PER_PAGE}&orderBy=created"
+        paged_get(ctx, headers, comments_url, [base], "comments").each do |comment|
+          invalid_output!("Jira comment had an unexpected shape") unless comment.is_a?(Hash) && present?(comment["id"])
+          cu = parse_timestamp(comment["updated"] || comment["created"])
+          next if cutoff && cu < cutoff
 
           text = adf_text(comment["body"])
           events << {
             "event_id" => "jira:comment:#{comment["id"]}",
-            "fingerprint" => fingerprint(cu, text),
+            "fingerprint" => fingerprint(timestamp_string(cu), text),
             "event_type" => "jira.comment",
             "resource_id" => "issue:#{key}",
-            "actor_id" => jira_actor_id(comment["author"]),
-            "actor_type" => jira_actor_type(comment["author"]),
-            "occurred_at" => cu,
+            "actor_id" => jira_actor_id(comment["updateAuthor"] || comment["author"]),
+            "actor_type" => jira_actor_type(comment["updateAuthor"] || comment["author"]),
+            "occurred_at" => timestamp_string(cu),
             "payload" => { "key" => key, "comment_id" => comment["id"].to_s, "text" => text }
           }
           watermark = max_time(watermark, cu)
         end
 
-        changelog_url = "#{base}/rest/api/3/issue/#{uri_escape(key)}/changelog?maxResults=100"
-        paged_get(ctx, headers, changelog_url, allow, "values").each do |change|
-          created = change["created"].to_s
-          next if since && created <= since
+        changelog_url = "#{base}/rest/api/3/issue/#{uri_escape(key)}/changelog?startAt=0&maxResults=100"
+        paged_get(ctx, headers, changelog_url, [base], "values").each do |change|
+          invalid_output!("Jira changelog had an unexpected shape") unless change.is_a?(Hash) && present?(change["id"])
+          created = parse_timestamp(change["created"])
+          next if cutoff && created < cutoff
 
           items = Array(change["items"]).map do |item|
             "#{item["field"]}:#{item["fromString"]}->#{item["toString"]}"
           end
           events << {
             "event_id" => "jira:changelog:#{issue["id"]}:#{change["id"]}",
-            "fingerprint" => fingerprint(created, items.join(",")),
+            "fingerprint" => fingerprint(timestamp_string(created), items.join(",")),
             "event_type" => "jira.change",
             "resource_id" => "issue:#{key}",
             "actor_id" => jira_actor_id(change["author"]),
             "actor_type" => jira_actor_type(change["author"]),
-            "occurred_at" => created,
+            "occurred_at" => timestamp_string(created),
             "payload" => { "key" => key, "change_id" => change["id"].to_s, "items" => items }
           }
           watermark = max_time(watermark, created)
@@ -232,7 +267,9 @@ module Aiconshell
       def base_url(env)
         missing = []
         missing << "JIRA_EMAIL" unless present?(env["JIRA_EMAIL"])
-        missing << "JIRA_API_TOKEN" unless present?(env["JIRA_API_TOKEN"])
+        unless present?(env["JIRA_API_TOKEN"]) || present?(env["JIRA_API_TOKEN_FILE"])
+          missing << "JIRA_API_TOKEN or JIRA_API_TOKEN_FILE"
+        end
         require_credentials!(missing)
 
         raw = if present?(env["JIRA_BASE_URL"])
@@ -251,7 +288,8 @@ module Aiconshell
         rescue URI::InvalidURIError
           uri = nil
         end
-        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty?
+        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty? &&
+               uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
           raise CredentialsMissing.new(plugin: plugin_id,
                                        missing: ["Jira endpoint must be an https URL"])
         end
@@ -285,34 +323,49 @@ module Aiconshell
 
       # -- paging ---------------------------------------------------------
 
-      # Follow Jira "nextPage" absolute URLs with host validation. Any page
-      # failure raises, so the caller never advances its cursor.
+      # Comments use offset metadata; changelog may also include nextPage.
+      # A short page alone does not prove exhaustion. Never return partial data.
       def paged_get(ctx, headers, first_url, allowed_hosts, collection)
         items = []
         url = first_url
         seen = {}
+        expected_start = 0
         MAX_PAGES.times do
-          break if url.nil?
-          raise InputInvalid.new(plugin: plugin_id, operation: ctx.operation,
-                                 details: ["pagination loop detected"]) if seen[url]
+          incomplete!("Jira pagination did not advance") if seen[url]
 
           seen[url] = true
           response = ctx.transport.request(method: "GET", url: url, headers: headers, body: nil)
           payload = response.json
           page_items = payload.is_a?(Hash) ? payload[collection] : nil
           unless page_items.is_a?(Array)
-            raise OutputInvalid.new(plugin: plugin_id, operation: ctx.operation,
-                                    details: ["Jira paged response had an unexpected shape"])
+            invalid_output!("Jira paged response had an unexpected shape")
           end
-          items.concat(page_items)
 
-          nxt = payload.is_a?(Hash) ? payload["nextPage"] : nil
-          url = (nxt.nil? || nxt.to_s.empty?) ? nil : begin
-            Http.check_host!(nxt.to_s, allowed_hosts)
-            nxt.to_s
+          nxt = payload["nextPage"]
+          Http.check_host!(nxt, allowed_hosts) unless nxt.nil? || nxt == ""
+          start, maximum, total = payload.values_at("startAt", "maxResults", "total")
+          unless [start, maximum, total].all? { |value| value.is_a?(Integer) && value >= 0 }
+            invalid_output!("Jira pagination requires startAt, maxResults, and total")
           end
+          incomplete!("Jira pagination did not advance") unless start == expected_start
+          items.concat(page_items)
+          next_start = start + page_items.length
+          return items if next_start >= total && (nxt.nil? || nxt == "")
+
+          if page_items.empty? || maximum.zero? || payload["isLast"] == true
+            incomplete!("Jira pagination ended before all items were returned")
+          end
+          expected_start = next_start
+          url = if nxt.nil? || nxt == ""
+                  uri = URI.parse(first_url)
+                  query = URI.decode_www_form(uri.query.to_s).to_h
+                  uri.query = URI.encode_www_form(query.merge("startAt" => next_start.to_s))
+                  uri.to_s
+                else
+                  nxt.to_s
+                end
         end
-        items
+        incomplete!("Jira comments or changelog exceeded the page limit")
       end
 
       # -- ADF ------------------------------------------------------------
@@ -380,19 +433,41 @@ module Aiconshell
       end
 
       def cursor_since(cursor)
+        unless (cursor.keys - ["since"]).empty?
+          raise InputInvalid.new(plugin: plugin_id, operation: "latest_events",
+                                 details: ["cursor only supports since; restart incomplete polls from the previous cursor"])
+        end
         since = cursor["since"]
         return nil if since.nil?
-        return since if since.is_a?(String) && !since.empty?
 
-        raise InputInvalid.new(plugin: plugin_id, operation: "latest_events",
-                               details: ["cursor.since must be an ISO8601 string"])
+        parse_timestamp(since, input: true)
       end
 
       def max_time(current, candidate)
-        return candidate if current.nil? || current.empty?
-        return current if candidate.nil? || candidate.empty?
+        current.nil? || candidate > current ? candidate : current
+      end
 
-        candidate > current ? candidate : current
+      def parse_timestamp(value, input: false)
+        raise ArgumentError unless value.is_a?(String) && TIMESTAMP_PATTERN.match?(value)
+
+        Date.iso8601(value[0, 10])
+        Time.iso8601(value).utc
+      rescue ArgumentError
+        error = input ? InputInvalid : OutputInvalid
+        raise error.new(plugin: plugin_id, operation: "latest_events",
+                        details: [input ? "cursor.since must be a valid ISO8601 timestamp" : "Jira returned an invalid timestamp"])
+      end
+
+      def timestamp_string(time)
+        time.utc.iso8601(6).sub(/\.000000Z\z/, "Z")
+      end
+
+      def invalid_output!(reason)
+        raise OutputInvalid.new(plugin: plugin_id, operation: "latest_events", details: [reason])
+      end
+
+      def incomplete!(reason)
+        raise IncompletePoll.new(plugin: plugin_id, operation: "latest_events", reason: reason)
       end
 
       def uri_escape(value)

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
+require "date"
 require "json"
+require "time"
 require "uri"
 
 module Aiconshell
@@ -13,19 +15,17 @@ module Aiconshell
     # Normal posting never uses Graph import/migration endpoints.
     #
     # Poll scope: "team/<teamId>/channel/<channelId>".
-    # latest_events cursor: {"since": ISO8601, "next": optional resume URL}.
-    # Write targets: "conversation/<id>" (bot conversation reference; a Teams
-    # channel id doubles as its channel conversation id) or
-    # "channel/<teamId>/<channelId>". Polled message events carry
-    # resource_id "message/<teamId>/<channelId>/<messageId>" plus payload ids
-    # so the app can correlate them with stored bot conversation references.
+    # latest_events cursor: {"since": ISO8601}. All roots and replies are
+    # traversed before advancing it. Write targets use an actual Bot
+    # conversation reference, or a trusted mapping from a Graph resource id.
     # create_issue is explicitly unsupported: Teams has no issue tracker.
     class Teams < Base
       plugin_id "teams"
       required_env "TEAMS_TENANT_ID", "TEAMS_CLIENT_ID",
                    "TEAMS_CLIENT_SECRET", "TEAMS_CLIENT_SECRET_FILE",
                    "TEAMS_BOT_APP_ID", "TEAMS_BOT_APP_PASSWORD",
-                   "TEAMS_BOT_APP_PASSWORD_FILE", "TEAMS_SERVICE_URL"
+                   "TEAMS_BOT_APP_PASSWORD_FILE", "TEAMS_SERVICE_URL",
+                   "TEAMS_BOT_TARGETS_FILE"
 
       operation "latest_events",
                 input_schema: Schemas::LATEST_EVENTS_INPUT,
@@ -52,10 +52,23 @@ module Aiconshell
       BOT_SCOPE = "https://api.botframework.com/.default"
       SCOPE_PATTERN = %r{\Ateam/(?<team>[^/]+)/channel/(?<channel>[^/]+)\z}
       CONVERSATION_PATTERN = %r{\Aconversation:(?<id>[^/]+)(/(?<activity>.+))?\z}
-      CHANNEL_PATTERN = %r{\Achannel:(?<team>[^/]+)/(?<channel>[^/]+)(/(?<activity>.+))?\z}
+      CHANNEL_PATTERN = %r{\Achannel:(?<team>[^/]+)/(?<channel>[^/]+)\z}
+      MESSAGE_PATTERN = %r{\Amessage:(?<team>[^/]+)/(?<channel>[^/]+)/(?<root>[^/]+)\z}
       MAX_PAGES = 25
-      MAX_EXPANDED_MESSAGES = 50
       PER_PAGE = 50
+      OVERLAP_SECONDS = 300
+      TIMESTAMP_PATTERN = /\A\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\z/
+      BOT_TARGETS_SCHEMA = {
+        "type" => "object",
+        "additionalProperties" => {
+          "type" => "object", "required" => ["conversation_id"],
+          "properties" => {
+            "conversation_id" => { "type" => "string", "minLength" => 1 },
+            "activity_id" => { "type" => "string", "minLength" => 1 }
+          },
+          "additionalProperties" => false
+        }
+      }.freeze
 
       # Read credentials make the plugin usable for polling; write operations
       # additionally require bot credentials + service URL at call time.
@@ -76,119 +89,100 @@ module Aiconshell
 
         cursor = validated_cursor(input, "latest_events")
         since = cursor_since(cursor)
+        cutoff = since && since - OVERLAP_SECONDS
         graph = graph_base(ctx.env)
-        graph_host = URI.parse(graph).host.to_s.downcase
-        # Validate a caller-supplied resume URL before any external I/O so a
-        # hostile cursor can never cause a credentialed request elsewhere.
-        Http.check_host!(cursor["next"].to_s, [graph_host]) if cursor["next"]
         token = app_token(ctx, audience: :graph)
         headers = {
           "Authorization" => "Bearer #{token}",
           "Accept" => "application/json"
         }
 
-        filter = since ? "&$filter=#{uri_escape("lastModifiedDateTime gt #{since}")}" : ""
-        first_url = if cursor["next"]
-                      Http.check_host!(cursor["next"].to_s, [graph_host])
-                      cursor["next"].to_s
-                    else
-                      "#{graph}/v1.0/teams/#{uri_escape(match[:team])}/channels/#{uri_escape(match[:channel])}" \
-                        "/messages?$top=#{PER_PAGE}#{filter}"
-                    end
+        first_url = "#{graph}/v1.0/teams/#{uri_escape(match[:team])}/channels/#{uri_escape(match[:channel])}" \
+                    "/messages?$top=#{PER_PAGE}"
 
         events = []
         watermark = since
-        messages = paged_graph_get(ctx, headers, first_url, [graph_host])
-        messages.first(MAX_EXPANDED_MESSAGES).each do |message|
-          modified = (message["lastModifiedDateTime"] || message["createdDateTime"]).to_s
-          mid = message["id"].to_s
-          events << {
-            "event_id" => "teams:message:#{mid}",
-            "fingerprint" => fingerprint(modified, message.dig("body", "content"),
-                                         message["etag"], message.dig("body", "contentType")),
-            "event_type" => "teams.message",
-            "resource_id" => "message:#{match[:team]}/#{match[:channel]}/#{mid}",
-            "actor_id" => teams_actor_id(message["from"]),
-            "actor_type" => teams_actor_type(message["from"]),
-            "occurred_at" => message["createdDateTime"].to_s,
-            "payload" => {
-              "team_id" => match[:team], "channel_id" => match[:channel],
-              "message_id" => mid, "reply_to_id" => message["replyToId"],
-              "subject" => message["subject"],
-              "content" => message.dig("body", "content"),
-              "content_type" => message.dig("body", "contentType"),
-              "last_modified" => modified,
-              "web_url" => message["webUrl"]
-            }
-          }
+        messages = paged_graph_get(ctx, headers, first_url, [graph])
+        messages.each do |message|
+          event, modified = message_event(message, team: match[:team], channel: match[:channel])
+          mid = event["payload"]["message_id"]
+          events << event unless cutoff && modified < cutoff
           watermark = max_time(watermark, modified)
 
+          # Roots are ordered by their whole reply chain, not by the root's
+          # timestamp. Never stop at an old root: it may have a brand-new reply.
           replies_url =
             "#{graph}/v1.0/teams/#{uri_escape(match[:team])}/channels/#{uri_escape(match[:channel])}" \
-            "/messages/#{uri_escape(mid)}/replies?$top=#{PER_PAGE}#{filter}"
-          paged_graph_get(ctx, headers, replies_url, [graph_host]).each do |reply|
-            rmodified = (reply["lastModifiedDateTime"] || reply["createdDateTime"]).to_s
-            rid = reply["id"].to_s
-            next if since && rmodified <= since
-
-            events << {
-              "event_id" => "teams:reply:#{mid}:#{rid}",
-              "fingerprint" => fingerprint(rmodified, reply.dig("body", "content"), reply["etag"]),
-              "event_type" => "teams.reply",
-              "resource_id" => "message:#{match[:team]}/#{match[:channel]}/#{rid}",
-              "actor_id" => teams_actor_id(reply["from"]),
-              "actor_type" => teams_actor_type(reply["from"]),
-              "occurred_at" => reply["createdDateTime"].to_s,
-              "payload" => {
-                "team_id" => match[:team], "channel_id" => match[:channel],
-                "message_id" => rid, "reply_to_id" => mid,
-                "content" => reply.dig("body", "content"),
-                "content_type" => reply.dig("body", "contentType"),
-                "last_modified" => rmodified,
-                "web_url" => reply["webUrl"]
-              }
-            }
+            "/messages/#{uri_escape(mid)}/replies?$top=#{PER_PAGE}"
+          paged_graph_get(ctx, headers, replies_url, [graph]).each do |reply|
+            reply_event, rmodified = message_event(reply, team: match[:team], channel: match[:channel], root: mid)
+            events << reply_event unless cutoff && rmodified < cutoff
             watermark = max_time(watermark, rmodified)
           end
         end
 
-        events.sort_by! { |event| event["occurred_at"].to_s }
-        watermark ||= utc_iso8601(ctx.clock.now)
-        { "events" => events, "cursor" => { "since" => watermark } }
+        events.uniq! { |event| [event["event_id"], event["fingerprint"]] }
+        events.sort_by! { |event| parse_timestamp(event["occurred_at"]) }
+        watermark ||= ctx.clock.now
+        { "events" => events, "cursor" => { "since" => timestamp_string(watermark) } }
       end
 
       def handle_reply(input, ctx)
-        target = parse_write_target(input["resource_id"].to_s, "reply")
+        target = parse_write_target(input["resource_id"].to_s, "reply", ctx)
         post_activity(ctx, target, input["body"].to_s, "reply")
       end
 
       def handle_send_message(input, ctx)
-        target = parse_write_target(input["scope"].to_s, "send_message")
+        target = parse_write_target(input["scope"].to_s, "send_message", ctx)
         post_activity(ctx, target, input["body"].to_s, "send_message")
       end
 
       # -- writes (Bot Connector) ------------------------------------------
 
-      def parse_write_target(value, operation)
+      def parse_write_target(value, operation, ctx)
         if (match = CONVERSATION_PATTERN.match(value))
           return { conversation_id: match[:id], reply_to: match[:activity] }
         end
-        if (match = CHANNEL_PATTERN.match(value))
-          # A Teams channel id doubles as its channel conversation id.
-          return { conversation_id: match[:channel], reply_to: match[:activity] }
+        message_target = operation == "reply" && MESSAGE_PATTERN.match?(value)
+        if CHANNEL_PATTERN.match?(value) || message_target
+          target = bot_targets(ctx)[value]
+          unless target && (!message_target || present?(target["activity_id"]))
+            require_credentials!(["TEAMS_BOT_TARGETS_FILE or trusted teams_bot_targets mapping for this target"])
+          end
+          return { conversation_id: target["conversation_id"], reply_to: target["activity_id"] }
         end
 
         raise InputInvalid.new(plugin: plugin_id, operation: operation,
                                details: ['target must look like "conversation:<id>" or ' \
-                                         '"channel:<teamId>/<channelId>"'])
+                                         '"channel:<teamId>/<channelId>"; reply also accepts a mapped "message:<teamId>/<channelId>/<rootMessageId>"'])
+      end
+
+      # Only trusted application configuration supplies Bot references. Graph
+      # IDs alone cannot identify an arbitrary Bot conversation or activity.
+      def bot_targets(ctx)
+        targets = ctx.context["teams_bot_targets"] || ctx.context[:teams_bot_targets]
+        if targets.nil?
+          path = ctx.env["TEAMS_BOT_TARGETS_FILE"]
+          require_credentials!(["TEAMS_BOT_TARGETS_FILE or trusted teams_bot_targets mapping"]) unless present?(path)
+          targets = JSON.parse(File.read(path.to_s))
+        end
+        unless Schemas.error_details(BOT_TARGETS_SCHEMA, targets).empty?
+          require_credentials!(["TEAMS_BOT_TARGETS_FILE or teams_bot_targets must contain valid Bot references"])
+        end
+        targets
+      rescue JSON::ParserError, SystemCallError
+        require_credentials!(["TEAMS_BOT_TARGETS_FILE (readable JSON object required)"])
       end
 
       def post_activity(ctx, target, text, operation)
-        service_url, service_host = bot_service(ctx.env)
+        service_url, = bot_service(ctx.env)
         token = app_token(ctx, audience: :bot)
         url = "#{service_url}/v3/conversations/#{uri_escape(target[:conversation_id])}/activities"
         activity = { "type" => "message", "text" => text }
-        activity["replyToActivityId"] = target[:reply_to] if target[:reply_to]
+        if target[:reply_to]
+          url += "/#{uri_escape(target[:reply_to])}"
+          activity["replyToId"] = target[:reply_to]
+        end
         response = ctx.transport.request(
           method: "POST", url: url,
           headers: {
@@ -218,7 +212,8 @@ module Aiconshell
         rescue URI::InvalidURIError
           uri = nil
         end
-        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty?
+        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty? &&
+               uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
           raise CredentialsMissing.new(plugin: plugin_id,
                                        missing: ["TEAMS_SERVICE_URL (must be an https URL)"])
         end
@@ -237,7 +232,8 @@ module Aiconshell
         rescue URI::InvalidURIError
           uri = nil
         end
-        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty?
+        unless uri.is_a?(URI::HTTPS) && uri.host && !uri.host.empty? &&
+               uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
           raise CredentialsMissing.new(plugin: plugin_id,
                                        missing: ["TEAMS_GRAPH_URL (must be an https URL)"])
         end
@@ -344,30 +340,58 @@ module Aiconshell
         url = first_url
         seen = {}
         MAX_PAGES.times do
-          break if url.nil?
-          raise InputInvalid.new(plugin: plugin_id, operation: ctx.operation,
-                                 details: ["pagination loop detected"]) if seen[url]
+          incomplete!("Graph pagination did not advance") if seen[url]
 
           seen[url] = true
           response = ctx.transport.request(method: "GET", url: url, headers: headers, body: nil)
           payload = response.json
           values = payload.is_a?(Hash) ? payload["value"] : nil
           unless values.is_a?(Array)
-            raise OutputInvalid.new(plugin: plugin_id, operation: ctx.operation,
-                                    details: ["Graph response had an unexpected shape"])
+            invalid_output!("Graph response had an unexpected shape")
           end
           items.concat(values)
 
           nxt = payload.is_a?(Hash) ? payload["@odata.nextLink"] : nil
-          url = (nxt.nil? || nxt.to_s.empty?) ? nil : begin
-            Http.check_host!(nxt.to_s, allowed_hosts)
-            nxt.to_s
-          end
+          return items if nxt.nil? || nxt == ""
+
+          invalid_output!("Graph next link must be a string") unless nxt.is_a?(String)
+          Http.check_host!(nxt, allowed_hosts)
+          url = nxt
         end
-        items
+        incomplete!("Graph messages or replies exceeded the page limit")
       end
 
       # -- helpers ----------------------------------------------------------
+
+      def message_event(message, team:, channel:, root: nil)
+        unless message.is_a?(Hash) && message["id"].is_a?(String) && !message["id"].empty? &&
+               message["body"].is_a?(Hash)
+          invalid_output!("Graph message had an unexpected shape")
+        end
+        modified = parse_timestamp(message["lastModifiedDateTime"] || message["createdDateTime"])
+        mid = message["id"]
+        kind = root ? "reply" : "message"
+        identity = [team, channel, root, mid].compact.map { |id| uri_escape(id) }.join("/")
+        event = {
+          "event_id" => "teams:#{kind}:#{identity}",
+          "fingerprint" => fingerprint(timestamp_string(modified), message.dig("body", "content"),
+                                       message["etag"], message.dig("body", "contentType"), message["subject"]),
+          "event_type" => "teams.#{kind}",
+          "resource_id" => "message:#{team}/#{channel}/#{root || mid}",
+          "actor_id" => teams_actor_id(message["from"]),
+          "actor_type" => teams_actor_type(message["from"]),
+          "occurred_at" => timestamp_string(modified),
+          "payload" => {
+            "team_id" => team, "channel_id" => channel,
+            "message_id" => mid, "reply_to_id" => root,
+            "subject" => message["subject"],
+            "content" => message.dig("body", "content"),
+            "content_type" => message.dig("body", "contentType"),
+            "last_modified" => timestamp_string(modified), "web_url" => message["webUrl"]
+          }
+        }
+        [event, modified]
+      end
 
       def teams_actor_id(from)
         return "unknown" unless from.is_a?(Hash)
@@ -390,19 +414,41 @@ module Aiconshell
       end
 
       def cursor_since(cursor)
+        unless (cursor.keys - ["since"]).empty?
+          raise InputInvalid.new(plugin: plugin_id, operation: "latest_events",
+                                 details: ["cursor only supports since; restart incomplete polls from the previous cursor"])
+        end
         since = cursor["since"]
         return nil if since.nil?
-        return since if since.is_a?(String) && !since.empty?
 
-        raise InputInvalid.new(plugin: plugin_id, operation: "latest_events",
-                               details: ["cursor.since must be an ISO8601 string"])
+        parse_timestamp(since, input: true)
       end
 
       def max_time(current, candidate)
-        return candidate if current.nil? || current.empty?
-        return current if candidate.nil? || candidate.empty?
+        current.nil? || candidate > current ? candidate : current
+      end
 
-        candidate > current ? candidate : current
+      def parse_timestamp(value, input: false)
+        raise ArgumentError unless value.is_a?(String) && TIMESTAMP_PATTERN.match?(value)
+
+        Date.iso8601(value[0, 10])
+        Time.iso8601(value).utc
+      rescue ArgumentError
+        error = input ? InputInvalid : OutputInvalid
+        raise error.new(plugin: plugin_id, operation: "latest_events",
+                        details: [input ? "cursor.since must be a valid ISO8601 timestamp" : "Graph returned an invalid timestamp"])
+      end
+
+      def timestamp_string(time)
+        time.utc.iso8601(6).sub(/\.000000Z\z/, "Z")
+      end
+
+      def invalid_output!(reason)
+        raise OutputInvalid.new(plugin: plugin_id, operation: "latest_events", details: [reason])
+      end
+
+      def incomplete!(reason)
+        raise IncompletePoll.new(plugin: plugin_id, operation: "latest_events", reason: reason)
       end
 
       def uri_escape(value)
