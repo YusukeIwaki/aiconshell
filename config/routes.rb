@@ -14,4 +14,7 @@ Rails.application.routes.draw do
 
   # Admin console (issue #7). Route details live in config/routes/admin.rb.
   draw(:admin)
+
+  # JSON admin API for task requests (issue #10). Details in config/routes/api.rb.
+  draw(:api)
 end

@@ -18,6 +18,8 @@ require "action_view/railtie"
 # you've limited to :test, :development, or :production.
 Bundler.require(*Rails.groups)
 
+require_relative "../app/middleware/api_task_request_body_guard"
+
 module Aiconshell
   class Application < Rails::Application
     # Initialize configuration defaults for originally generated Rails version.
@@ -44,6 +46,12 @@ module Aiconshell
     #
     # config.time_zone = "Central Time (US & Canada)"
     # config.eager_load_paths << Rails.root.join("extras")
+
+    # Narrow guard for /api/admin/task_requests routes (issue #10). It runs
+    # ahead of Rails parameter parsing/logging, parses a bounded body once,
+    # and replaces rack.input so malformed bytes never reach framework logs.
+    # Other routes are untouched.
+    config.middleware.insert_before Rack::Sendfile, ApiTaskRequestBodyGuard
 
     # Don't generate system test files.
     config.generators.system_tests = nil
