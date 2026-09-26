@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "test_helper"
+require "event_log_fixtures"
 
 Observability = Aiconshell::Observability
 
@@ -36,6 +37,19 @@ test("emit never raises: invalid input is dropped with a sanitized warning") do 
   expect(log_output.string).to match(/emit dropped/)
 end
 
+test("configured Teams channel receives events from every layer") do |memory_outbox:|
+  Observability.configure do |config|
+    config.outbox = memory_outbox
+    config.default_teams_channel = "channel:team/operations"
+  end
+
+  %w[interaction coordination execution].each do |layer|
+    envelope = Observability.emit(layer: layer, kind: "work.updated", message: "Updated")
+    record = memory_outbox.find_by_event_id(envelope["event_id"])
+    expect(record["teams_channel"]).to eq("channel:team/operations")
+  end
+end
+
 test("emit never raises: outbox failures are contained") do |test_logger:, log_output:|
   broken = Object.new
   def broken.enqueue(*)
@@ -55,6 +69,14 @@ test("emit! raises ValidationError for strict callers") do |memory_outbox:|
 
   expect(-> { Observability.emit!(layer: "bogus", kind: "x", message: "m") })
     .to raise_error(Aiconshell::Observability::ValidationError)
+end
+
+test("emit contains a simultaneous outbox and diagnostic logger failure") do
+  broken_logger = Object.new
+  def broken_logger.warn(*) = raise(IOError, "log device unavailable")
+  Observability.configure { |config| config.logger = broken_logger }
+
+  expect(Observability.emit(layer: "invalid", kind: "x", message: "m")).to be_nil
 end
 
 test("search delegates to the configured backend") do

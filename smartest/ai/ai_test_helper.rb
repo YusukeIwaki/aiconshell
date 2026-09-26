@@ -94,6 +94,8 @@ module AiTestSupport
 
   def make_config(root, bin:, homes: %w[claude codex muse], **overrides)
     homes.each { |name| FileUtils.mkdir_p(File.join(root, "homes", name)) }
+    # Muse's home is XDG-rooted: auth lives in the nested "muse" subdir.
+    FileUtils.mkdir_p(File.join(root, "homes", "muse", "muse")) if homes.include?("muse")
     defaults = {
       claude_home: File.join(root, "homes", "claude"),
       codex_home: File.join(root, "homes", "codex"),

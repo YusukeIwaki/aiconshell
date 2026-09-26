@@ -22,7 +22,7 @@ class EventDelivery < ApplicationRecord
   }
   scope :prunable, lambda { |before|
     where("created_at < ?", before)
-      .where.not(clickhouse_delivered_at: nil)
+      .where("clickhouse_delivered_at IS NOT NULL OR clickhouse_skipped_at IS NOT NULL")
       .where("teams_channel IS NULL OR teams_channel = '' " \
              "OR teams_delivered_at IS NOT NULL OR teams_skipped_at IS NOT NULL")
   }

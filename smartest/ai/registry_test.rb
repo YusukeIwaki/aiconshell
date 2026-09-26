@@ -65,8 +65,9 @@ test("diagnose reports paths but never file contents") do
     bin = AiTestSupport.make_bin(root, %w[muse])
     AiTestSupport.with_env("PATH" => bin) do
       config = AiTestSupport.make_config(root, bin: bin)
-      File.write(File.join(root, "homes", "muse", "auth.json"), "super-secret-bytes")
+      File.write(File.join(root, "homes", "muse", "muse", "auth.json"), "super-secret-bytes")
       diagnosis = Ai::Registry.new(config: config).diagnose("muse")
+      expect(diagnosis[:home]).to eq(File.join(root, "homes", "muse", "muse"))
       expect(diagnosis[:configured]).to eq(true)
       expect(diagnosis.inspect.include?("super-secret-bytes")).to eq(false)
     end

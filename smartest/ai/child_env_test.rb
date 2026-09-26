@@ -41,15 +41,49 @@ test("child env exposes only the calling provider credential home") do
     claude_env = Ai::ChildEnv.build(provider: "claude", config: config)
     expect(claude_env["CLAUDE_CONFIG_DIR"]).to eq(File.join(root, "homes", "claude"))
     expect(claude_env.key?("CODEX_HOME")).to eq(false)
-    expect(claude_env.key?("MUSE_CONFIG_DIR")).to eq(false)
+    expect(claude_env.key?("MUSE_AUTH_PATH")).to eq(false)
+    expect(claude_env.key?("XDG_CONFIG_HOME")).to eq(false)
 
     codex_env = Ai::ChildEnv.build(provider: "codex", config: config)
     expect(codex_env["CODEX_HOME"]).to eq(File.join(root, "homes", "codex"))
     expect(codex_env.key?("CLAUDE_CONFIG_DIR")).to eq(false)
+    expect(codex_env.key?("MUSE_AUTH_PATH")).to eq(false)
+    expect(codex_env.key?("XDG_CONFIG_HOME")).to eq(false)
 
     muse_env = Ai::ChildEnv.build(provider: "muse", config: config)
-    expect(muse_env["MUSE_CONFIG_DIR"]).to eq(File.join(root, "homes", "muse"))
+    expect(muse_env["XDG_CONFIG_HOME"]).to eq(File.join(root, "homes", "muse"))
+    expect(muse_env["MUSE_AUTH_PATH"]).to eq(File.join(root, "homes", "muse", "muse", "auth.json"))
+    expect(muse_env.key?("MUSE_CONFIG_DIR")).to eq(false)
     expect(muse_env.key?("CODEX_HOME")).to eq(false)
+    expect(muse_env.key?("CLAUDE_CONFIG_DIR")).to eq(false)
+  end
+end
+
+test("muse home resolves from override, XDG, then default") do
+  AiTestSupport.with_tmpdir do |root|
+    xdg = File.join(root, "xdg")
+    override = File.join(root, "override")
+    AiTestSupport.with_env("AICONSHELL_MUSE_HOME" => nil, "XDG_CONFIG_HOME" => xdg) do
+      expect(Ai::Config.new.muse_home).to eq(File.expand_path(xdg))
+    end
+    AiTestSupport.with_env("AICONSHELL_MUSE_HOME" => override, "XDG_CONFIG_HOME" => xdg) do
+      expect(Ai::Config.new.muse_home).to eq(File.expand_path(override))
+    end
+    AiTestSupport.with_env("AICONSHELL_MUSE_HOME" => nil, "XDG_CONFIG_HOME" => nil) do
+      expect(Ai::Config.new.muse_home).to eq(File.expand_path("~/.config"))
+    end
+    AiTestSupport.with_env("AICONSHELL_MUSE_HOME" => nil, "XDG_CONFIG_HOME" => "") do
+      expect(Ai::Config.new.muse_home).to eq(File.expand_path("~/.config"))
+    end
+  end
+end
+
+test("muse auth dir is the nested muse subdirectory") do
+  AiTestSupport.with_tmpdir do |root|
+    config = AiTestSupport.make_config(root, bin: "/nonexistent")
+    expect(config.auth_dir_for("muse")).to eq(File.join(root, "homes", "muse", "muse"))
+    expect(config.auth_dir_for("claude")).to eq(File.join(root, "homes", "claude"))
+    expect(config.auth_dir_for("codex")).to eq(File.join(root, "homes", "codex"))
   end
 end
 

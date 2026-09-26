@@ -30,25 +30,46 @@ runtime failure (`ExecutionFailed` with `kind` `:auth` or `:usage_limit`).
 | Codex | `codex exec --json --output-schema <f> --output-last-message <f> … -` (prompt on stdin) | JSON object in the `--output-last-message` file |
 | Muse Code | `muse exec --json --output-schema <f> --prompt-file <f> --workspace <dir> …` | `text` of the last `run.terminal.*` JSONL event, parsed as JSON |
 
-Layer confinement:
+Layer CLI policy (not OS confinement — see Boundary below):
 
-- `interaction` / `coordination`: Claude runs with `--tools ""` and plan
-  mode; Codex with `--sandbox read-only`; Muse with `--disable-write
-  --disable-shell --disable-web-tools`. Nothing on disk can change.
-- `execution`: Claude keeps workspace file tools with `acceptEdits`
-  (anything that would prompt is denied); Codex uses `--sandbox
-  workspace-write`; Muse runs without the disable flags. The workspace must
-  be an isolated directory: the application body and every provider auth
-  location are rejected as workspaces, as are relative paths.
+- Every layer suppresses inherited connector/settings configuration: Claude uses
+  `--setting-sources "" --strict-mcp-config --disable-slash-commands`; Codex uses
+  `--ignore-user-config --ignore-rules`; Muse excludes foreign personal context.
+- Codex additionally sets `forced_login_method="chatgpt"`, so a mounted API-login
+  cache cannot select API-key billing. See the [official configuration reference](https://developers.openai.com/ja-JP/docs/config-file/config-reference).
+- `interaction` / `coordination`: Claude has no tools, Codex uses its read-only
+  sandbox, and Muse disables writes, shell, and web tools.
+- `execution`: Claude explicitly allows Read/Edit/Write/Glob/Grep/Bash, Codex
+  uses its workspace-write sandbox, and Muse retains its default sandbox.
+- All layers run without approval prompts: Claude uses `--permission-prompts none`,
+  Codex `exec` is noninteractive, and Muse uses both `--approval-mode never` and
+  `--user-input-auto-resolve`. The latter only cancels model questions; it is not
+  a substitute for the separate tool-approval mode.
+
+Boundary: CLI flags are policy requests to a subprocess, not a sandbox.
+`cwd`/`--add-dir`/`-C`/`--workspace` choose working roots — `--add-dir`
+*grants* tool access to a directory, it does not confine Bash/Read to the
+workspace — and Codex documents `--sandbox` as the policy for
+model-generated shell commands only. The real isolation boundary is the
+container / trusted-worker deployment: run CLIs in the control and execution
+workers with dedicated workspace directories and private provider volumes,
+and no secrets in the child environment. The Ruby path guard rejects
+workspaces that overlap provider auth locations (symlinks resolved) and
+relative paths, but it does not sandbox the CLI and does not scan for
+symlinks nested inside the workspace. The application-body separation is a
+deployment property, not something this library enforces.
 
 Verified CLI surfaces: `claude --help` 2.1.280, `codex exec --help`
-codex-cli 0.155.1, `muse exec --help` Muse Code 1.3.0, plus the official
+codex-cli 0.155.1, `muse exec --help` Muse Code 1.4.0, plus the official
 Claude CLI reference / structured-outputs docs and offline `muse exec
 --provider echo` probes (no login, no billed calls). Minimum versions for
-the flags used here: Claude Code with `--json-schema`, `--permission-prompts`
-and `--no-session-persistence` (2.1.259+), Codex with `--output-schema` /
-`--output-last-message`, Muse Code 1.3.x with `--output-schema` /
-`--prompt-file` / `--no-session-log`. Older CLIs fail fast with a classified
+the flags used here: Claude Code with `--json-schema`,
+`--permission-prompts`, `--no-session-persistence`, `--strict-mcp-config`
+and `--disable-slash-commands` (2.1.259+), Codex with `--output-schema` /
+`--output-last-message` / `--ignore-user-config` / `--ignore-rules`, Muse
+Code 1.4.x with `--output-schema` / `--prompt-file` / `--no-session-log` /
+`--user-input-auto-resolve` / `--approval-mode` /
+`--no-foreign-personal-context`. Older CLIs fail fast with a classified
 `ExecutionFailed` instead of silent misbehavior.
 
 Notes and edges:
@@ -62,13 +83,15 @@ Notes and edges:
 - Codex and Muse have no system-prompt flag, so policy instructions are
   folded into the prompt document as `Instructions:… / Task:…`. Claude uses
   `--system-prompt`.
-- The Claude prompt travels as a positional argv element (documented
-  `claude -p "query"` form). Prompts starting with `-` may be misparsed by
-  the CLI; that surfaces as `ExecutionFailed`, never as injection (argv
+- Prompts never travel in argv: Claude and Codex receive the prompt on
+  stdin, Muse via `--prompt-file`. Large prompts and prompts starting
+  with `-` work, and user text never appears in the process list (argv
   arrays only, no shell anywhere).
 - Processes run with `cwd = workspace`, their own process group, a timeout
-  (default 300s), bounded stdout/stderr (default 1MB) and TERM-then-KILL
-  group cleanup, so grandchildren cannot outlive the run.
+  (default 300s), bounded stdout/stderr and result-file reads (default
+  1MB) and TERM-then-KILL group cleanup. The deadline covers I/O too, and
+  cleanup runs even when the parent exits promptly, so TERM-ignoring
+  grandchildren holding pipes cannot outlive the run or wedge collection.
 
 ## Login and credential homes
 
@@ -77,42 +100,50 @@ persist only the resulting credential directories:
 
 | Provider | Login | Credential home (presence-checked) | Child env override |
 | --- | --- | --- | --- |
-| Claude Code | interactive `claude` login or `claude setup-token` | `~/.claude` (`CLAUDE_CONFIG_DIR`, `AICONSHELL_CLAUDE_HOME`) | `CLAUDE_CONFIG_DIR` |
+| Claude Code | interactive `claude` subscription login | `~/.claude` (`CLAUDE_CONFIG_DIR`, `AICONSHELL_CLAUDE_HOME`) | `CLAUDE_CONFIG_DIR` |
 | Codex | `codex login` | `~/.codex` (`CODEX_HOME`, `AICONSHELL_CODEX_HOME`) | `CODEX_HOME` |
-| Muse Code | `muse login` | `~/.config/muse` (`MUSE_CONFIG_DIR`, `AICONSHELL_MUSE_HOME`) | `MUSE_CONFIG_DIR`, optional `AICONSHELL_MUSE_XDG_CONFIG_HOME` → `XDG_CONFIG_HOME` |
+| Muse Code | `muse login` | `<xdg>/muse` (`AICONSHELL_MUSE_HOME`, else `XDG_CONFIG_HOME`, else `~/.config`) | `XDG_CONFIG_HOME` + `MUSE_AUTH_PATH=<xdg>/muse/auth.json` |
 
 The child environment is built from scratch (`unsetenv_others`): database,
 GitHub, Jira, Teams and API-key variables are never inherited. Only a pinned
 `PATH`, locale, a neutral `HOME`, `TMPDIR` and the calling provider's home
 reach the CLI. Auth file contents are never read by this library and never
-appear in errors, the EventLog, the database or admin pages; failure excerpts
-are bounded (500 chars) and redacted. Never set `META_API_KEY`,
+appear in errors, the EventLog, the database or admin pages; failures carry
+only provider, kind and exit status (raw stdout/stderr is classified, then
+discarded — no excerpts, redacted or otherwise). Never set `META_API_KEY`,
 `OPENAI_API_KEY` or similar for these workers: API-key billing is out of
 scope by design.
 
 Token refresh is left to the CLIs themselves: keep the credential homes on
 persistent volumes so refresh writes survive restarts. The Rails lane must
 mount one private volume per provider (e.g. `/private/ai/claude`,
-`/private/ai/codex`, `/private/ai/muse-config`) and point the `AICONSHELL_*`
-overrides at them. The volumes must not be readable from the web/control
-containers — only execution workers need them.
+`/private/ai/codex`, `/private/ai/muse-xdg`) and point the `AICONSHELL_*`
+overrides at them. The volumes are mounted in control and execution workers, since all three
+layers can use AI. Web does not need them; its presence diagnostic is local to
+the Web process and does not establish worker readiness.
+
+Muse layout note: `AICONSHELL_MUSE_HOME` is the XDG config home itself (the
+directory *containing* `muse/`), not the `muse/` directory. The volume must
+hold `muse/auth.json` (plus `muse/settings.json`, `muse/trust.json` as the
+CLI maintains them). This is the only mapping honored by both stages:
+verified against the installed `muse` launcher script
+(`credential_path="${MUSE_AUTH_PATH:-$credential_default}"`, default
+`$XDG_CONFIG_HOME/muse/auth.json` else `$HOME/.config/muse/auth.json`) and
+the native runtime, which resolves the same XDG/HOME-rooted
+`muse/auth.json` and honors neither `MUSE_CONFIG_DIR` nor `MUSE_AUTH_PATH`.
+The child keeps a neutral `HOME`, so `XDG_CONFIG_HOME` is what preserves
+access to the configured auth; `MUSE_AUTH_PATH` pins the launcher to the
+same file. Auth file contents are never read (presence checks only) and
+never copied into the repo.
 
 ## Railway and Compose
 
-Railway has no preinstalled AI CLIs; install pinned versions in the
-execution-worker image (example shape, pin to the versions above):
-
-```dockerfile
-# Claude Code (npm), Codex (npm), Muse (vendor channel)
-RUN npm install -g @anthropic-ai/claude-code@2.1.280 @openai/codex@0.155.1 \
- && curl -fsSL https://vendor.example.com/muse-1.3.0 -o /usr/local/bin/muse \
- && chmod +x /usr/local/bin/muse
-```
-
-Then attach the three private volumes and set the home overrides plus
-`AICONSHELL_AI_HOME` (neutral child `HOME`). Compose mirrors the same
-split: `web` / `control-worker` / `execution-worker` / `postgres` /
-`clickhouse`, with provider volumes mounted only into `execution-worker`.
+Use the repository's optional Docker `ai` target for **both control and execution**
+workers. It installs pinned Claude/Codex versions. Muse requires an authorized
+Linux executable supplied at build time; do not copy a macOS binary or auth cache
+into the image. See [deployment.md](deployment.md) for the tested build, volume,
+and login commands. Keep subscription credential volumes writable for refresh.
+No real subscription login or billed model call is part of the automated tests.
 
 ## Failure modes
 
@@ -127,11 +158,14 @@ split: `web` / `control-worker` / `execution-worker` / `postgres` /
 ## Tests
 
 `RBENV_VERSION=3.4.9 rbenv exec smartest smartest/ai/` runs the offline
-suite: catalog, argv construction, parsing, schema validation, timeouts and
-env filtering via a fake process runner, plus small real-subprocess boundary
-tests (prompt piping, cwd, bounded output, TERM→KILL with grandchild
-cleanup, no shell interpolation). Login flows and billed AI executions are
-never triggered from tests.
+suite: catalog, argv construction (no prompt in argv, layer tool policy,
+noninteractive flags), parsing, schema validation, error sanitization
+(unprefixed sentinels absent from errors), timeouts, symlink workspace
+rejection and env filtering via a fake process runner, plus small
+real-subprocess boundary tests (stdin piping, cwd, bounded output and
+result files, TERM→KILL with grandchild cleanup even after parent exit,
+spawn-failure FD cleanup, no shell interpolation). Login flows and billed
+AI executions are never triggered from tests.
 
 ## Runtime dependencies (for the Rails lane)
 

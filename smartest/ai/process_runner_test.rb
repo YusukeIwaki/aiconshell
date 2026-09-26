@@ -119,4 +119,86 @@ test("process runner validates its inputs") do
   expect { runner.call(**base.merge(argv: ["echo"], timeout: 0)) }.to raise_error(ArgumentError)
   expect { runner.call(**base.merge(argv: ["echo"], max_output_bytes: 0)) }.to raise_error(ArgumentError)
   expect { runner.call(**base.merge(argv: ["echo"], stdin_data: 42)) }.to raise_error(ArgumentError)
+  expect { runner.call(**base.merge(argv: ["echo"], kill_grace_seconds: -1)) }.to raise_error(ArgumentError)
+end
+
+test("process runner kills a TERM-ignoring grandchild after the parent exits") do
+  AiTestSupport.with_tmpdir do |root|
+    pid_file = File.join(root, "grandchild.pid")
+    parent = File.join(root, "parent.rb")
+    File.write(parent, <<~RUBY)
+      $stdout.sync = true
+      puts "parent-out"
+      fork do
+        File.write(#{pid_file.dump}, Process.pid.to_s)
+        trap("TERM", "IGNORE")
+        sleep 30
+      end
+      exit 0
+    RUBY
+    begin
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = Ai::ProcessRunner.new.call(
+        argv: [RbConfig.ruby, parent],
+        env: { "PATH" => "/usr/bin:/bin" },
+        cwd: root, stdin_data: "x" * 2_000_000,
+        timeout: 10, max_output_bytes: 1_000_000, kill_grace_seconds: 0.3
+      )
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      expect(result.timed_out?).to eq(false)
+      expect(result.exit_status).to eq(0)
+      expect(result.stdout).to eq("parent-out\n")
+      expect(elapsed < 8).to eq(true)
+
+      expect(File.exist?(pid_file)).to eq(true)
+      grandchild_pid = File.read(pid_file).to_i
+      expect(grandchild_pid.positive?).to eq(true)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      dead = loop do
+        begin
+          Process.kill(0, grandchild_pid)
+        rescue Errno::ESRCH
+          break true
+        end
+        break false if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        sleep 0.05
+      end
+      expect(dead).to eq(true)
+    ensure
+      if File.exist?(pid_file)
+        begin
+          Process.kill("KILL", File.read(pid_file).to_i)
+        rescue SystemCallError, ArgumentError
+          nil
+        end
+      end
+    end
+  end
+end
+
+test("process runner closes all FDs when spawn fails") do
+  AiTestSupport.with_tmpdir do |root|
+    runner = Ai::ProcessRunner.new
+    GC.disable
+    begin
+      before = Dir["/dev/fd/*"].size
+      expect do
+        runner.call(
+          argv: [RbConfig.ruby, "-e", "exit 0"],
+          env: { "PATH" => "/usr/bin:/bin" },
+          cwd: File.join(root, "missing-dir"),
+          stdin_data: nil, timeout: 5,
+          max_output_bytes: 100, kill_grace_seconds: 0.1
+        )
+      end.to raise_error(SystemCallError)
+      expect(Dir["/dev/fd/*"].size).to eq(before)
+    ensure
+      GC.enable
+    end
+    # A failed spawn must not wedge later runs.
+    real_runner_call('puts "ok"') do |result, _root|
+      expect(result.stdout).to eq("ok\n")
+    end
+  end
 end

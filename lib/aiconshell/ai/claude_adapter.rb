@@ -7,8 +7,11 @@ module Aiconshell
     # Verified against `claude --help` (2.1.280) and the official CLI
     # reference / structured-outputs docs:
     #   claude -p --output-format json --json-schema '<schema>' [...]
-    # prints one result envelope; the validated object arrives in
-    # `structured_output` when subtype is "success".
+    # with the prompt on stdin (no positional prompt argument) prints one
+    # result envelope; the validated object arrives in `structured_output`
+    # when subtype is "success". Stdin delivery keeps large prompts and
+    # prompts starting with "-" working, and keeps user text out of argv
+    # (never visible in the process list).
     class ClaudeAdapter < Adapter
       class << self
         def id
@@ -31,10 +34,10 @@ module Aiconshell
           argv += ["--model", model] if model
           argv += ["--effort", effort] if effort
           argv += ["--system-prompt", instructions] if instructions && !instructions.strip.empty?
+          argv += ["--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"]
           argv += layer_flags(workspace, layer)
           argv += ["--permission-prompts", "none", "--no-session-persistence"]
-          argv << prompt
-          { argv: argv, stdin_data: nil }
+          { argv: argv, stdin_data: prompt }
         end
 
         def parse_output(stdout:, stderr:, exit_status:, files:, config:)
@@ -42,10 +45,7 @@ module Aiconshell
           envelope = parse_json_object!(stdout.to_s.strip, "claude output")
           if envelope["type"] == "result" && envelope["subtype"] != "success"
             kind = Redactor.failure_kind(envelope_text(envelope, stderr))
-            raise ExecutionFailed.new(
-              id, exit_status: exit_status, kind: kind,
-              excerpt: Redactor.excerpt(envelope_text(envelope, stderr), max_chars: config.error_excerpt_chars)
-            )
+            raise ExecutionFailed.new(id, exit_status: exit_status, kind: kind)
           end
 
           structured = envelope["structured_output"]
@@ -60,13 +60,18 @@ module Aiconshell
 
         private
 
-        # Interaction/coordination run with every tool disabled in plan mode.
-        # Execution keeps file tools plus Bash; acceptEdits auto-approves
-        # workspace edits while anything that would prompt is denied, and
-        # file tools stay confined to the workspace directories.
+        # Interaction/coordination: every tool disabled in plan mode, plus
+        # --strict-mcp-config (no --mcp-config is ever passed, so no MCP
+        # server loads) and --disable-slash-commands (no skills). This is
+        # CLI policy, not OS confinement: see docs/ai-providers.md.
+        # Execution allows file tools plus Bash for unattended work; acceptEdits auto-approves
+        # workspace edits while anything that would prompt is denied
+        # (--permission-prompts none). --add-dir *grants* tool access to
+        # the workspace; it does not confine Bash/Read to it.
         def layer_flags(workspace, layer)
           if execution_layer?(layer)
             ["--tools", "Read,Edit,Write,Glob,Grep,Bash",
+             "--allowedTools", "Read,Edit,Write,Glob,Grep,Bash",
              "--permission-mode", "acceptEdits",
              "--add-dir", workspace]
           else

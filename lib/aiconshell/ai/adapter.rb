@@ -5,7 +5,7 @@ require "json"
 module Aiconshell
   module Ai
     # Base class for provider adapters. Each adapter owns one subscription
-    # CLI: argv construction (array only, never shell), tool confinement per
+    # CLI: argv construction (array only, never shell), tool policy per
     # layer, and stdout/output-file parsing into a JSON-compatible Hash.
     class Adapter
       class << self
@@ -35,12 +35,12 @@ module Aiconshell
         # Presence-only diagnostic: executable on PATH plus private auth
         # location mounted. Subscription validity stays a runtime concern.
         def configured?(config)
-          !resolve_executable(config).nil? && Dir.exist?(config.home_for(id))
+          !resolve_executable(config).nil? && Dir.exist?(config.auth_dir_for(id))
         end
 
         def diagnose(config)
           executable = config.executable_for(id)
-          home = config.home_for(id)
+          home = config.auth_dir_for(id)
           found = !resolve_executable(config).nil?
           present = Dir.exist?(home)
           {
@@ -115,11 +115,9 @@ module Aiconshell
         def check_exit!(stdout:, stderr:, exit_status:, config:)
           return if exit_status == 0
 
+          # stderr is classified, then discarded: no excerpt is kept.
           kind = Redactor.failure_kind(stderr)
-          raise ExecutionFailed.new(
-            id, exit_status: exit_status, kind: kind,
-            excerpt: Redactor.excerpt(stderr, max_chars: config.error_excerpt_chars)
-          )
+          raise ExecutionFailed.new(id, exit_status: exit_status, kind: kind)
         end
 
         def parse_json_object!(text, what)
@@ -128,15 +126,22 @@ module Aiconshell
             raise InvalidOutput.new(id, "#{what} must be a JSON object, got #{parsed.class}")
           end
           parsed
-        rescue JSON::ParserError => error
-          raise InvalidOutput.new(id, "#{what} is not valid JSON: #{Redactor.excerpt(error.message, max_chars: 200)}")
+        rescue JSON::ParserError
+          # Parser messages can echo the offending input: discard them.
+          raise InvalidOutput.new(id, "#{what} is not valid JSON")
         end
 
-        def read_output_file!(path, what)
+        # Bounded read: at most max_bytes+1 are ever loaded, so a
+        # runaway CLI cannot exhaust memory via the result file.
+        def read_output_file!(path, what, max_bytes:)
           unless path && File.file?(path)
             raise InvalidOutput.new(id, "#{what} was not produced by the CLI")
           end
-          content = File.read(path, encoding: Encoding::UTF_8).scrub.strip
+          raw = File.read(path, max_bytes + 1, 0, encoding: Encoding::UTF_8)
+          if raw.bytesize > max_bytes
+            raise InvalidOutput.new(id, "#{what} exceeded #{max_bytes} bytes")
+          end
+          content = raw.scrub.strip
           raise InvalidOutput.new(id, "#{what} is empty") if content.empty?
 
           content
