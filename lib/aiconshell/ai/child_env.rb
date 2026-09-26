@@ -34,8 +34,16 @@ module Aiconshell
         when "codex"
           env["CODEX_HOME"] = config.codex_home
         when "muse"
-          env["MUSE_CONFIG_DIR"] = config.muse_home
-          env["XDG_CONFIG_HOME"] = config.muse_xdg_config_home if config.muse_xdg_config_home
+          # Verified against the installed launcher (a shell script:
+          # credential_path="${MUSE_AUTH_PATH:-$credential_default}",
+          # default $XDG_CONFIG_HOME/muse/auth.json else
+          # $HOME/.config/muse/auth.json) and the native runtime, which
+          # resolves the same XDG/HOME-rooted muse/auth.json and honors
+          # neither MUSE_CONFIG_DIR nor MUSE_AUTH_PATH. XDG_CONFIG_HOME
+          # is the one mapping both stages honor; MUSE_AUTH_PATH pins
+          # the launcher to the same file. The neutral HOME is kept.
+          env["XDG_CONFIG_HOME"] = config.muse_home
+          env["MUSE_AUTH_PATH"] = File.join(config.auth_dir_for("muse"), "auth.json")
         end
 
         env

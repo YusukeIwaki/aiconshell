@@ -25,13 +25,25 @@ module Aiconshell
       def compile(schema)
         JSONSchemer.schema(schema)
       rescue StandardError => error
-        raise ArgumentError, "invalid JSON schema (#{error.class}): #{Redactor.excerpt(error.message, max_chars: 200)}"
+        # Developer-facing (raised before any provider I/O): the schema is
+        # app-authored, so a bounded slice of the library message is safe.
+        raise ArgumentError, "invalid JSON schema (#{error.class}): #{bound(error.message)}"
       end
 
       def check_valid(schemer, data)
         schemer.valid?(data)
-      rescue JSONSchemer::UnknownRef => error
-        raise ArgumentError, "remote $ref is not supported: #{Redactor.excerpt(error.message, max_chars: 200)}"
+      rescue JSONSchemer::UnknownRef
+        raise ArgumentError, "remote $ref is not supported"
+      end
+
+      # Single-line, bounded slice for developer-facing messages only.
+      # Never used for provider output.
+      def bound(message, max_chars: 200)
+        clean = message.to_s.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "?")
+        clean = clean.strip.gsub(/\s+/, " ")
+        return clean if clean.length <= max_chars
+
+        "#{clean[0, max_chars]}...(truncated)"
       end
 
       # Error detail lists JSON pointers and expected types only. Values from

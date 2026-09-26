@@ -2,9 +2,11 @@
 
 module Aiconshell
   module Ai
-    # Base class for all Ai port errors. Messages are pre-redacted and carry
-    # only bounded excerpts; they never include auth file contents or raw
-    # provider stdout.
+    # Base class for all Ai port errors. Messages are curated: provider id,
+    # failure kind, exit status, executable/auth paths and JSON pointers.
+    # Provider raw stdout/stderr is used internally only to classify the
+    # failure, then discarded — it never reaches messages, the database,
+    # the EventLog or admin pages. Auth file contents are never read.
     class Error < StandardError
     end
 
@@ -59,24 +61,17 @@ module Aiconshell
 
     # Raised when the provider CLI exits non-zero or reports a terminal
     # failure. #kind classifies the failure heuristically from stderr:
-    # :auth, :usage_limit, :not_found or :generic.
+    # :auth, :usage_limit, :not_found or :generic. The raw text is used
+    # only for that classification, then discarded: the message carries
+    # provider, exit status and kind, nothing else.
     class ExecutionFailed < Error
-      attr_reader :provider, :exit_status, :kind, :excerpt
+      attr_reader :provider, :exit_status, :kind
 
-      def initialize(provider, exit_status:, kind: :generic, excerpt: nil)
+      def initialize(provider, exit_status:, kind: :generic)
         @provider = provider
         @exit_status = exit_status
         @kind = kind
-        @excerpt = excerpt
-        super(build_message)
-      end
-
-      private
-
-      def build_message
-        message = "AI provider #{provider.inspect} failed (exit=#{exit_status.inspect}, kind=#{kind})"
-        message += ": #{excerpt}" if excerpt && !excerpt.empty?
-        message
+        super("AI provider #{provider.inspect} failed (exit=#{exit_status.inspect}, kind=#{kind})")
       end
     end
 
