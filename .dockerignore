@@ -3,6 +3,7 @@
 # Ignore git directory.
 /.git/
 .gitignore
+/.gitignore
 
 # Ignore bundler config.
 /.bundle
