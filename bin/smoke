@@ -21,19 +21,78 @@ set -euo pipefail
 APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_ROOT"
 
-WEB_URL="${WEB_URL:-http://127.0.0.1:${WEB_PORT:-3000}}"
-DB_HOST="${SMOKE_DB_HOST:-127.0.0.1}"
-DB_PORT="${POSTGRES_PORT:-5432}"
-DB_USER="${POSTGRES_USER:-aiconshell}"
-DB_NAME="${POSTGRES_DB:-aiconshell_development}"
-CH_URL="${SMOKE_CLICKHOUSE_URL:-http://127.0.0.1:${CLICKHOUSE_PORT:-8123}}"
-CH_DB="${CLICKHOUSE_DATABASE:-aiconshell}"
-CH_TABLE="${CLICKHOUSE_TABLE:-event_log}"
-CH_USER="${CLICKHOUSE_USER:-aiconshell}"
-# Same dev default as compose.yml; override with the real password whenever
-# CLICKHOUSE_PASSWORD is set to a non-default value.
-CH_PASSWORD="${CLICKHOUSE_PASSWORD:-aiconshell_dev}"
-PROJECT="${COMPOSE_PROJECT_NAME:-aiconshell}"
+# Ask Compose to apply its own .env / COMPOSE_ENV_FILES / shell precedence.
+# Never source .env or evaluate generated shell text. JSON and credentials
+# stay in memory; NUL-delimited fields preserve spaces, quotes and newlines.
+# Capture diagnostics too: a Compose interpolation error can contain a secret.
+smoke_config=()
+smoke_config_count=0
+while IFS= read -r -d '' value; do
+  smoke_config+=("$value")
+  smoke_config_count=$((smoke_config_count + 1))
+done < <(ruby -rjson -ropen3 <<'RUBY'
+begin
+  raw, _diagnostics, status = Open3.capture3("docker", "compose", "config", "--format", "json")
+  raise "Compose configuration failed" unless status.success?
+
+  config = JSON.parse(raw)
+  services = config.fetch("services")
+  # A wildcard bind is reached through loopback; a specific bind must be
+  # probed at that address. Published ports are strings in Compose JSON.
+  endpoint = lambda do |name, target|
+    port = services.fetch(name).fetch("ports").find do |entry|
+      entry.fetch("target").to_i == target && entry.fetch("protocol", "tcp") == "tcp"
+    end
+    published = port.fetch("published").to_s
+    raise "Static published port required" unless published.match?(/\A[1-9]\d*\z/)
+
+    host = port.fetch("host_ip", "127.0.0.1")
+    host = "127.0.0.1" if host.empty? || host == "0.0.0.0"
+    host = "::1" if host == "::"
+    [host, published]
+  end
+  http_url = lambda do |host, port|
+    host = "[#{host}]" if host.include?(":")
+    "http://#{host}:#{port}"
+  end
+  web_host, web_port = endpoint.call("web", 3000)
+  db_host, db_port = endpoint.call("db", 5432)
+  ch_host, ch_port = endpoint.call("clickhouse", 8123)
+  db = services.fetch("db").fetch("environment")
+  ch = services.fetch("control").fetch("environment")
+  values = [http_url.call(web_host, web_port), db_host, db_port,
+            db.fetch("POSTGRES_USER"), db.fetch("POSTGRES_DB"), db.fetch("POSTGRES_PASSWORD"),
+            http_url.call(ch_host, ch_port), ch.fetch("CLICKHOUSE_DATABASE"),
+            ch.fetch("CLICKHOUSE_TABLE"), ch.fetch("CLICKHOUSE_USER"),
+            ch.fetch("CLICKHOUSE_PASSWORD"), config.fetch("name")].map(&:to_s)
+  raise "Invalid configuration field" if values.any? { |value| value.include?("\0") }
+
+  STDOUT.write(values.join("\0") + "\0")
+rescue StandardError
+  exit 1
+end
+RUBY
+)
+if (( smoke_config_count != 12 )); then
+  echo "smoke: FAIL - cannot resolve Compose configuration (requires Docker Compose and Ruby)" >&2
+  exit 1
+fi
+
+# Explicit smoke endpoint overrides retain their existing behavior. Normal
+# Compose variables were already resolved above, including .env passwords.
+WEB_URL="${WEB_URL:-${smoke_config[0]}}"
+DB_HOST="${SMOKE_DB_HOST:-${smoke_config[1]}}"
+DB_PORT="${smoke_config[2]}"
+DB_USER="${smoke_config[3]}"
+DB_NAME="${smoke_config[4]}"
+export PGPASSWORD="${PGPASSWORD:-${smoke_config[5]}}"
+CH_URL="${SMOKE_CLICKHOUSE_URL:-${smoke_config[6]}}"
+CH_DB="${smoke_config[7]}"
+CH_TABLE="${smoke_config[8]}"
+CH_USER="${smoke_config[9]}"
+CH_PASSWORD="${smoke_config[10]}"
+PROJECT="${smoke_config[11]}"
+unset smoke_config value
 
 failures=0
 warnings=0
