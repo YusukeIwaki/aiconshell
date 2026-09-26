@@ -128,6 +128,141 @@ resent. Interrupted local drafting can return to pending after backoff. Remote
 providers do not offer an end-to-end exactly-once guarantee; operators must
 reconcile uncertain sends before deciding whether another action is needed.
 
+## Typed admin reads and results (issue #11)
+
+`Coordination::TriageService.new(ai_runner:, registry:, event_sink:, clock:)`
+uses the same injected Registry for query preflight, query invocation, and
+result validation. Omitted keywords keep the production defaults. The AI returns
+exactly one of these shapes, validated against `TriageService::DECISION_SCHEMA`:
+
+```json
+{"read_requests":[{"task_id":123,"plugin":"github","operation":"list_issues","input":{"scope":"owner/repo"}}]}
+```
+
+```json
+{"rulings":[{"task_id":123,"result":{"summary":"An urgent issue needs review; notification requested.","actions":[{"plugin":"teams","operation":"send_message","input":{"scope":"channel:team-id/channel-id","body":"Please review the urgent issue."}}]}}]}
+```
+
+The AI may request at most three read rounds and ten total reads, with at most
+one request per task in each round. Every read round is preflighted in full
+before any query: task references must be known and unique, the task must have
+a linked persisted admin origin, and operations must be explicitly read-only
+in the registered catalog. `Interaction::QueryService` validates the exact
+input and output schemas, permission metadata, and allowlisted destination.
+It never changes polling cursors or ingests events. Plugin semantic preflight
+uses the same pure `Registry#validate_input` contract as normal invocation.
+
+Successful results are supplied to the next AI call on an `OBSERVATIONS: `
+JSON line as an array of `{task_id, round, plugin, operation, input, output}`.
+Each query output is limited to 128,000 serialized JSON bytes; accumulated
+observations to 256,000 bytes, prompts to 512,000 bytes, and decisions to
+256,000 bytes. A query failure stops the loop immediately with a content-free
+classified error and backoff; no later final result or write is accepted.
+Policy/task changes make the decision stale, preserve feedback, and prevent
+application. AI and HTTP calls run outside database transactions.
+
+GitHub `list_issues` reads one bounded page of open issues and excludes pull
+requests. `complete`, `next_cursor`, `truncated`, `limit_reached`, and per-field
+truncation flags remain visible in observations. `complete: false` is successful
+partial data, not a query failure. At page 100, a further page sets
+`limit_reached: true` with no usable next cursor. The AI must not claim a complete
+scan from partial data or infer missing text from truncation. See the
+[GitHub plugin contract](../plugins/github/README.md) for field and byte bounds;
+paging a changing remote list does not provide a consistent snapshot.
+
+`read_requests` and `rulings` cannot be combined. A result ruling cannot also
+specify `status`, `dispatch`, `reply`, or `work_plan`; an optional valid priority
+is applied with the result. Any final round containing a result rejects unknown
+or duplicate task references before mutation, validates every proposed action,
+then commits all rulings together in a savepoint. A late failure rolls back the
+whole round even inside a caller-owned transaction. Legacy-only ruling rounds
+retain their existing sequential behavior: a valid first ruling can apply while
+a later duplicate or invalid ruling is rejected. Legacy replies remain bound
+to the task's external source; `admin` is never an outbound destination.
+
+Admin event ingestion preserves validated titles up to 500 characters and
+descriptions up to 8,000; external event normalization retains its existing
+200/4,000-character limits. Tasks in `waiting_delivery` are excluded from AI
+triage, including those with new feedback. That state cannot be requested using
+the legacy status field.
+
+## Admin result batches and delivery reconciliation
+
+Cross-connector admin requests persist a validated coordination result
+`{summary, actions: [{plugin, operation, input}]}` (`summary` 1–2000 chars,
+at most 20 actions). Only tasks with a trusted persisted origin are
+eligible: `Task#admin_request?` requires an associated stored human `ExternalEvent`
+with plugin `admin` and event type `admin.task_request` matching the
+task's source reference and linked through its `task_id`. Source strings or payload flags alone never
+authorize, and ordinary external tasks keep their existing reply rules.
+
+`Coordination::ResultService.new(registry:, event_sink:, clock:,
+allowed_scopes:).apply(task_id:, task_version:, feedback_ids:, policy:,
+result:)` validates every action through
+`Interaction::ActionValidator#validate(plugin:, operation:, input:)` —
+supported non-read-only writes (`reply`, `create_issue`, `send_message`),
+exact registered input schemas and pure semantic preflight, destinations derived with
+`PluginAccess` against current `AICONSHELL_ALLOWED_SCOPES` — before any
+mutation. Whitespace-only summaries and NUL characters in summaries or any
+action input string/key are rejected before PostgreSQL persistence. The whole
+batch, `coordination_result` (`summary`,
+`action_count`), `delivery_batch_key`, state change, and exact feedback
+acknowledgements then commit atomically under the task lock, guarded by
+an unchanged task `lock_version` and an enabled/unchanged coordination
+policy. Idempotency keys are stable: batch `result-<task_id>-<version>`,
+actions `result-<task_id>-<version>-<ordinal>`. Running tasks, current
+run pointers, active runs, terminal tasks, `waiting_delivery` tasks, and
+any outstanding pending/sending action reject the result. Results from
+`waiting_human` / `waiting_review` additionally require pending human feedback
+in the supplied snapshot. Terminal tasks retain the existing feedback-driven
+transition to `inbox` before a later result can be applied. No-action
+results complete as `done` with the stored summary; action results move
+to `waiting_delivery`, never directly to `done`. No execution is
+enqueued and no `TaskRun` is created. The shared `Task::TRANSITIONS` map
+is unchanged; the result path uses its own explicit from-state
+allowlist. Result codes: `:ok`, `:invalid_result`, `:unknown_task`,
+`:duplicate_result`, `:stale_task`, `:stale_policy`,
+`:not_admin_origin`, `:task_running`, `:terminal_task`, `:batch_active`,
+`:outstanding_actions`, `:feedback_required`, plus validator codes (`:unknown_plugin`,
+`:unknown_operation`, `:unsupported_operation`,
+`:operation_not_allowed`, `:not_writable`, `:input_invalid`,
+`:scope_not_allowed`, `:schema_invalid`, `:permission_denied`,
+`:validation_failed`) with the failing `action_index`.
+
+Only `Coordination::DeliveryReconciler` leaves `waiting_delivery`.
+`reconcile(task_id:)` verifies exact batch membership against the
+persisted batch key and a positive expected count; missing, deleted, or
+mismatched counts recover to `waiting_human` (`batch_mismatch`), never
+vacuously succeeding. Batches with any pending/sending action stay
+`waiting_delivery`. All-`sent` batches complete as `done`; any
+`failed`/`uncertain` delivery parks as `waiting_human` with a
+content-free reason (`delivery_failed`, `delivery_uncertain`, or
+`delivery_partial`), clears `next_action_at`, and never autonomously
+resends or replans. Reconciliation never acknowledges human feedback;
+new explicit feedback unlocks later Coordination handling, and prior
+batch metadata stays until a new authorized result replaces it.
+`WorkflowMaintenanceJob` runs `reconcile_all(limit: 100)` before its
+execution-policy early return, so settlement works with execution
+disabled. PostgreSQL treats `waiting_delivery` as open in
+`index_tasks_one_open_per_source`.
+
+`CompletionService` never creates replies for the internal admin
+origin, including execution-dispatched admin tasks. `WorkContext`
+additionally exposes the bounded prior `coordination_result`
+(summary truncated to 500 chars with `summary_truncated`, `action_count`) and recent delivery
+metadata (batch key, plugin, operation, normalized destination, status,
+content-free `error_code`) without action bodies, so replanning after a
+failed/uncertain batch sees previously attempted writes.
+
+Outbound delivery validates the exact registered plugin input/output
+schemas for the action's operation and preserves the full input,
+including custom required fields; unknown/unsupported operations and
+schema violations fail before any transport or handler call. Schemas
+permit only `reply`, `create_issue`, and `send_message`; no other write
+operations were added. `sent` records an accepted external API receipt; it
+does not establish that a human read the notification or provide end-to-end
+exactly-once delivery.
+
 ## Runtime configuration
 
 Pure Ruby plugin, AI, and observability entrypoints are explicitly required at

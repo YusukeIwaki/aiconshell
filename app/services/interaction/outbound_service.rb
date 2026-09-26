@@ -33,23 +33,26 @@ module Interaction
       if snapshot[:plugin] == "jira" && PluginAccess.self_actor_ids("jira").empty?
         return settle(action_id, token, status: "failed", code: :self_actor_not_configured)
       end
-      input = operation_input(snapshot[:operation], input)
-      schema = {
-        "reply" => Aiconshell::Plugins::Schemas::REPLY_INPUT,
-        "create_issue" => Aiconshell::Plugins::Schemas::CREATE_ISSUE_INPUT,
-        "send_message" => Aiconshell::Plugins::Schemas::SEND_MESSAGE_INPUT
-      }.fetch(snapshot[:operation])
-      unless JSONSchemer.schema(schema).valid?(input) && input.fetch("body", "").strip.present?
-        return settle(action_id, token, status: "failed", code: :input_invalid)
-      end
+      validator = ActionValidator.new(registry: @registry)
+      checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
+      return settle(action_id, token, status: "failed", code: checked.code) unless checked.ok?
+
+      operation = registered_operation(snapshot[:plugin], snapshot[:operation])
+      # Exact registered input schema; the full input (including custom
+      # required fields) is preserved for the handler, never sliced.
       input = draft(input) if %w[reply send_message].include?(snapshot[:operation])
+      checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
+      return settle(action_id, token, status: "failed", code: checked.code) unless checked.ok?
+
       unless start_request(action_id, token)
         return Result.new(ok: false, code: :stale_delivery)
       end
       request_started = true
       output = @registry.invoke(plugin: snapshot[:plugin], operation: snapshot[:operation],
         input: input, context: PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry))
-      unless JSONSchemer.schema(Aiconshell::Plugins::Schemas::WRITE_OUTPUT).valid?(output)
+      unless Aiconshell::Plugins::Schemas.error_details(operation["output_schema"], output).empty? &&
+          output.is_a?(Hash) && output["external_id"].is_a?(String) && output["external_id"].present? &&
+          (output["url"].nil? || output["url"].is_a?(String))
         return settle(action_id, token, status: "uncertain", code: :invalid_delivery_response)
       end
       settle(action_id, token, status: "sent", code: :ok,
@@ -136,14 +139,12 @@ module Interaction
       end
     end
 
-    def operation_input(operation, input)
-      keys = case operation
-      when "reply" then %w[resource_id body]
-      when "create_issue" then %w[scope title body]
-      when "send_message" then %w[scope body]
-      else raise ArgumentError, "unknown operation"
-      end
-      input.slice(*keys)
+    def registry_entry(plugin)
+      @registry.catalog.find { |item| item["id"] == plugin.to_s }
+    end
+
+    def registered_operation(plugin, operation)
+      registry_entry(plugin)&.fetch("operations", [])&.find { |item| item["name"] == operation.to_s }
     end
 
     def draft(input)

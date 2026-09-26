@@ -7,6 +7,7 @@ class WorkflowMaintenanceJob < ApplicationJob
 
   def perform
     Interaction::OutboundService.new.recover_expired!
+    Coordination::DeliveryReconciler.new.reconcile_all(limit: 100)
     OutboundAction.deliverable.limit(100).pluck(:id).each { |id| OutboundDeliveryJob.perform_later(id) }
     return unless LayerPolicy.enabled_for("execution")
 
