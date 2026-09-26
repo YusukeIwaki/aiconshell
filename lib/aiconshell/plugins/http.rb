@@ -48,26 +48,30 @@ module Aiconshell
       DEFAULT_WRITE_TIMEOUT = 15
       MAX_BODY_BYTES = 8 * 1024 * 1024
 
-      # Production transport on top of Net::HTTP.
+      # Production transport on top of Net::HTTP. Response bodies are read
+      # with a streaming byte bound (MAX_BODY_BYTES by default); oversize
+      # bodies raise ResponseTooLarge before they are fully buffered.
       class NetHttpTransport
         def initialize(open_timeout: DEFAULT_OPEN_TIMEOUT,
                        read_timeout: DEFAULT_READ_TIMEOUT,
                        write_timeout: DEFAULT_WRITE_TIMEOUT,
-                       clock: Time)
+                       clock: Time,
+                       max_body_bytes: MAX_BODY_BYTES)
           @open_timeout = open_timeout
           @read_timeout = read_timeout
           @write_timeout = write_timeout
           @clock = clock
+          @max_body_bytes = max_body_bytes
         end
 
         def request(method:, url:, headers: {}, body: nil)
           uri = parse_uri!(method, url)
           payload = body.nil? ? nil : body.to_s
-          net_response = perform(method, uri, headers, payload)
+          status, resp_headers, resp_body = perform(method, uri, headers, payload)
           response = Response.new(
-            status: net_response.code.to_i,
-            headers: extract_headers(net_response),
-            body: net_response.body.to_s
+            status: status,
+            headers: resp_headers,
+            body: resp_body
           )
           Http.raise_for_status!(method, url, response, clock: @clock)
           response
@@ -85,13 +89,19 @@ module Aiconshell
             raise TransportError.new(http_method: method, url: url,
                                      cause_message: "unsupported URL")
           end
+          if uri.userinfo && !uri.userinfo.empty?
+            raise TransportError.new(http_method: method, url: url,
+                                     cause_message: "URL must not contain userinfo")
+          end
           uri
-        rescue URI::InvalidURIError => e
+        rescue URI::InvalidURIError
+          # Never echo the raw parser message: it can contain the input URL.
           raise TransportError.new(http_method: method, url: url,
-                                   cause_message: "invalid URL (#{e.message})")
+                                   cause_message: "invalid URL")
         end
 
         def perform(method, uri, headers, payload)
+          result = nil
           Net::HTTP.start(uri.host, uri.port,
                           use_ssl: uri.scheme == "https",
                           open_timeout: @open_timeout,
@@ -100,8 +110,17 @@ module Aiconshell
             request = net_request_class(method).new(uri.request_uri)
             headers.each { |name, value| request[name.to_s] = value.to_s }
             request.body = payload if payload
-            http.request(request)
+            http.request(request) do |net_response|
+              result = read_bounded!(method, uri, net_response)
+            end
           end
+          unless result
+            raise TransportError.new(http_method: method, url: uri.to_s,
+                                     cause_message: "empty response")
+          end
+          result
+        rescue ResponseTooLarge, TransportTimeout
+          raise
         rescue Net::OpenTimeout
           raise TransportTimeout.new(http_method: method, url: uri.to_s,
                                      timeout_kind: "connect")
@@ -116,6 +135,30 @@ module Aiconshell
                                    cause_message: "#{e.class}: #{e.message}")
         end
 
+        # Read a response body in chunks, enforcing @max_body_bytes. A
+        # declared Content-Length over the bound fails fast without reading.
+        def read_bounded!(method, uri, net_response)
+          headers = {}
+          net_response.each_header do |name, value|
+            key = name.to_s.downcase
+            headers[key] = headers.key?(key) ? "#{headers[key]}, #{value}" : value.to_s
+          end
+          declared = headers["content-length"].to_s.strip
+          if declared.match?(/\A\d+\z/) && declared.to_i > @max_body_bytes
+            raise ResponseTooLarge.new(http_method: method, url: uri.to_s,
+                                       limit_bytes: @max_body_bytes)
+          end
+          buf = +""
+          net_response.read_body do |chunk|
+            buf << chunk
+            next unless buf.bytesize > @max_body_bytes
+
+            raise ResponseTooLarge.new(http_method: method, url: uri.to_s,
+                                       limit_bytes: @max_body_bytes)
+          end
+          [net_response.code.to_i, headers, buf]
+        end
+
         def net_request_class(method)
           case method.to_s.upcase
           when "GET" then Net::HTTP::Get
@@ -127,14 +170,6 @@ module Aiconshell
           end
         end
 
-        def extract_headers(net_response)
-          headers = {}
-          net_response.each_header do |name, value|
-            key = name.to_s.downcase
-            headers[key] = headers.key?(key) ? "#{headers[key]}, #{value}" : value.to_s
-          end
-          headers
-        end
       end
 
       class << self
@@ -170,19 +205,86 @@ module Aiconshell
         end
 
         # Guard a URL taken from a cursor or an API payload (Link header,
-        # nextPage, @odata.nextLink) against the plugin host allowlist.
-        # Returns the parsed URI. Raises HostRejected before any I/O.
+        # nextPage, @odata.nextLink) against trusted origins before any
+        # credentialed request is sent. Returns the parsed URI.
+        #
+        # Allowed entries are full origins ("https://api.example.com",
+        # "https://host:8443/base") or, for the production default, a bare
+        # hostname meaning https with the default port. Scheme, host
+        # (case-insensitive), and effective port must all match, so an
+        # https origin never silently downgrades to http and a same-host
+        # wrong-port URL is rejected. URLs carrying userinfo are always
+        # rejected. Plain-http loopback origins are accepted only when the
+        # caller explicitly lists that exact loopback origin (test
+        # injection); they are never implied by a bare hostname.
         def check_host!(url, allowed_hosts)
-          uri = URI.parse(url.to_s)
+          allowed = Array(allowed_hosts)
+          begin
+            uri = URI.parse(url.to_s)
+          rescue URI::InvalidURIError
+            raise HostRejected.new(host: "(invalid url)", allowed_hosts: allowed)
+          end
           host = uri.host.to_s.downcase
-          allowed = Array(allowed_hosts).map { |entry| entry.to_s.downcase }
-          unless uri.is_a?(URI::HTTP) && !host.empty? && allowed.include?(host)
-            raise HostRejected.new(host: host.empty? ? url.to_s : host,
-                                   allowed_hosts: allowed_hosts)
+          unless uri.is_a?(URI::HTTP) && !host.empty?
+            raise HostRejected.new(host: "(invalid url)", allowed_hosts: allowed)
+          end
+          if uri.userinfo && !uri.userinfo.empty?
+            raise HostRejected.new(host: host, allowed_hosts: allowed)
+          end
+          matched = allowed.any? { |entry| origin_allowed?(uri, entry) }
+          unless matched
+            raise HostRejected.new(host: host, allowed_hosts: allowed)
           end
           uri
-        rescue URI::InvalidURIError
-          raise HostRejected.new(host: url.to_s, allowed_hosts: allowed_hosts)
+        end
+
+        # True when the candidate URI matches one allowlist entry: same
+        # scheme, same host, same effective port. Bare hostnames mean
+        # https + 443; anything else must be an explicit http(s) origin.
+        def origin_allowed?(uri, entry)
+          text = entry.to_s.strip
+          return false if text.empty?
+
+          if text.match?(%r{\Ahttps?://}i)
+            begin
+              base = URI.parse(text)
+            rescue URI::InvalidURIError
+              return false
+            end
+            return false unless base.is_a?(URI::HTTP) && base.host && !base.host.empty?
+            return false if base.userinfo && !base.userinfo.empty?
+            return false unless uri.scheme.to_s.downcase == base.scheme.to_s.downcase
+            return false unless uri.host.to_s.downcase == base.host.to_s.downcase
+
+            return uri.port == base.port
+          end
+
+          uri.scheme.to_s.downcase == "https" &&
+            uri.host.to_s.downcase == text.downcase &&
+            uri.port == 443
+        end
+
+        # Only application-authored reasons are safe to expose. Network and
+        # parser messages can contain credentials or arbitrary response text.
+        SAFE_CAUSES = ["unsupported URL", "invalid URL", "URL must not contain userinfo", "empty response"].freeze
+
+        def curate_cause(message)
+          text = message.to_s
+          return text if SAFE_CAUSES.include?(text)
+          return text if text.match?(/\Aresponse body exceeded \d+ bytes\z/)
+
+          "network I/O failed"
+        end
+
+        # Parse a response body as JSON, converting parser failures to a
+        # bounded OutputInvalid that never echoes server text.
+        def strict_json!(body, plugin:, operation:)
+          return nil if body.nil? || body.to_s.empty?
+
+          JSON.parse(body.to_s)
+        rescue JSON::ParserError
+          raise OutputInvalid.new(plugin: plugin, operation: operation,
+                                  details: ["response was not valid JSON"])
         end
 
         # Strip query/fragment for safe use in error messages and logs.
