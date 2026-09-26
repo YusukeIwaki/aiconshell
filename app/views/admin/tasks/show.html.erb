@@ -11,10 +11,27 @@
       <tr><th>作業計画</th><td><div class="admin-verbatim"><%= @task.work_plan.presence || "未設定" %></div></td></tr>
       <tr><th>参照元</th><td><%= @task.source_plugin %> <%= @task.source_resource_id %></td></tr>
       <tr><th>次回予定</th><td><%= @task.next_action_at %></td></tr>
+      <% if @task.last_error.present? %>
+        <tr id="task-last-error"><th>エラー</th><td><div class="admin-verbatim"><%= @task.last_error %></div></td></tr>
+      <% end %>
       <tr><th>更新日時</th><td><%= @task.updated_at %></td></tr>
     </table>
   </div>
 </div>
+
+<% result = @task.coordination_result %>
+<% if result.is_a?(Hash) && result["summary"].is_a?(String) %>
+  <h2>整理結果</h2>
+  <div class="admin-card" id="coordination-result">
+    <div class="admin-verbatim"><%= result["summary"] %></div>
+    <% if result["action_count"].is_a?(Integer) && result["action_count"] >= 0 %>
+      <p>通知件数：<%= result["action_count"] %>件</p>
+    <% end %>
+    <% if @task.status == "waiting_delivery" %>
+      <p>通知の配送を待っています。すべての送信が確認されると完了します。</p>
+    <% end %>
+  </div>
+<% end %>
 
 <h2>フィードバック（<%= @feedbacks.size %>件）</h2>
 <% if @feedbacks.empty? %>

@@ -35,6 +35,16 @@ bin/rails zeitwerk:check
 - 結合テストの初回は `db:prepare` が必要。Rails 配線を変えたら
   `bin/rails zeitwerk:check` も実行する。
 
+管理依頼の受け入れ部分だけを実行する場合:
+
+```sh
+RAILS_ENV=test bundle exec smartest smartest/integration/acceptance
+```
+
+この部分は実 PostgreSQL と EventLog の PostgreSQL outbox を使う。
+ClickHouse への配送・検索は別の結合テストで検証するため、完全検証では
+上記の `bin/test all` と実 ClickHouse を使う。
+
 ## Ruby と依存関係
 
 - Ruby は 3.4.9（`Gemfile` と `.ruby-version` が正）、依存関係はロック維持。
@@ -103,6 +113,24 @@ end
   不正な戻り値や未消費スクリプトは `assert_consumed!` で失敗する。
 
 ## 受け入れアサーション指針
+
+`integration/acceptance/request_workflow_test.rb` と
+`request_workflow_failures_test.rb` は、実コントローラ受付 → durable event →
+Coordination → GitHub 取得 → 設定済み AI Runner の判断 → 永続送信意図 →
+Teams 配送 → 完了確認を通す。`request_acceptance_helper.rb` は一時 Bot 対応表、
+合成認証、実 Registry / Github / Teams と境界フィクスチャを組み合わせる。
+AI の応答は脚本であり、実モデルの判断品質を保証するテストではない。
+
+UI の Basic 認証と実 CSRF、API の重複受付、通知不要時の無送信、
+部分取得・切り詰め情報、AI スキーマ拒否、許可外宛先、未知・重複タスク参照の
+全件拒否、GitHub 429、配送の一部失敗と未処理フィードバックを検証する。
+実プロバイダ・GitHub / Teams アカウントへ接続することはない。
+
+DB フィクスチャはテストごとに rollback する。受付の
+`after_all_transactions_commit` による EventLog・enqueue はそこで発火しないため、
+受け入れシナリオでは Coordination を明示的に呼ぶ。
+実 commit / rollback と受付後 enqueue の関係は
+`integration/admin/task_request_race_test.rb` が別途検証する。
 
 - 永続化された状態、有意な境界リクエスト、未送信であること、スキーマ拒否、
   部分結果メタデータ、成功済み重複の抑止を検証する。

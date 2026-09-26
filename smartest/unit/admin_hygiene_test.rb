@@ -5,7 +5,9 @@ require "test_helper"
 # Static guard for the Interaction/Coordination/Execution split: admin
 # controllers accept feedback and configure policies, but never invoke
 # execution workers, never mutate tasks/runs, and never shell out.
-ADMIN_CONTROLLERS_DIR = File.expand_path("../../app/controllers/admin", __dir__)
+ADMIN_CONTROLLERS_DIRS = %w[admin api/admin].map do |namespace|
+  File.expand_path("../../app/controllers/#{namespace}", __dir__)
+end.freeze
 ADMIN_ROUTES_FILE = File.expand_path("../../config/routes/admin.rb", __dir__)
 
 FORBIDDEN_TOKENS = [
@@ -29,8 +31,11 @@ FORBIDDEN_TOKENS = [
 ].freeze
 
 test("admin controllers contain no worker dispatch or task mutation") do
-  files = Dir[File.join(ADMIN_CONTROLLERS_DIR, "*.rb")].sort
-  expect(files.empty?).to eq(false)
+  files = ADMIN_CONTROLLERS_DIRS.flat_map do |directory|
+    controllers = Dir[File.join(directory, "*.rb")].sort
+    expect(controllers.empty?).to eq(false)
+    controllers
+  end
 
   violations = []
   files.each do |file|

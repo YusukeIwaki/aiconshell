@@ -27,6 +27,9 @@ test("invalid provider output is rejected before any connector call") do |http:|
     expect(ctx.process_runner.calls.size).to eq(1)
     expect(EventDelivery.where(kind: "triage.ai_failed").exists?).to eq(true)
     expect(flow.event_text.include?(canary)).to eq(false)
+    status = flow.api_get(http, receipt.request_id)
+    expect(status["last_error"]).to eq(task.last_error)
+    expect(http.last_response.body.include?(canary)).to eq(false)
     ctx.assert_consumed!
   end
 end
@@ -206,6 +209,10 @@ test("an unconfigured provider remains selectable and records a safe runtime fai
     expect(OutboundAction.count).to eq(0)
     expect(ctx.process_runner.calls).to eq([])
     expect(ctx.transport.requests).to eq([])
+    expect(flow.api_get(http, receipt.request_id)["last_error"]).to eq(task.last_error)
+    http.get("/admin/tasks/#{task.id}", {}, flow.admin_headers)
+    expect(http.last_response.status).to eq(200)
+    expect(Nokogiri::HTML(http.last_response.body).at_css("#task-last-error").text.include?(task.last_error)).to eq(true)
     ctx.assert_consumed!
   end
 end

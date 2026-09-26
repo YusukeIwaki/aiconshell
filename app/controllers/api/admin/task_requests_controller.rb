@@ -87,11 +87,25 @@ module Api
 
       def receipt_json(receipt)
         receipt = receipt.reload
+        task = receipt.external_event&.task
         {
           request_id: receipt.request_id,
           status: receipt.status,
-          task_id: receipt.task_id
+          task_id: task&.id,
+          task_status: task&.status,
+          coordination_result: public_result(task&.coordination_result),
+          last_error: task&.last_error
         }
+      end
+
+      # Publish selected result fields only, even if persisted JSON gains
+      # internal metadata later. Provider output and prompts are never a
+      # receipt representation.
+      def public_result(value)
+        return nil unless value.is_a?(Hash) && value["summary"].is_a?(String) &&
+                          value["action_count"].is_a?(Integer) && value["action_count"] >= 0
+
+        { summary: value["summary"], action_count: value["action_count"] }
       end
     end
   end

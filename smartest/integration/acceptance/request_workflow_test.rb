@@ -102,6 +102,9 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     status = flow.api_get(http, receipt.request_id)
     expect(http.last_response.status).to eq(200)
     expect(status.slice("status", "task_id")).to eq({ "status" => "processed", "task_id" => task.id })
+    expect(status["task_status"]).to eq("waiting_delivery")
+    expect(status["coordination_result"]).to eq({ "summary" => summary, "action_count" => 1 })
+    expect(status["last_error"]).to eq(nil)
     expect(triage.call.triaged).to eq(0)
     expect(task.outbound_actions.count).to eq(1)
 
@@ -120,6 +123,7 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     reconciler = Coordination::DeliveryReconciler.new(clock: ctx.clock)
     expect(reconciler.reconcile(task_id: task.id).code).to eq(:settled_done)
     expect(task.reload.status).to eq("done")
+    expect(flow.api_get(http, receipt.request_id)["task_status"]).to eq("done")
     expect(delivery.call(action.id).code).to eq(:duplicate_delivery)
     expect(reconciler.reconcile(task_id: task.id).code).to eq(:not_waiting_delivery)
     expect(triage.call.triaged).to eq(0)

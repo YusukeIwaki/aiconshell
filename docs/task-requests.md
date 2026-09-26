@@ -1,4 +1,4 @@
-# Admin task requests (issue #10)
+# Admin task requests
 
 Authenticated operators submit natural-language task requests through the admin
 UI and a JSON admin API. Both use the shared intake
@@ -7,9 +7,10 @@ UI and a JSON admin API. Both use the shared intake
 ingests the event later; intake controllers never create `Task`/`TaskRun`,
 never decide scheduling, and never invoke execution.
 
-Parallel issue #11 owns Task/Coordination/plugin/outbound changes. This lane
-adds no Task fields and does not edit Coordination, plugins, outbound
-workflow, or `docs/architecture.md`.
+Coordination can read allowlisted connector data, ask the configured AI to
+judge it, and persist a result with optional outbound actions. Interaction
+delivers those actions; Coordination confirms completion after delivery.
+See [the workflow contract](workflow.md) for limits and failure handling.
 
 ## Routes
 
@@ -124,6 +125,18 @@ of parameter logs. Other routes are untouched.
   `processed` once Coordination marks `processed_at`. `task_id` is
   `external_event.task_id` (nil until ingestion assigns a Task). The UI
   labels these `タスク整理待ち` and `タスク作成済み`.
+- API receipts contain exactly `request_id`, `status`, `task_id`,
+  `task_status`, `coordination_result`, and `last_error`.
+  `task_status` is the linked Task state, separate from receipt processing:
+  `waiting_delivery` means notifications await delivery confirmation;
+  `done` means complete (including a no-notification result);
+  `waiting_human` requires operator review after failed or uncertain delivery.
+- `coordination_result` contains only a string `summary` and nonnegative
+  integer `action_count`, or is `null` until a valid result exists. Other
+  stored JSON fields, prompts and provider output are never serialized.
+  `last_error` is an app-owned classified runtime message, or `null`.
+  All three added fields are `null` before ingestion assigns a Task.
+  GET is read-only and requires the same Bearer authentication as POST.
 - Event is server-owned: `plugin: "admin"`,
   `event_type: "admin.task_request"`, `actor_type: "human"`,
   `actor_id: "admin"` (UI) or `"admin-api"` (API). Each accepted request
@@ -142,9 +155,9 @@ succeeds and the existing recurring triage ingests the event; the failure is
 logged and emitted content-free.
 
 Normal `Coordination::TriageService` ingestion assigns the event to a Task
-and marks `processed_at`. The full receipt and event payload (500/8000) are
-preserved by this lane; Task-row mapping details are owned by parallel issue
-#11 and are not asserted here.
+and marks `processed_at`. The full title and description (500/8000) remain
+available to Coordination. Result summaries and classified runtime errors
+are visible on the admin Task detail and in authenticated API receipts.
 
 ## EventLog and log hygiene
 
@@ -166,12 +179,18 @@ curl -i -X POST http://127.0.0.1:3000/api/admin/task_requests \
   -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{"title":"Fix login","description":"Steps to reproduce..."}'
 # 202 + Location: /api/admin/task_requests/<request_id>
-# {"request_id":"<uuid>","status":"accepted","task_id":null}
+# {"request_id":"<uuid>","status":"accepted","task_id":null,"task_status":null,"coordination_result":null,"last_error":null}
 
-curl -s http://127.0.0.1:3000/api/admin/task_requests/<uuid> \
+REQUEST_ID='UUID returned by POST'
+curl -sS "http://127.0.0.1:3000/api/admin/task_requests/$REQUEST_ID" \
   -H "Authorization: Bearer $ADMIN_API_TOKEN"
-# 200 {"request_id":"<uuid>","status":"accepted","task_id":null}
+# Example after notification is queued (not yet confirmed sent):
+# {"request_id":"<uuid>","status":"processed","task_id":123,"task_status":"waiting_delivery","coordination_result":{"summary":"One urgent issue; notification queued.","action_count":1},"last_error":null}
 ```
+
+For a connector request example and required GitHub/Teams/AI setup, see
+[the README](../README.md#自然言語で依頼する). An HTTP 202 receipt does not
+promise a successful AI judgment or external delivery.
 
 API errors (all content-free JSON):
 

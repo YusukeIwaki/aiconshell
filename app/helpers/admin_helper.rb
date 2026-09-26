@@ -7,6 +7,7 @@ module AdminHelper
     "running" => "実行中",
     "waiting_human" => "人間待ち",
     "waiting_review" => "レビュー待ち",
+    "waiting_delivery" => "配送待ち",
     "done" => "完了",
     "failed" => "失敗",
     "cancelled" => "取消"
