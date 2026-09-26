@@ -21,6 +21,8 @@
 #   until then, deliveries stay queued in PostgreSQL and retry.
 # - ngrok is an explicit opt-in profile and is usually unnecessary: the app
 #   polls external services, so inbound connectivity is not required.
+#   Set RAILS_DEVELOPMENT_HOSTS to the exact public hostname and recreate
+#   web after the tunnel URL is known (see docs/deployment.md).
 #     NGROK_AUTHTOKEN=... docker compose --profile tunnel up ngrok
 
 name: ${COMPOSE_PROJECT_NAME:-aiconshell}
@@ -198,6 +200,8 @@ services:
     environment:
       <<: [*app-database, *workflow, *clickhouse-client, *integration-credentials]
       PORT: "3000"
+      # Rails' built-in development-only Host allowlist, read at boot.
+      RAILS_DEVELOPMENT_HOSTS: ${RAILS_DEVELOPMENT_HOSTS:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     ports:
