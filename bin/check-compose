@@ -1,0 +1,339 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Static operations-config checks (stdlib only, no gems, no Docker, no DB).
+#
+#   ruby bin/check-compose
+#
+# Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
+# separated control/execution queues, no integration credentials on the
+# execution worker, explicit workflow settings on every Rails process,
+# the EventLog channel default on every emitting Rails process, Teams
+# targets path on web/control only, recurring schedules on control only,
+# ClickHouse-independent startup (SQL migrate vs clickhouse-init split),
+# AI auth only on the workers, persisted workspaces outside app source,
+# a single migration process, production /up health exclusion, loopback-bound
+# ports, no Docker socket mounts, and .env.example coverage of every compose
+# variable.
+# Runs in CI (ops job) and locally before `docker compose up`.
+require "yaml"
+
+ROOT = File.expand_path("..", __dir__)
+failures = []
+
+def check(failures, name)
+  yield
+  puts "check-compose: ok   - #{name}"
+  true
+rescue StandardError => e
+  puts "check-compose: FAIL - #{name}: #{e.message}"
+  failures << name
+  false
+end
+
+def assert(condition, message)
+  raise message unless condition
+end
+
+WORKFLOW_VARS = %w[
+  AICONSHELL_EXECUTION_ROOT AICONSHELL_ALLOWED_SCOPES
+  AICONSHELL_LEASE_SECONDS AICONSHELL_AI_TIMEOUT_SECONDS
+  AICONSHELL_POLL_LEASE_SECONDS AICONSHELL_MAX_RUN_ATTEMPTS
+  AICONSHELL_MAX_ACTION_ATTEMPTS AICONSHELL_DEMO_MODE
+].freeze
+
+AI_VARS = %w[
+  CLAUDE_CONFIG_DIR CODEX_HOME AICONSHELL_MUSE_HOME AICONSHELL_AI_HOME
+  AICONSHELL_CLAUDE_BIN AICONSHELL_CODEX_BIN AICONSHELL_MUSE_BIN
+].freeze
+
+compose_path = File.join(ROOT, "compose.yml")
+compose = YAML.load_file(compose_path, aliases: true)
+services = compose.fetch("services")
+
+check(failures, "compose.yml declares web/control/execution/migrate/clickhouse-init/db/clickhouse") do
+  %w[web control execution migrate clickhouse-init db clickhouse].each do |name|
+    assert(services.key?(name), "missing service #{name}")
+  end
+end
+
+check(failures, "ngrok is opt-in via the tunnel profile") do
+  ngrok = services.fetch("ngrok")
+  assert(Array(ngrok["profiles"]).include?("tunnel"), "ngrok must carry profiles: [\"tunnel\"]")
+end
+
+check(failures, "project name is per-worktree (COMPOSE_PROJECT_NAME)") do
+  assert(compose["name"].to_s.include?("COMPOSE_PROJECT_NAME"),
+    "top-level name: must reference COMPOSE_PROJECT_NAME")
+end
+
+app_services = %w[web control execution migrate]
+env_of = ->(name) do
+  env = services.dig(name, "environment")
+  assert(env.is_a?(Hash), "#{name}.environment must be a mapping, got #{env.class}")
+  env.transform_keys(&:to_s)
+end
+
+check(failures, "web/control/execution/migrate share one DATABASE_URL") do
+  urls = app_services.to_h { |name| [name, env_of.call(name)["DATABASE_URL"]] }
+  assert(urls.values.all? { |url| !url.to_s.empty? }, "DATABASE_URL must be set on #{app_services.join(", ")}")
+  assert(urls.values.uniq.size == 1, "DATABASE_URL differs: #{urls.keys.join(", ")}")
+end
+
+check(failures, "every Rails process receives all WorkflowSettings variables") do
+  app_services.each do |name|
+    env = env_of.call(name)
+    missing = WORKFLOW_VARS.reject { |var| env.key?(var) }
+    assert(missing.empty?, "#{name} is missing workflow variables: #{missing.join(", ")} " \
+      "(validate! runs on every Rails boot)")
+  end
+end
+
+check(failures, "execution root is explicit, outside app source, on a persisted volume") do
+  roots = app_services.to_h { |name| [name, env_of.call(name)["AICONSHELL_EXECUTION_ROOT"]] }
+  assert(roots.values.uniq.size == 1, "AICONSHELL_EXECUTION_ROOT differs: #{roots.values.uniq.inspect}")
+  root = roots.values.first.to_s
+  assert(root.include?("/workspaces"), "execution root must be /workspaces, got #{root.inspect}")
+  assert(!root.include?("/rails"), "execution root must be outside the app source (/rails)")
+  %w[control execution].each do |name|
+    mounts = Array(services.dig(name, "volumes")).map(&:to_s)
+    assert(mounts.any? { |mount| mount.include?("ai_workspaces:/workspaces") },
+      "#{name} must mount ai_workspaces at /workspaces")
+  end
+  assert(compose.fetch("volumes").key?("ai_workspaces"), "missing named volume ai_workspaces")
+end
+
+check(failures, "execution worker receives no integration credentials") do
+  forbidden = env_of.call("execution").keys.select do |key|
+    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|CLICKHOUSE_)/)
+  end
+  assert(forbidden.empty?, "forbidden keys on execution: #{forbidden.join(", ")}")
+  %w[AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID].each do |var|
+    assert(!env_of.call("execution").key?(var), "forbidden key on execution: #{var}")
+  end
+end
+
+check(failures, "control has integration credentials plus self-actor ids; web has credentials but no self-actor ids") do
+  %w[GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE].each do |var|
+    assert(env_of.call("web").key?(var), "web is missing #{var} (admin diagnostics)")
+    assert(env_of.call("control").key?(var), "control is missing #{var}")
+  end
+  %w[AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID].each do |var|
+    assert(env_of.call("control").key?(var), "control is missing #{var} (poll/outbound filtering)")
+    assert(!env_of.call("web").key?(var), "web must not carry #{var} (control-only)")
+  end
+end
+
+check(failures, "every emitting Rails process receives EVENT_LOG_TEAMS_CHANNEL (blank default)") do
+  app_services.each do |name|
+    env = env_of.call(name)
+    assert(env.key?("EVENT_LOG_TEAMS_CHANNEL"),
+      "#{name} is missing EVENT_LOG_TEAMS_CHANNEL (captured on outbox rows at emit time)")
+  end
+  example = File.read(File.join(ROOT, ".env.example"))
+  assert(example.match?(/^EVENT_LOG_TEAMS_CHANNEL=$/m),
+    ".env.example must default EVENT_LOG_TEAMS_CHANNEL to blank")
+end
+
+check(failures, "AI auth goes only to control/execution (corrected muse mapping, no MUSE_CONFIG_DIR)") do
+  services.each do |name, svc|
+    keys = (svc["environment"] || {}).keys.map(&:to_s)
+    assert(!keys.include?("MUSE_CONFIG_DIR"),
+      "#{name} sets MUSE_CONFIG_DIR, which the native CLI does not honor (use AICONSHELL_MUSE_HOME)")
+  end
+  %w[control execution].each do |name|
+    env = env_of.call(name)
+    missing = AI_VARS.reject { |var| env.key?(var) }
+    assert(missing.empty?, "#{name} is missing AI variables: #{missing.join(", ")}")
+  end
+  %w[web migrate clickhouse-init].each do |name|
+    present = env_of.call(name).keys & AI_VARS
+    assert(present.empty?, "#{name} must not carry AI variables: #{present.join(", ")}")
+  end
+  %w[control execution].each do |name|
+    mounts = Array(services.dig(name, "volumes")).map(&:to_s)
+    %w[claude_auth codex_auth muse_auth].each do |volume|
+      assert(mounts.any? { |mount| mount.start_with?("#{volume}:") }, "#{name} must mount #{volume}")
+    end
+  end
+  assert(Array(services.dig("web", "volumes")).empty?, "web must mount no AI auth volumes")
+end
+
+check(failures, "control worker runs queue control, execution runs queue execution") do
+  control_cmd = Array(services.dig("control", "command")).join(" ")
+  execution_cmd = Array(services.dig("execution", "command")).join(" ")
+  assert(control_cmd.include?("--config-file=config/queue_control.yml"), "control command: #{control_cmd}")
+  assert(execution_cmd.include?("--config-file=config/queue_execution.yml"), "execution command: #{execution_cmd}")
+  assert(execution_cmd.include?("--skip-recurring"), "execution must pass --skip-recurring")
+  assert(!control_cmd.include?("--skip-recurring"), "control must keep the recurring scheduler")
+end
+
+check(failures, "queue configs bind workers to a single queue each") do
+  control_q = YAML.load_file(File.join(ROOT, "config/queue_control.yml"))
+  execution_q = YAML.load_file(File.join(ROOT, "config/queue_execution.yml"))
+  control_queues = Array(control_q.dig("workers", 0, "queues")).map(&:to_s)
+  execution_queues = Array(execution_q.dig("workers", 0, "queues")).map(&:to_s)
+  assert(control_queues == ["control"], "queue_control workers: #{control_queues.inspect}")
+  assert(execution_queues == ["execution"], "queue_execution workers: #{execution_queues.inspect}")
+end
+
+check(failures, "recurring schedules wire all control jobs in development and production") do
+  expected = {
+    "integration_poll_schedule" => { "class" => "IntegrationPollScheduleJob", "schedule" => "every 5 minutes" },
+    "coordination_triage" => { "class" => "CoordinationTriageJob", "schedule" => "every minute" },
+    "lease_recovery" => { "class" => "LeaseRecoveryJob", "schedule" => "every minute" },
+    "workflow_maintenance" => { "class" => "WorkflowMaintenanceJob", "schedule" => "every minute" },
+    "event_log_delivery" => { "class" => "EventLogDeliveryJob", "schedule" => "every minute" },
+    "clear_solid_queue_finished_jobs" => { "command" => true, "schedule" => "every hour at minute 12" }
+  }
+  recurring = YAML.load_file(File.join(ROOT, "config/recurring.yml"), aliases: true)
+  assert(!recurring.key?("test"), "test must not auto-schedule recurring tasks")
+  %w[development production].each do |env|
+    tasks = recurring[env]
+    assert(tasks.is_a?(Hash), "#{env} section must be a mapping")
+    missing = expected.keys - tasks.keys.map(&:to_s)
+    extra = tasks.keys.map(&:to_s) - expected.keys
+    assert(missing.empty?, "#{env} is missing recurring tasks: #{missing.join(", ")}")
+    assert(extra.empty?, "#{env} has unexpected recurring tasks: #{extra.join(", ")}")
+    expected.each do |key, spec|
+      task = tasks[key] || tasks[key.to_sym]
+      assert(task["schedule"].to_s == spec["schedule"], "#{env}.#{key} schedule: #{task["schedule"].inspect}")
+      assert(task["queue"].to_s == "control", "#{env}.#{key} must target queue control")
+      if spec["command"]
+        assert(!task["command"].to_s.empty?, "#{env}.#{key} needs its cleanup command")
+      else
+        assert(task["class"].to_s == spec["class"], "#{env}.#{key} class: #{task["class"].inspect}")
+        assert(task["args"].nil?, "#{env}.#{key} must not pass args (job-side defaults)")
+        underscore = spec["class"].gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+          .gsub(/([a-z\d])([A-Z])/, '\1_\2').downcase
+        job_file = File.join(ROOT, "app/jobs/#{underscore}.rb")
+        assert(File.file?(job_file), "missing #{job_file} for #{env}.#{key}")
+        assert(File.read(job_file).include?("queue_as :control"),
+          "#{job_file} must declare queue_as :control")
+      end
+    end
+  end
+end
+
+check(failures, "production keeps force_ssl but excludes /up from the redirect") do
+  production = File.read(File.join(ROOT, "config/environments/production.rb"))
+  assert(production.match?(/^\s*config\.force_ssl = true\s*$/),
+    "production must keep force_ssl (HTTPS for admin)")
+  assert(production.match?(/config\.ssl_options = \{ redirect: \{ exclude:.*request\.path == "\/up"/m),
+    "production must exclude /up from the SSL redirect (Railway healthcheck)")
+end
+
+check(failures, "exactly one SQL migration setup process (migrate service)") do
+  assert(env_of.call("migrate")["AICONSHELL_RUN_DB_SETUP"] == "1", "migrate must set AICONSHELL_RUN_DB_SETUP=1")
+  %w[web control execution clickhouse-init].each do |name|
+    assert(env_of.call(name)["AICONSHELL_RUN_DB_SETUP"].nil?, "#{name} must not run SQL setup")
+  end
+  %w[web control execution].each do |name|
+    dep = services.dig(name, "depends_on", "migrate", "condition")
+    assert(dep == "service_completed_successfully", "#{name} must wait for migrate (got #{dep.inspect})")
+  end
+  clickhouse_keys = env_of.call("migrate").keys.select { |key| key.start_with?("CLICKHOUSE_") }
+  assert(clickhouse_keys.empty?, "migrate must not need ClickHouse: #{clickhouse_keys.join(", ")}")
+end
+
+check(failures, "ClickHouse outage never blocks startup (independent clickhouse-init)") do
+  init = services.fetch("clickhouse-init")
+  cmd = Array(init["command"]).join(" ")
+  assert(cmd.include?("bin/setup-clickhouse"), "clickhouse-init command: #{cmd}")
+  assert(init["restart"] == "no", "clickhouse-init must be one-shot (restart: no)")
+  dep = init.dig("depends_on", "clickhouse", "condition")
+  assert(dep == "service_healthy", "clickhouse-init must wait for clickhouse healthy")
+  init_env = init.fetch("environment").transform_keys(&:to_s)
+  assert(init_env.key?("CLICKHOUSE_URL"), "clickhouse-init needs the clickhouse-client variables")
+  %w[web control execution migrate].each do |name|
+    assert(services.dig(name, "depends_on", "clickhouse").nil?,
+      "#{name} must not depend on clickhouse (EventLog is eventually consistent)")
+  end
+end
+
+check(failures, "no service uses env_file (allow-listed environment only)") do
+  with_env_file = services.select { |_name, svc| svc.key?("env_file") }.keys
+  assert(with_env_file.empty?, "env_file on: #{with_env_file.join(", ")}")
+end
+
+check(failures, "no Docker socket mount anywhere") do
+  raw = File.read(compose_path)
+  assert(!raw.include?("docker.sock"), "compose.yml references docker.sock")
+end
+
+check(failures, "published ports bind loopback by default") do
+  services.each do |name, svc|
+    Array(svc["ports"]).each do |port|
+      text = port.to_s
+      assert(text.start_with?("127.0.0.1") || text.match?(/\A\$\{[A-Z_]+:-127\.0\.0\.1\}/),
+        "#{name} port #{text.inspect} is not loopback-bound by default")
+    end
+  end
+end
+
+check(failures, "db/clickhouse/web define healthchecks") do
+  %w[db clickhouse web].each do |name|
+    assert(services.dig(name, "healthcheck", "test"), "#{name} has no healthcheck.test")
+  end
+end
+
+check(failures, "Dockerfile defaults to app, ai carries git and bakes muse intentionally") do
+  dockerfile = File.read(File.join(ROOT, "Dockerfile"))
+  stages = dockerfile.scan(/^FROM \S+ AS (\S+)/).flatten
+  assert(stages.include?("ai"), "missing ai stage")
+  assert(dockerfile.include?("AICONSHELL_EXECUTION_ROOT=/tmp/aiconshell-build-root ./bin/rails assets:precompile"),
+    "assets:precompile must set a dummy AICONSHELL_EXECUTION_ROOT (production boot validates it)")
+  assert(stages.last == "runtime" && dockerfile.include?("ARG RUNTIME_TARGET=app") &&
+    dockerfile.include?('FROM ${RUNTIME_TARGET} AS runtime'),
+    "runtime must default to app and accept an explicit ai target for Railway workers")
+  assert(dockerfile.include?("USER 1000:1000"), "runtime must drop to non-root")
+  assert(dockerfile.include?("type=secret,id=muse_cli,required=false"),
+    "muse CLI must enter only via an optional build secret")
+  assert(dockerfile.include?("install -m 0755 /run/secrets/muse_cli /usr/local/bin/muse"),
+    "muse binary must be installed into the ai image from the secret")
+  ai_stage = dockerfile.split(/^FROM \S+ AS ai\s*$/).last.split(/^FROM /).first
+  assert(ai_stage.match?(/apt-get install [^\n]*\bgit\b/),
+    "ai stage must install git for engineering commands")
+  assert(dockerfile.include?("/workspaces"), "image must provide /workspaces (execution root)")
+  assert(!dockerfile.include?("MUSE_CONFIG_DIR"), "Dockerfile must not reference MUSE_CONFIG_DIR")
+end
+
+check(failures, ".env.example documents every compose variable") do
+  example = File.read(File.join(ROOT, ".env.example"))
+  raw = File.read(compose_path)
+  vars = raw.scan(/\$\{([A-Z][A-Z0-9_]*)/).flatten.uniq
+  missing = vars.reject { |var| example.match?(/^#{var}=/m) }
+  assert(missing.empty?, "undocumented variables: #{missing.join(", ")}")
+end
+
+check(failures, "CI runs all suites with required services and no live providers") do
+  ci_path = File.join(ROOT, ".github/workflows/ci.yml")
+  ci = YAML.load_file(ci_path)
+  jobs = ci.fetch("jobs")
+  %w[unit integration zeitwerk ops clickhouse-smoke].each do |job|
+    assert(jobs.key?(job), "CI missing job #{job}")
+  end
+  raw = File.read(ci_path)
+  assert(raw.include?("bin/test unit"), "CI unit job must run bin/test unit")
+  assert(raw.include?("bin/test integration"), "CI integration job must run bin/test integration")
+  assert(raw.include?("zeitwerk:check"), "CI must run zeitwerk:check")
+  services_used = (jobs.dig("integration", "services") || {}).keys.map(&:to_s)
+  assert(services_used.include?("postgres"), "CI integration job must run a postgres service")
+  assert(services_used.include?("clickhouse"), "CI integration job must run a clickhouse service")
+  assert(raw.include?("TEST_CLICKHOUSE_URL"), "CI integration must set TEST_CLICKHOUSE_URL (fail fast, never silently skip)")
+  assert(raw.include?("claude") && raw.include?("--version"), "CI ops job must --version the pinned Linux CLIs")
+  %w[NGROK_AUTHTOKEN CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY].each do |secret|
+    assert(!raw.include?(secret), "CI must not reference #{secret}")
+  end
+end
+
+check(failures, "Railway predeploy runs SQL only (ClickHouse setup is separate)") do
+  railway = File.read(File.join(ROOT, "railway.toml"))
+  assert(railway.include?('preDeployCommand = "./bin/rails db:prepare"'),
+    "railway predeploy must be SQL-only db:prepare")
+  assert(!railway.match?(/^preDeployCommand.*setup-clickhouse/m),
+    "railway predeploy must not couple ClickHouse setup to deploys")
+end
+
+puts "check-compose: failures=#{failures.size}"
+exit(failures.empty? ? 0 : 1)

@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+#
+# Smoke-test a running compose stack. No AI credentials, binaries, or external
+# accounts required.
+#
+#   docker compose up --build -d   # first, in another terminal (or -d here)
+#   ./bin/smoke
+#
+# Checks: web /up, PostgreSQL SELECT 1, control/execution containers running
+# with one shared DATABASE_URL and both supervisors registered on that same
+# database, the 6 recurring tasks scheduled by the control scheduler, and
+# ClickHouse ping + event_log table. ClickHouse is covered by the
+# eventual-consistency contract: an unreachable server is a WARNING
+# (deliveries stay queued and retry), but a reachable server with a missing
+# table is a FAIL (clickhouse-init should have applied the schema).
+# Endpoints follow the same *_BIND/*_PORT variables as compose.yml. Never
+# prints credentials.
+#
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$APP_ROOT"
+
+# Ask Compose to apply its own .env / COMPOSE_ENV_FILES / shell precedence.
+# Never source .env or evaluate generated shell text. JSON and credentials
+# stay in memory; NUL-delimited fields preserve spaces, quotes and newlines.
+# Capture diagnostics too: a Compose interpolation error can contain a secret.
+smoke_config=()
+smoke_config_count=0
+while IFS= read -r -d '' value; do
+  smoke_config+=("$value")
+  smoke_config_count=$((smoke_config_count + 1))
+done < <(ruby -rjson -ropen3 <<'RUBY'
+begin
+  raw, _diagnostics, status = Open3.capture3("docker", "compose", "config", "--format", "json")
+  raise "Compose configuration failed" unless status.success?
+
+  config = JSON.parse(raw)
+  services = config.fetch("services")
+  # A wildcard bind is reached through loopback; a specific bind must be
+  # probed at that address. Published ports are strings in Compose JSON.
+  endpoint = lambda do |name, target|
+    port = services.fetch(name).fetch("ports").find do |entry|
+      entry.fetch("target").to_i == target && entry.fetch("protocol", "tcp") == "tcp"
+    end
+    published = port.fetch("published").to_s
+    raise "Static published port required" unless published.match?(/\A[1-9]\d*\z/)
+
+    host = port.fetch("host_ip", "127.0.0.1")
+    host = "127.0.0.1" if host.empty? || host == "0.0.0.0"
+    host = "::1" if host == "::"
+    [host, published]
+  end
+  http_url = lambda do |host, port|
+    host = "[#{host}]" if host.include?(":")
+    "http://#{host}:#{port}"
+  end
+  web_host, web_port = endpoint.call("web", 3000)
+  db_host, db_port = endpoint.call("db", 5432)
+  ch_host, ch_port = endpoint.call("clickhouse", 8123)
+  db = services.fetch("db").fetch("environment")
+  ch = services.fetch("control").fetch("environment")
+  values = [http_url.call(web_host, web_port), db_host, db_port,
+            db.fetch("POSTGRES_USER"), db.fetch("POSTGRES_DB"), db.fetch("POSTGRES_PASSWORD"),
+            http_url.call(ch_host, ch_port), ch.fetch("CLICKHOUSE_DATABASE"),
+            ch.fetch("CLICKHOUSE_TABLE"), ch.fetch("CLICKHOUSE_USER"),
+            ch.fetch("CLICKHOUSE_PASSWORD"), config.fetch("name")].map(&:to_s)
+  raise "Invalid configuration field" if values.any? { |value| value.include?("\0") }
+
+  STDOUT.write(values.join("\0") + "\0")
+rescue StandardError
+  exit 1
+end
+RUBY
+)
+if (( smoke_config_count != 12 )); then
+  echo "smoke: FAIL - cannot resolve Compose configuration (requires Docker Compose and Ruby)" >&2
+  exit 1
+fi
+
+# Explicit smoke endpoint overrides retain their existing behavior. Normal
+# Compose variables were already resolved above, including .env passwords.
+WEB_URL="${WEB_URL:-${smoke_config[0]}}"
+DB_HOST="${SMOKE_DB_HOST:-${smoke_config[1]}}"
+DB_PORT="${smoke_config[2]}"
+DB_USER="${smoke_config[3]}"
+DB_NAME="${smoke_config[4]}"
+export PGPASSWORD="${PGPASSWORD:-${smoke_config[5]}}"
+CH_URL="${SMOKE_CLICKHOUSE_URL:-${smoke_config[6]}}"
+CH_DB="${smoke_config[7]}"
+CH_TABLE="${smoke_config[8]}"
+CH_USER="${smoke_config[9]}"
+CH_PASSWORD="${smoke_config[10]}"
+PROJECT="${smoke_config[11]}"
+unset smoke_config value
+
+failures=0
+warnings=0
+check() { # name, command...
+  local name="$1"; shift
+  if "$@" > /dev/null 2>&1; then
+    echo "smoke: ok   - $name"
+  else
+    echo "smoke: FAIL - $name" >&2
+    failures=$((failures + 1))
+  fi
+}
+warn() { # name, detail
+  echo "smoke: WARN - $1 ($2)" >&2
+  warnings=$((warnings + 1))
+}
+
+# 1. Web health endpoint.
+check "web $WEB_URL/up returns 200" \
+  curl -fsSL --max-time 10 "$WEB_URL/up"
+
+# 2. PostgreSQL reachable with the compose-published port.
+if command -v pg_isready > /dev/null 2>&1; then
+  check "postgres $DB_HOST:$DB_PORT accepts connections" \
+    pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME"
+elif command -v psql > /dev/null 2>&1; then
+  check "postgres $DB_HOST:$DB_PORT answers SELECT 1" \
+    psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=$DB_NAME connect_timeout=10" -tAc "SELECT 1"
+else
+  # Fallback through the compose `db` service (needs no local client).
+  check "postgres answers SELECT 1 (via compose db service)" \
+    docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1"
+fi
+
+# 3. Workers running.
+for svc in control execution; do
+  state="$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | awk -v s="$svc" '$1==s{print $2; exit}')"
+  if [[ "$state" == "running" ]]; then
+    echo "smoke: ok   - compose service $svc is running"
+  else
+    echo "smoke: FAIL - compose service $svc is not running (state: ${state:-unknown})" >&2
+    failures=$((failures + 1))
+  fi
+done
+
+# 4. One shared DATABASE_URL across web/control/execution.
+url_web="" url_control="" url_execution="" urls_read=0
+for svc in web control execution; do
+  if val="$(docker compose exec -T "$svc" printenv DATABASE_URL 2>/dev/null)"; then
+    case "$svc" in
+      web) url_web="$val" ;;
+      control) url_control="$val" ;;
+      execution) url_execution="$val" ;;
+    esac
+    urls_read=$((urls_read + 1))
+  else
+    echo "smoke: FAIL - cannot read DATABASE_URL from $svc" >&2
+    failures=$((failures + 1))
+  fi
+done
+if (( urls_read == 3 )); then
+  if [[ "$url_web" == "$url_control" && "$url_control" == "$url_execution" ]]; then
+    echo "smoke: ok   - web/control/execution share one DATABASE_URL"
+  else
+    echo "smoke: FAIL - DATABASE_URL differs between services" >&2
+    failures=$((failures + 1))
+  fi
+fi
+
+# 5. Both supervisors registered on that same database (fork-mode bin/jobs
+# registers one Supervisor row each; heartbeats prove they are alive).
+supervisors_registered() {
+  local count
+  local tries=0
+  while (( tries < 18 )); do
+    count="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+      "SELECT COUNT(*) FROM solid_queue_processes WHERE kind LIKE 'Supervisor%' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'" 2>/dev/null | tr -d ' ')"
+    if [[ "$count" == "2" ]]; then return 0; fi
+    tries=$((tries + 1))
+    sleep 5
+  done
+  return 1
+}
+check "control+execution supervisors registered on shared DB (2 heartbeats)" \
+  supervisors_registered
+
+# 6. Recurring tasks registered by the control scheduler (the execution
+# worker passes --skip-recurring, so exactly the 6 static tasks from
+# config/recurring.yml must be present while control is running).
+recurring_registered() {
+  local count
+  local tries=0
+  while (( tries < 18 )); do
+    count="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+      "SELECT COUNT(*) FROM solid_queue_recurring_tasks WHERE static" 2>/dev/null | tr -d ' ')"
+    if [[ "$count" == "6" ]]; then return 0; fi
+    tries=$((tries + 1))
+    sleep 5
+  done
+  return 1
+}
+check "6 recurring tasks registered (control scheduler)" \
+  recurring_registered
+
+# 7. ClickHouse: unreachable is a warning (queued + retried); reachable
+# with a missing table is a failure (schema setup did not run).
+if curl -fsSL --max-time 10 "$CH_URL/ping" > /dev/null 2>&1; then
+  echo "smoke: ok   - clickhouse $CH_URL answers /ping"
+  table_check() {
+    local out
+    out="$(curl -fsSL --max-time 10 --user "$CH_USER:$CH_PASSWORD" \
+      --get --data-urlencode "database=$CH_DB" \
+      --data-urlencode "query=EXISTS TABLE $CH_TABLE" "$CH_URL/")"
+    [[ "$out" == "1" ]]
+  }
+  check "clickhouse table $CH_DB.$CH_TABLE exists" table_check
+else
+  warn "clickhouse $CH_URL unreachable" "EventLog deliveries stay queued in PostgreSQL and retry; run 'docker compose up clickhouse-init' once it is back"
+fi
+
+echo "smoke: project=$PROJECT failures=$failures warnings=$warnings"
+exit "$([ "$failures" -eq 0 ] && echo 0 || echo 1)"

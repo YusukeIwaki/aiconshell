@@ -28,7 +28,11 @@ Rails.application.configure do
   config.force_ssl = true
 
   # Skip http-to-https redirect for the default health check endpoint.
-  # config.ssl_options = { redirect: { exclude: ->(request) { request.path == "/up" } } }
+  # Load balancers and Railway healthchecks probe /up over plain HTTP on
+  # the private network; without this exclusion they would follow a 301
+  # instead of reading the 200. Everything else (including /admin) still
+  # redirects to HTTPS.
+  config.ssl_options = { redirect: { exclude: ->(request) { request.path == "/up" } } }
 
   # Log to STDOUT with the current request id as a default log tag.
   config.log_tags = [ :request_id ]

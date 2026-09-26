@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# Apply the EventLog ClickHouse schema (db/clickhouse/*.sql) over HTTP.
+#
+# Used by the compose `clickhouse-init` service, the Railway one-off step,
+# and CI. Idempotent: the schema statements use IF NOT EXISTS and are safe
+# to re-run. Never prints credentials.
+#
+#   CLICKHOUSE_URL=http://127.0.0.1:8123 ./bin/setup-clickhouse
+#
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
+DATABASE="${CLICKHOUSE_DATABASE:-aiconshell}"
+TABLE="${CLICKHOUSE_TABLE:-event_log}"
+USER="${CLICKHOUSE_USER:-}"
+PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+SCHEMA_DIR="${CLICKHOUSE_SCHEMA_DIR:-$APP_ROOT/db/clickhouse}"
+TRIES="${CLICKHOUSE_SETUP_TRIES:-30}"
+
+if [[ ! "$DATABASE" =~ ^[A-Za-z0-9_]+$ ]]; then
+  echo "setup-clickhouse: refusing unexpected database name: $DATABASE" >&2
+  exit 1
+fi
+if [[ ! "$TABLE" =~ ^[A-Za-z0-9_]+$ ]]; then
+  echo "setup-clickhouse: refusing unexpected table name: $TABLE" >&2
+  exit 1
+fi
+
+auth_args=()
+if [[ -n "$USER" ]]; then
+  auth_args=(--user "$USER:$PASSWORD")
+fi
+
+echo "setup-clickhouse: waiting for $URL ..." >&2
+attempt=1
+until curl -fsSL --max-time 5 "$URL/ping" > /dev/null 2>&1; do
+  if (( attempt >= TRIES )); then
+    echo "setup-clickhouse: server did not answer /ping after $TRIES tries" >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep 2
+done
+
+shopt -s nullglob
+files=("$SCHEMA_DIR"/*.sql)
+if (( ${#files[@]} == 0 )); then
+  echo "setup-clickhouse: no schema files in $SCHEMA_DIR" >&2
+  exit 1
+fi
+
+for file in "${files[@]}"; do
+  echo "setup-clickhouse: applying $(basename "$file")" >&2
+  curl -fsSL --max-time 60 "${auth_args[@]}" -X POST \
+    "$URL/?database=$DATABASE" --data-binary "@$file" > /dev/null
+done
+
+exists="$(curl -fsSL --max-time 30 "${auth_args[@]}" \
+  --get --data-urlencode "database=$DATABASE" \
+  --data-urlencode "query=EXISTS TABLE $TABLE" "$URL/")"
+if [[ "$exists" != "1" ]]; then
+  echo "setup-clickhouse: verification failed: table $TABLE missing" >&2
+  exit 1
+fi
+
+echo "setup-clickhouse: ok ($TABLE present in $DATABASE)" >&2

@@ -1,0 +1,14 @@
+# Temporary bootstrap for ONE existing worker service and its own /data
+# volume. Set RAILWAY_RUN_UID=0, clear dashboard healthchecks, and select this
+# config only while applying the ownership commands in docs/deployment.md.
+# This process does not boot Rails or execute jobs. After initialization,
+# remove RAILWAY_RUN_UID and select that worker's normal config, then deploy.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "/bin/sleep infinity"
+preDeployCommand = []
+restartPolicyType = "NEVER"
