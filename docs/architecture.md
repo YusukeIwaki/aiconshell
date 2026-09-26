@@ -35,7 +35,7 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 
 | モデル | 主な情報 / 制約 |
 | --- | --- |
-| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at。plugin+event_id+fingerprint を一意にする |
+| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし、親スナップショットは改訂を鎖状に識別する |
 | IntegrationCursor | plugin と scope ごとの cursor JSON、lease、last_polled_at、error。全ページの durable ingest 完了後のみ更新 |
 | Task | title、description、status、priority、source reference、next_action_at、lock_version。状態更新は Coordination のみ |
 | TaskFeedback | task、body、author、processed_at。人間の意見を保持し、直接的な状態変更をしない |

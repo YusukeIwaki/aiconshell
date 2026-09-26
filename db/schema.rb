@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_000603) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_000901) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -57,6 +57,8 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_000603) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.bigint "task_id"
+    t.string "source_fingerprint"
+    t.datetime "source_updated_at"
     t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_on_plugin_event_fingerprint", unique: true
     t.index ["plugin", "resource_id"], name: "index_external_events_on_plugin_resource"
     t.index ["processed_at"], name: "index_external_events_on_processed_at"
@@ -303,7 +305,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_000603) do
     t.index ["status"], name: "index_task_runs_on_status"
     t.index ["task_id", "status"], name: "index_task_runs_on_task_status"
     t.index ["task_id"], name: "index_task_runs_on_task_id"
-    t.index ["task_id"], name: "index_task_runs_one_active_per_task", unique: true, where: "((status)::text = ANY ((ARRAY['pending'::character varying, 'leased'::character varying, 'running'::character varying])::text[]))"
+    t.index ["task_id"], name: "index_task_runs_one_active_per_task", unique: true, where: "((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('leased'::character varying)::text, ('running'::character varying)::text]))"
     t.check_constraint "attempt > 0", name: "task_runs_positive_attempt"
   end
 
@@ -324,7 +326,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_000603) do
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"
-    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'failed'::character varying])::text[])))"
+    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY (ARRAY[('inbox'::character varying)::text, ('ready'::character varying)::text, ('running'::character varying)::text, ('waiting_human'::character varying)::text, ('waiting_review'::character varying)::text, ('failed'::character varying)::text])))"
     t.index ["status"], name: "index_tasks_on_status"
   end
 
