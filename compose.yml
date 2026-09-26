@@ -1,0 +1,228 @@
+# aiconshell local stack: same web / control-worker / execution-worker split as
+# production (see docs/architecture.md and docs/deployment.md).
+#
+#   cp .env.example .env            # once; adjust secrets and ports
+#   docker compose up --build       # web + workers + postgres + clickhouse
+#   ./bin/smoke                     # verify the running stack
+#
+# Notes:
+# - Every service publishes ports on 127.0.0.1 by default; override the
+#   *_BIND/*_PORT variables in .env to change that. Never bind 0.0.0.0 with
+#   the default dev credentials.
+# - Each checkout should use its own COMPOSE_PROJECT_NAME so volumes and
+#   networks never collide between worktrees.
+# - Code is carried inside the image (no source bind-mounts): rebuild after
+#   pulling changes (`docker compose up --build`).
+# - Variables are allow-listed per service on purpose (no blanket env_file),
+#   so the execution worker provably receives no integration credentials.
+# - ngrok is an explicit opt-in profile and is usually unnecessary: the app
+#   polls external services, so inbound connectivity is not required.
+#     NGROK_AUTHTOKEN=... docker compose --profile tunnel up ngrok
+
+name: ${COMPOSE_PROJECT_NAME:-aiconshell}
+
+x-app-database: &app-database
+  DATABASE_URL: ${DATABASE_URL:-postgresql://aiconshell:aiconshell_dev@db:5432/aiconshell_development}
+  RAILS_ENV: ${RAILS_ENV:-development}
+  RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}
+  JOB_CONCURRENCY: ${JOB_CONCURRENCY:-1}
+  # Dev-only fallback so `docker compose config` and first boot work with no
+  # .env. Any shared/staging/production use MUST set a real SECRET_KEY_BASE
+  # (see .env.example). Never use this value outside a local checkout.
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:-dev-only-insecure-secret-do-not-use-in-shared-envs}
+
+x-clickhouse-client: &clickhouse-client
+  CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-aiconshell}
+  CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-event_log}
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-aiconshell}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-aiconshell_dev}
+
+x-integration-credentials: &integration-credentials
+  GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+  GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
+  GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
+  GITHUB_PRIVATE_KEY_FILE: ${GITHUB_PRIVATE_KEY_FILE:-}
+  JIRA_EMAIL: ${JIRA_EMAIL:-}
+  JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+  JIRA_API_TOKEN_FILE: ${JIRA_API_TOKEN_FILE:-}
+  JIRA_SITE_URL: ${JIRA_SITE_URL:-}
+  JIRA_CLOUD_ID: ${JIRA_CLOUD_ID:-}
+  JIRA_BASE_URL: ${JIRA_BASE_URL:-}
+  TEAMS_TENANT_ID: ${TEAMS_TENANT_ID:-}
+  TEAMS_CLIENT_ID: ${TEAMS_CLIENT_ID:-}
+  TEAMS_CLIENT_SECRET: ${TEAMS_CLIENT_SECRET:-}
+  TEAMS_CLIENT_SECRET_FILE: ${TEAMS_CLIENT_SECRET_FILE:-}
+  TEAMS_BOT_APP_ID: ${TEAMS_BOT_APP_ID:-}
+  TEAMS_BOT_APP_PASSWORD: ${TEAMS_BOT_APP_PASSWORD:-}
+  TEAMS_BOT_APP_PASSWORD_FILE: ${TEAMS_BOT_APP_PASSWORD_FILE:-}
+  TEAMS_SERVICE_URL: ${TEAMS_SERVICE_URL:-}
+
+x-ai-auth: &ai-auth
+  # Private persisted auth homes (named volumes below). The AI lane reads
+  # exactly these variables (lib/aiconshell/ai/config.rb); normal CLI token
+  # refresh writes back to the volumes. Contents are never baked into images.
+  CLAUDE_CONFIG_DIR: /private/claude
+  CODEX_HOME: /private/codex
+  MUSE_CONFIG_DIR: /private/muse
+
+services:
+  db:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aiconshell}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aiconshell_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-aiconshell_development}
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  clickhouse:
+    # EventLog search store (26.8 series per docs/architecture.md).
+    image: clickhouse/clickhouse-server:26.8.11.7
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-aiconshell}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-aiconshell}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-aiconshell_dev}
+    ports:
+      # HTTP interface only (the app uses HTTP; native 9000 stays internal).
+      - "${CLICKHOUSE_BIND:-127.0.0.1}:${CLICKHOUSE_PORT:-8123}:8123"
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1' > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # One-shot setup: the ONLY process that runs `bin/rails db:prepare` and the
+  # ClickHouse schema. Web and workers start after it completes successfully,
+  # so migrations can never contend. Safe to re-run (idempotent).
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: [*app-database, *clickhouse-client]
+      AICONSHELL_RUN_SETUP: "1"
+    command: ["true"]
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: [*app-database, *clickhouse-client, *integration-credentials]
+      PORT: "3000"
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
+    command: ["./bin/rails", "server", "-b", "0.0.0.0", "-p", "3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/up > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # Control plane: interaction polling, coordination dispatch, outbound and
+  # EventLog delivery, recurring scheduler. Queue `control` only.
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${CONTROL_TARGET:-app}
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: [*app-database, *clickhouse-client, *integration-credentials, *ai-auth]
+    volumes:
+      - claude_auth:/private/claude
+      - codex_auth:/private/codex
+      - muse_auth:/private/muse
+    command: ["./bin/jobs", "--config-file=config/queue_control.yml"]
+
+  # Execution plane: AI CLI subprocess runs on queue `execution` only.
+  # Receives the database plus AI auth homes, and NOTHING ELSE: no
+  # GitHub/Jira/Teams/ClickHouse credentials (enforced by bin/check-compose
+  # and documented in docs/deployment.md).
+  execution:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${EXECUTION_TARGET:-app}
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: [*app-database, *ai-auth]
+    volumes:
+      - claude_auth:/private/claude
+      - codex_auth:/private/codex
+      - muse_auth:/private/muse
+    command: ["./bin/jobs", "--config-file=config/queue_execution.yml", "--skip-recurring"]
+
+  # Optional inbound tunnel for webhook demos. Almost never needed (the app
+  # polls), and never started by default. Requires NGROK_AUTHTOKEN.
+  ngrok:
+    image: ngrok/ngrok:3
+    profiles: ["tunnel"]
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    command: ["http", "web:3000"]
+    ports:
+      - "${NGROK_BIND:-127.0.0.1}:${NGROK_PORT:-4040}:4040"
+
+volumes:
+  pgdata:
+  clickhouse:
+  # Private AI subscription-auth stores. Persisted across restarts so token
+  # refresh survives; never committed, never baked into images.
+  claude_auth:
+  codex_auth:
+  muse_auth:

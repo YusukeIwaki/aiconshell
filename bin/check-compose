@@ -1,0 +1,161 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Static operations-config checks (stdlib only, no gems, no Docker, no DB).
+#
+#   ruby bin/check-compose
+#
+# Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
+# separated control/execution queues, no integration credentials on the
+# execution worker, a single migration process, loopback-bound ports, no
+# Docker socket mounts, and .env.example coverage of every compose variable.
+# Runs in CI (ops job) and locally before `docker compose up`.
+require "yaml"
+
+ROOT = File.expand_path("..", __dir__)
+failures = []
+ok_count = 0
+
+def check(failures, name)
+  yield
+  puts "check-compose: ok   - #{name}"
+  true
+rescue StandardError => e
+  puts "check-compose: FAIL - #{name}: #{e.message}"
+  failures << name
+  false
+end
+
+def assert(condition, message)
+  raise message unless condition
+end
+
+compose_path = File.join(ROOT, "compose.yml")
+compose = YAML.load_file(compose_path, aliases: true)
+services = compose.fetch("services")
+
+check(failures, "compose.yml declares web/control/execution/migrate/db/clickhouse") do
+  %w[web control execution migrate db clickhouse].each do |name|
+    assert(services.key?(name), "missing service #{name}")
+  end
+end
+
+check(failures, "ngrok is opt-in via the tunnel profile") do
+  ngrok = services.fetch("ngrok")
+  assert(Array(ngrok["profiles"]).include?("tunnel"), "ngrok must carry profiles: [\"tunnel\"]")
+end
+
+check(failures, "project name is per-worktree (COMPOSE_PROJECT_NAME)") do
+  assert(compose["name"].to_s.include?("COMPOSE_PROJECT_NAME"),
+    "top-level name: must reference COMPOSE_PROJECT_NAME")
+end
+
+app_services = %w[web control execution migrate]
+env_of = ->(name) do
+  env = services.dig(name, "environment")
+  assert(env.is_a?(Hash), "#{name}.environment must be a mapping, got #{env.class}")
+  env.transform_keys(&:to_s)
+end
+
+check(failures, "web/control/execution/migrate share one DATABASE_URL") do
+  urls = app_services.to_h { |name| [name, env_of.call(name)["DATABASE_URL"]] }
+  assert(urls.values.all? { |url| !url.to_s.empty? }, "DATABASE_URL must be set on #{app_services.join(', ')}")
+  assert(urls.values.uniq.size == 1, "DATABASE_URL differs: #{urls.keys.join(', ')}")
+end
+
+check(failures, "execution worker receives no integration credentials") do
+  forbidden = env_of.call("execution").keys.select do |key|
+    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|CLICKHOUSE_)/)
+  end
+  assert(forbidden.empty?, "forbidden keys on execution: #{forbidden.join(', ')}")
+end
+
+check(failures, "control worker runs queue control, execution runs queue execution") do
+  control_cmd = Array(services.dig("control", "command")).join(" ")
+  execution_cmd = Array(services.dig("execution", "command")).join(" ")
+  assert(control_cmd.include?("--config-file=config/queue_control.yml"), "control command: #{control_cmd}")
+  assert(execution_cmd.include?("--config-file=config/queue_execution.yml"), "execution command: #{execution_cmd}")
+  assert(execution_cmd.include?("--skip-recurring"), "execution must pass --skip-recurring")
+  assert(!control_cmd.include?("--skip-recurring"), "control must keep the recurring scheduler")
+end
+
+check(failures, "queue configs bind workers to a single queue each") do
+  control_q = YAML.load_file(File.join(ROOT, "config/queue_control.yml"))
+  execution_q = YAML.load_file(File.join(ROOT, "config/queue_execution.yml"))
+  control_queues = Array(control_q.dig("workers", 0, "queues")).map(&:to_s)
+  execution_queues = Array(execution_q.dig("workers", 0, "queues")).map(&:to_s)
+  assert(control_queues == ["control"], "queue_control workers: #{control_queues.inspect}")
+  assert(execution_queues == ["execution"], "queue_execution workers: #{execution_queues.inspect}")
+end
+
+check(failures, "exactly one migration setup process (migrate service)") do
+  assert(env_of.call("migrate")["AICONSHELL_RUN_SETUP"] == "1", "migrate must set AICONSHELL_RUN_SETUP=1")
+  %w[web control execution].each do |name|
+    assert(env_of.call(name)["AICONSHELL_RUN_SETUP"].nil?, "#{name} must not run setup")
+  end
+  %w[web control execution].each do |name|
+    dep = services.dig(name, "depends_on", "migrate", "condition")
+    assert(dep == "service_completed_successfully", "#{name} must wait for migrate (got #{dep.inspect})")
+  end
+end
+
+check(failures, "no service uses env_file (allow-listed environment only)") do
+  with_env_file = services.select { |_name, svc| svc.key?("env_file") }.keys
+  assert(with_env_file.empty?, "env_file on: #{with_env_file.join(', ')}")
+end
+
+check(failures, "no Docker socket mount anywhere") do
+  raw = File.read(compose_path)
+  assert(!raw.include?("docker.sock"), "compose.yml references docker.sock")
+end
+
+check(failures, "published ports bind loopback by default") do
+  services.each do |name, svc|
+    Array(svc["ports"]).each do |port|
+      text = port.to_s
+      assert(text.start_with?("127.0.0.1") || text.match?(/\A\$\{[A-Z_]+:-127\.0\.0\.1\}/),
+        "#{name} port #{text.inspect} is not loopback-bound by default")
+    end
+  end
+end
+
+check(failures, "db/clickhouse/web define healthchecks") do
+  %w[db clickhouse web].each do |name|
+    assert(services.dig(name, "healthcheck", "test"), "#{name} has no healthcheck.test")
+  end
+end
+
+check(failures, "Dockerfile defaults to app, ai stays optional") do
+  dockerfile = File.read(File.join(ROOT, "Dockerfile"))
+  stages = dockerfile.scan(/^FROM \S+ AS (\S+)/).flatten
+  assert(stages.include?("ai"), "missing ai stage")
+  assert(stages.last == "app", "default (last) stage must be app, got #{stages.last.inspect}")
+  assert(dockerfile.include?("USER 1000:1000"), "runtime must drop to non-root")
+  assert(dockerfile.include?("type=secret,id=muse_cli,required=false"),
+    "muse CLI must enter only via an optional build secret")
+end
+
+check(failures, ".env.example documents every compose variable") do
+  example = File.read(File.join(ROOT, ".env.example"))
+  raw = File.read(compose_path)
+  vars = raw.scan(/\$\{([A-Z][A-Z0-9_]*)/).flatten.uniq
+  missing = vars.reject { |var| example.match?(/^#?\s*#{var}=/m) }
+  assert(missing.empty?, "undocumented variables: #{missing.join(', ')}")
+end
+
+check(failures, "CI runs unit/integration/zeitwerk without live providers") do
+  ci_path = File.join(ROOT, ".github/workflows/ci.yml")
+  ci = YAML.load_file(ci_path)
+  jobs = ci.fetch("jobs").keys.map(&:to_s)
+  %w[unit integration zeitwerk ops clickhouse-smoke].each do |job|
+    assert(jobs.include?(job), "CI missing job #{job}")
+  end
+  raw = File.read(ci_path)
+  assert(raw.include?("zeitwerk:check"), "CI must run zeitwerk:check")
+  %w[NGROK_AUTHTOKEN CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY].each do |secret|
+    assert(!raw.include?(secret), "CI must not reference #{secret}")
+  end
+end
+
+puts "check-compose: failures=#{failures.size}"
+exit(failures.empty? ? 0 : 1)

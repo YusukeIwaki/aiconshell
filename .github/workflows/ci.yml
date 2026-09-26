@@ -1,0 +1,120 @@
+# Test-only CI. GitHub Actions is never the runtime scheduler: production
+# scheduling is Solid Queue recurring jobs on the control worker.
+#
+# Jobs:
+#   unit            Smartest unit suite (no DB, no network, no AI, no creds)
+#   integration     Smartest integration suite against a PostgreSQL service
+#   zeitwerk        Rails autoloading check
+#   ops             compose config + static ops contracts + image builds
+#                   (app default and optional ai target; no provider login)
+#   clickhouse-smoke  real ClickHouse service + schema setup verification
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in lockstep with .ruby-version and the Dockerfile RUBY_VERSION.
+  RUBY_VERSION: "3.4.9"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+          bundler-cache: true
+      - name: Unit suite (no DB)
+        run: bin/test unit
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: aiconshell_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d aiconshell_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      RAILS_ENV: test
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aiconshell_test
+      SECRET_KEY_BASE: ci-dummy-secret-key-base-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+          bundler-cache: true
+      - name: Prepare test database
+        run: bundle exec rails db:prepare
+      - name: Integration suite (PostgreSQL)
+        run: bin/test integration
+
+  zeitwerk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RAILS_ENV: test
+      SECRET_KEY_BASE: ci-dummy-secret-key-base-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+          bundler-cache: true
+      - name: Zeitwerk check
+        run: bin/rails zeitwerk:check
+
+  ops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose config validates
+        run: docker compose config --quiet
+      - name: Static ops contracts
+        run: ruby bin/check-compose
+      - name: Build default (app) image
+        run: docker build -t aiconshell:ci-app .
+      - name: Build optional AI worker image (no Muse secret, no login)
+        run: docker build --target ai -t aiconshell:ci-ai .
+
+  clickhouse-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.11.7
+        env:
+          CLICKHOUSE_DB: aiconshell
+          CLICKHOUSE_USER: aiconshell
+          CLICKHOUSE_PASSWORD: aiconshell_ci
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user aiconshell --password aiconshell_ci --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      CLICKHOUSE_URL: http://localhost:8123
+      CLICKHOUSE_DATABASE: aiconshell
+      CLICKHOUSE_USER: aiconshell
+      CLICKHOUSE_PASSWORD: aiconshell_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply EventLog schema
+        run: ./bin/setup-clickhouse

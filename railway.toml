@@ -1,0 +1,27 @@
+# Railway service config (Config-as-Code) for the WEB service.
+#
+# Attach the same repository as three services; this file is the web default
+# (root). Control/execution overrides live in the dashboard per
+# docs/deployment.md ("Railway" section): same image, different start
+# commands, no healthcheck path, no predeploy command.
+#
+# Provision from the Railway catalog in the same project/environment:
+#   - PostgreSQL plugin  -> provides DATABASE_URL (reference it, see below)
+#   - ClickHouse template -> provides CLICKHOUSE_URL/USER/PASSWORD/DATABASE
+# Attach private volumes for /private/claude, /private/codex, /private/muse
+# on the control and execution services only.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Thruster fronts Puma and honors Railway's injected PORT.
+startCommand = "./bin/thrust ./bin/rails server"
+# Single migration/setup step before each deploy (db:prepare is idempotent;
+# setup-clickhouse re-applies the IF NOT EXISTS schema, then verifies it).
+preDeployCommand = "./bin/rails db:prepare && ./bin/setup-clickhouse"
+healthcheckPath = "/up"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# Run the Smartest suites (see AGENTS.md).
+#
+#   bin/test [unit|integration|all] [-- extra smartest args...]
+#
+# - unit:        smartest/unit/**/*_test.rb, no database, no network, no AI.
+# - integration: smartest/integration/**/*_test.rb against PostgreSQL
+#                (TEST_DATABASE_URL, must end with _test); prepared with
+#                `RAILS_ENV=test bin/rails db:prepare` first.
+#
+# A suite directory that does not exist yet is skipped with a warning so the
+# runner stays green while lanes land progressively; once present, its tests
+# must pass. CI invokes `bin/test unit` and `bin/test integration`.
+#
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$APP_ROOT"
+
+suite="${1:-all}"
+if [[ "$suite" == "--" ]]; then suite="all"; else shift 2>/dev/null || true; fi
+extra=()
+if [[ "${1:-}" == "--" ]]; then shift; fi
+extra=("$@")
+
+run_suite() {
+  local name="$1" dir="$2"
+  if [[ ! -d "$dir" ]]; then
+    echo "bin/test: $name: $dir not present yet, skipping" >&2
+    return 0
+  fi
+  echo "bin/test: $name ($dir)" >&2
+  bundle exec smartest "$dir" "${extra[@]}"
+}
+
+case "$suite" in
+  unit)
+    run_suite "unit" "smartest/unit"
+    ;;
+  integration)
+    export RAILS_ENV=test
+    run_suite "integration" "smartest/integration"
+    ;;
+  all)
+    run_suite "unit" "smartest/unit"
+    export RAILS_ENV=test
+    run_suite "integration" "smartest/integration"
+    ;;
+  *)
+    echo "usage: bin/test [unit|integration|all] [-- smartest args...]" >&2
+    exit 2
+    ;;
+esac

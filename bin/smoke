@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# Smoke-test a running compose stack. No AI credentials, binaries, or external
+# accounts required.
+#
+#   docker compose up --build -d   # first, in another terminal (or -d here)
+#   ./bin/smoke
+#
+# Checks: web /up, PostgreSQL SELECT 1, ClickHouse ping + event_log table,
+# control/execution containers running, and one shared DATABASE_URL across
+# web/control/execution. Endpoints follow the same *_BIND/*_PORT variables as
+# compose.yml. Never prints credentials.
+#
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$APP_ROOT"
+
+WEB_URL="${WEB_URL:-http://127.0.0.1:${WEB_PORT:-3000}}"
+DB_HOST="${SMOKE_DB_HOST:-127.0.0.1}"
+DB_PORT="${POSTGRES_PORT:-5432}"
+DB_USER="${POSTGRES_USER:-aiconshell}"
+DB_NAME="${POSTGRES_DB:-aiconshell_development}"
+CH_URL="${SMOKE_CLICKHOUSE_URL:-http://127.0.0.1:${CLICKHOUSE_PORT:-8123}}"
+CH_DB="${CLICKHOUSE_DATABASE:-aiconshell}"
+CH_TABLE="${CLICKHOUSE_TABLE:-event_log}"
+CH_USER="${CLICKHOUSE_USER:-aiconshell}"
+PROJECT="${COMPOSE_PROJECT_NAME:-aiconshell}"
+
+failures=0
+check() { # name, command...
+  local name="$1"; shift
+  if "$@" > /dev/null 2>&1; then
+    echo "smoke: ok   - $name"
+  else
+    echo "smoke: FAIL - $name" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+# 1. Web health endpoint.
+check "web $WEB_URL/up returns 200" \
+  curl -fsSL --max-time 10 "$WEB_URL/up"
+
+# 2. PostgreSQL reachable with the compose-published port.
+if command -v pg_isready > /dev/null 2>&1; then
+  check "postgres $DB_HOST:$DB_PORT accepts connections" \
+    pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME"
+elif command -v psql > /dev/null 2>&1; then
+  check "postgres $DB_HOST:$DB_PORT answers SELECT 1" \
+    psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=$DB_NAME connect_timeout=10" -tAc "SELECT 1"
+else
+  # Fallback through the compose `db` service (needs no local client).
+  check "postgres answers SELECT 1 (via compose db service)" \
+    docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1"
+fi
+
+# 3. ClickHouse ping + EventLog table present.
+check "clickhouse $CH_URL answers /ping" \
+  curl -fsSL --max-time 10 "$CH_URL/ping"
+table_check() {
+  local out
+  out="$(curl -fsSL --max-time 10 --user "$CH_USER:${CLICKHOUSE_PASSWORD:-}" \
+    --get --data-urlencode "database=$CH_DB" \
+    --data-urlencode "query=EXISTS TABLE $CH_TABLE" "$CH_URL/")"
+  [[ "$out" == "1" ]]
+}
+check "clickhouse table $CH_DB.$CH_TABLE exists" table_check
+
+# 4. Workers running.
+for svc in control execution; do
+  state="$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | awk -v s="$svc" '$1==s{print $2; exit}')"
+  if [[ "$state" == "running" ]]; then
+    echo "smoke: ok   - compose service $svc is running"
+  else
+    echo "smoke: FAIL - compose service $svc is not running (state: ${state:-unknown})" >&2
+    failures=$((failures + 1))
+  fi
+done
+
+# 5. One shared DATABASE_URL across web/control/execution.
+urls=()
+for svc in web control execution; do
+  if val="$(docker compose exec -T "$svc" printenv DATABASE_URL 2>/dev/null)"; then
+    urls+=("$val")
+  else
+    echo "smoke: FAIL - cannot read DATABASE_URL from $svc" >&2
+    failures=$((failures + 1))
+  fi
+done
+if (( ${#urls[@]} == 3 )); then
+  if [[ "${urls[0]}" == "${urls[1]}" && "${urls[1]}" == "${urls[2]}" ]]; then
+    echo "smoke: ok   - web/control/execution share one DATABASE_URL"
+  else
+    echo "smoke: FAIL - DATABASE_URL differs between services" >&2
+    failures=$((failures + 1))
+  fi
+fi
+
+echo "smoke: project=$PROJECT failures=$failures"
+exit "$([ "$failures" -eq 0 ] && echo 0 || echo 1)"

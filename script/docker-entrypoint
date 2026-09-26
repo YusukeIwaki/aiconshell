@@ -1,0 +1,29 @@
+#!/bin/bash -e
+#
+# Container entrypoint for compose and Railway.
+#
+# Database/ClickHouse setup runs ONLY when AICONSHELL_RUN_SETUP=1, which is
+# set exclusively on the one-shot `migrate` service (compose) or the predeploy
+# path (Railway). Web and worker processes boot straight into their commands,
+# so concurrent `db:prepare` runs can never contend, and a missing AI binary
+# or credential can never block startup (CLIs are resolved lazily at
+# execution time by the AI lane).
+#
+# The Rails-foundation `bin/docker-entrypoint` remains available for
+# Kamal/hand-run flows; this script is the compose/Railway wiring.
+
+# Enable jemalloc for reduced memory usage and latency.
+if [ -z "${LD_PRELOAD+x}" ]; then
+  LD_PRELOAD=$(find /usr/lib -name libjemalloc.so.2 -print -quit)
+  export LD_PRELOAD
+fi
+
+if [ "${AICONSHELL_RUN_SETUP:-0}" = "1" ]; then
+  echo "==> aiconshell setup: db:prepare" >&2
+  ./bin/rails db:prepare
+
+  echo "==> aiconshell setup: clickhouse schema" >&2
+  ./bin/setup-clickhouse
+fi
+
+exec "${@}"
