@@ -24,7 +24,8 @@ module Aiconshell
       operation "latest_events",
         input_schema: Schemas::LATEST_EVENTS_INPUT,
         output_schema: Schemas::LATEST_EVENTS_OUTPUT,
-        scope: "example:read"
+        scope: "example:read",
+        read_only: true
 
       private
 
@@ -73,6 +74,10 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
   取得失敗は明示的なエラーとして返し、HTTP ページの継続先の origin を検証します。
 - 新規課題、返信などの操作にも入出力スキーマを宣言します。未対応操作は
   `unsupported: true, reason: "..."` で一覧に理由を表示できます。
+- 操作に明示の Boolean `read_only` を宣言します。既定は `false` で、catalog は
+  常に `true` / `false` を返します。`latest_events` などの参照操作は `true`、
+  返信・作成などの書込操作は `false` のままにします。
+  `Interaction::QueryService` は `read_only: true` の操作だけを呼び出します。
 
 `smartest/plugins/*_test.rb` の注入された transport / clock / env を使い、認証情報や
 実アカウントなしで正常系、スキーマ違反、改ページ、重複、429、曖昧な投稿失敗を確認します。

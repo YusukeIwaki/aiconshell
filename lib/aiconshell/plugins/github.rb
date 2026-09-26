@@ -30,7 +30,13 @@ module Aiconshell
       operation "latest_events",
                 input_schema: Schemas::LATEST_EVENTS_INPUT,
                 output_schema: Schemas::LATEST_EVENTS_OUTPUT,
-                scope: "github:read"
+                scope: "github:read",
+                read_only: true
+      operation "list_issues",
+                input_schema: Schemas::LIST_ISSUES_INPUT,
+                output_schema: Schemas::LIST_ISSUES_OUTPUT,
+                scope: "github:read",
+                read_only: true
       operation "reply",
                 input_schema: Schemas::REPLY_INPUT,
                 output_schema: Schemas::WRITE_OUTPUT,
@@ -52,6 +58,16 @@ module Aiconshell
       OVERLAP_SECONDS = 60
       STREAM_NAMES = %w[issues issue_comments review_comments workflow_runs].freeze
       TIMESTAMP_PATTERN = /\A\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\z/
+      # list_issues bounds: one page of 30 open issues per call. Worst-case
+      # truncated output stays within Interaction::QueryService's byte budget.
+      LIST_ISSUES_PER_PAGE = 30
+      LIST_ISSUES_MAX_ISSUES = 30
+      LIST_ISSUES_MAX_CURSOR_PAGE = 100
+      LIST_ISSUES_BODY_LIMIT = 2000
+      LIST_ISSUES_TITLE_LIMIT = 300
+      LIST_ISSUES_MAX_LABELS = 10
+      LIST_ISSUES_LABEL_LIMIT = 100
+      LIST_ISSUES_URL_LIMIT = 512
 
       def configured?(env)
         present?(env["GITHUB_APP_ID"]) &&
@@ -279,6 +295,53 @@ module Aiconshell
         } }
       end
 
+      # On-demand read of current open issues (pull requests excluded).
+      # Single fixed page per call; continuation is an explicit page cursor
+      # bound to this repository and query. Scope, cursor, and Link targets
+      # are validated before any credential use or network I/O.
+      def handle_list_issues(input, ctx)
+        match = SCOPE_PATTERN.match(input["scope"].to_s)
+        unless match
+          raise InputInvalid.new(plugin: plugin_id, operation: "list_issues",
+                                 details: ['scope must look like "owner/repo"'])
+        end
+
+        full = "#{match[:owner]}/#{match[:repo]}"
+        api = api_base(ctx.env)
+        page = validated_list_cursor(input, full)
+        first_url = list_issues_url(api, full, page)
+        token = installation_token(ctx)
+        headers = {
+          "Authorization" => "Bearer #{token}",
+          "Accept" => "application/vnd.github+json",
+          "X-GitHub-Api-Version" => API_VERSION
+        }
+
+        items, nxt = read_page(ctx, headers, first_url, first_url, [api],
+                               page_size: LIST_ISSUES_PER_PAGE)
+        issues = []
+        items.each do |item|
+          next unless item.is_a?(Hash)
+          next unless item["pull_request"].nil?
+
+          issues << normalize_list_issue!(item)
+          break if issues.length >= LIST_ISSUES_MAX_ISSUES
+        end
+
+        truncated = issues.any? do |issue|
+          issue["body_truncated"] || issue["title_truncated"] ||
+            issue["labels_truncated"] || issue["url_truncated"]
+        end
+        if nxt
+          { "issues" => issues, "complete" => false,
+            "next_cursor" => { "version" => 1, "scope" => full, "page" => page + 1 },
+            "truncated" => truncated }
+        else
+          { "issues" => issues, "complete" => true,
+            "next_cursor" => nil, "truncated" => truncated }
+        end
+      end
+
       def handle_reply(input, ctx)
         match = RESOURCE_PATTERN.match(input["resource_id"].to_s)
         unless match
@@ -458,7 +521,7 @@ module Aiconshell
         end
         nxt = Http.next_link(response.headers)
         if nxt
-          nxt = validate_page_url!(nxt, first_url, allowed_hosts)
+          nxt = validate_page_url!(nxt, first_url, allowed_hosts, operation: ctx.operation)
           current_page = URI.decode_www_form(URI.parse(url).query.to_s).to_h.fetch("page", "1").to_i
           next_page = URI.decode_www_form(URI.parse(nxt).query.to_s).to_h.fetch("page").to_i
           unless next_page == current_page + 1
@@ -498,10 +561,10 @@ module Aiconshell
         items
       end
 
-      def validate_page_url!(url, first_url, allowed_hosts, from_cursor: false)
+      def validate_page_url!(url, first_url, allowed_hosts, from_cursor: false, operation: "latest_events")
         error = from_cursor ? InputInvalid : OutputInvalid
         unless url.is_a?(String) && !url.empty?
-          raise error.new(plugin: plugin_id, operation: "latest_events",
+          raise error.new(plugin: plugin_id, operation: operation,
                           details: ["cursor pagination URL must be a nonempty string"])
         end
         uri = Http.check_host!(url, allowed_hosts)
@@ -509,22 +572,28 @@ module Aiconshell
         pairs = URI.decode_www_form(uri.query.to_s)
         query = pairs.to_h
         page = query.delete("page")
+        expected_query = URI.decode_www_form(expected.query.to_s).to_h
+        expected_query.delete("page")
         path_matches = uri.path.casecmp?(expected.path) ||
                        (!from_cursor && repository_id_path?(uri.path, expected.path))
         valid = uri.fragment.nil? && path_matches &&
                 pairs.map(&:first).uniq.length == pairs.length &&
-                query == URI.decode_www_form(expected.query.to_s).to_h &&
+                query == expected_query &&
                 page.is_a?(String) && page.match?(/\A[1-9]\d*\z/) && page.to_i >= 2
         unless valid
-          raise error.new(plugin: plugin_id, operation: "latest_events",
+          raise error.new(plugin: plugin_id, operation: operation,
                           details: ["cursor pagination URL must match its repository, stream, filters, and page size"])
         end
         # GitHub can advertise /repositories/{id}/... in its Link header.
         # Use it only as a page-number hint; requests and durable checkpoints
         # remain bound to the caller's named repository and exact endpoint.
-        "#{first_url}&page=#{page}"
+        rebuilt = URI.parse(first_url)
+        base_params = URI.decode_www_form(rebuilt.query.to_s).reject { |key, _| key == "page" }
+        base_params << ["page", page]
+        rebuilt.query = URI.encode_www_form(base_params)
+        rebuilt.to_s
       rescue ArgumentError
-        raise error.new(plugin: plugin_id, operation: "latest_events",
+        raise error.new(plugin: plugin_id, operation: operation,
                         details: ["cursor pagination URL has invalid parameters"])
       end
 
@@ -563,6 +632,92 @@ module Aiconshell
 
       def invalid_cursor!(reason)
         raise InputInvalid.new(plugin: plugin_id, operation: "latest_events", details: [reason])
+      end
+
+      def list_issues_url(api, full, page)
+        "#{api}/repos/#{full}/issues?state=open&sort=created&direction=desc" \
+          "&per_page=#{LIST_ISSUES_PER_PAGE}&page=#{page}"
+      end
+
+      # Null/omitted cursor starts at page 1. Continuations carry an explicit
+      # versioned page bound to this repository; anything else is rejected
+      # before credentials or network are used.
+      def validated_list_cursor(input, full)
+        cursor = validated_cursor(input, "list_issues")
+        return 1 if cursor.empty?
+
+        unless cursor["version"] == 1 && cursor["scope"] == full &&
+               (cursor.keys - %w[version scope page]).empty? &&
+               cursor["page"].is_a?(Integer) &&
+               cursor["page"] >= 2 && cursor["page"] <= LIST_ISSUES_MAX_CURSOR_PAGE
+          raise InputInvalid.new(plugin: plugin_id, operation: "list_issues",
+                                 details: ["cursor must be version 1 for this repository with page 2..#{LIST_ISSUES_MAX_CURSOR_PAGE}"])
+        end
+        cursor["page"]
+      end
+
+      def normalize_list_issue!(item)
+        id = item["id"]
+        number = item["number"]
+        title = item["title"]
+        body = item.key?("body") ? item["body"] : ""
+        body = "" if body.nil?
+        labels = item["labels"]
+        state = item["state"]
+        url = item["html_url"]
+        unless id.is_a?(Integer) && id >= 1 &&
+               number.is_a?(Integer) && number >= 1 &&
+               title.is_a?(String) && body.is_a?(String) &&
+               labels.is_a?(Array) && state == "open" &&
+               (url.nil? || url.is_a?(String))
+          raise OutputInvalid.new(plugin: plugin_id, operation: "list_issues",
+                                  details: ["GitHub issue had an unexpected shape"])
+        end
+
+        title_text, title_cut = truncate_text!(title, LIST_ISSUES_TITLE_LIMIT, "title")
+        body_text, body_cut = truncate_text!(body, LIST_ISSUES_BODY_LIMIT, "body")
+        label_names, labels_cut = normalize_labels!(labels)
+        url_text, url_cut = normalize_url!(url)
+        { "id" => id, "number" => number,
+          "title" => title_text, "title_truncated" => title_cut,
+          "body" => body_text, "body_truncated" => body_cut,
+          "labels" => label_names, "labels_truncated" => labels_cut,
+          "state" => "open", "url" => url_text, "url_truncated" => url_cut }
+      end
+
+      def truncate_text!(value, limit, _field)
+        return [value, false] if value.length <= limit
+
+        [value[0, limit], true]
+      end
+
+      def normalize_labels!(labels)
+        names = labels.map do |label|
+          name = label.is_a?(Hash) ? label["name"] : label
+          unless name.is_a?(String)
+            raise OutputInvalid.new(plugin: plugin_id, operation: "list_issues",
+                                    details: ["GitHub issue label had an unexpected shape"])
+          end
+          name
+        end
+        cut = names.length > LIST_ISSUES_MAX_LABELS
+        names = names.first(LIST_ISSUES_MAX_LABELS)
+        names = names.map do |name|
+          if name.length > LIST_ISSUES_LABEL_LIMIT
+            cut = true
+            name[0, LIST_ISSUES_LABEL_LIMIT]
+          else
+            name
+          end
+        end
+        [names, cut]
+      end
+
+      def normalize_url!(url)
+        return [nil, false] if url.nil?
+        return [url, false] if url.length <= LIST_ISSUES_URL_LIMIT
+
+        [nil, true]
       end
 
       def strict_time(value)

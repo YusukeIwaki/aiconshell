@@ -30,7 +30,8 @@ module Aiconshell
       operation "latest_events",
                 input_schema: Schemas::LATEST_EVENTS_INPUT,
                 output_schema: Schemas::LATEST_EVENTS_OUTPUT,
-                scope: "teams:read"
+                scope: "teams:read",
+                read_only: true
       operation "reply",
                 input_schema: Schemas::REPLY_INPUT,
                 output_schema: Schemas::WRITE_OUTPUT,

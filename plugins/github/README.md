@@ -50,6 +50,7 @@ poll のみの場合:
 | latest_events: workflow runs | `GET /repos/{owner}/{repo}/actions/runs` |
 | reply（issue / PR 共通） | `POST /repos/{owner}/{repo}/issues/{number}/comments` |
 | create_issue | `POST /repos/{owner}/{repo}/issues` |
+| list_issues | `GET /repos/{owner}/{repo}/issues?state=open&sort=created&direction=desc&per_page=30&page=N` |
 
 ## 操作
 
@@ -60,6 +61,27 @@ poll のみの場合:
   途中で HTTP・検証エラーが発生した場合は例外を送出し、部分 cursor を返さない。
 - `reply`: `resource_id` は `issue:owner/repo#123` / `pr:owner/repo#123`。
 - `create_issue`: `scope` は `owner/repo`。
+- `list_issues`（`read_only: true`）: 現在の open issue を 1 ページ分読む
+  on-demand 照会。`pull_request` キーを持つ PR は除外する。入力は
+  `{"scope": "owner/repo", "cursor": null または {"version":1,"scope":"owner/repo","page":N}}`。
+  出力は `{"issues": [...], "complete": bool, "next_cursor": object|null, "truncated": bool}`。
+  各 issue は `id` / `number` / `title` / `body` / `labels` / `state: "open"` / `url` と
+  `title_truncated` / `body_truncated` / `labels_truncated` / `url_truncated` の
+  明示フラグを持つ。`complete: true` のとき `next_cursor` は null、
+  未読ページが残るときは `complete: false` で次ページの cursor を返す。
+  部分結果が `complete: true` を主張しない。cursor は当該 repository と
+  固定クエリに束縛し、token 取得前に検証する。
+
+## list_issues の固定制限
+
+- 1 回の呼び出しで 1 ページ（`per_page=30`）、最大 30 件の正規化 issue。
+- 本文 2000 文字、件名 300 文字、ラベル 10 件×各 100 文字、URL 512 文字で
+  打ち切り、対応する `*_truncated` を `true` にする。本文が長い通常の issue も
+  全体を読まずに捨てない。URL が制限超えの場合は `url: null` とする。
+- cursor の `page` は 2〜100。`Link: rel="next"` の origin・path・filter・
+  ページ件数が一致し、現在ページの次を指す場合のみ継続ありと判定する。
+- worst-case の打ち切り済み出力は `Interaction::QueryService` の
+  128,000 バイト予算に収まる。権限は Issues Read-only で足りる。
 
 ## Cursor と履歴巡回
 

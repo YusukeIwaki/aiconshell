@@ -10,7 +10,7 @@ test("default registry exposes the github/jira/teams capability catalog") do
 
   expect(by_id.keys).to eq(%w[github jira teams])
   expect(by_id["github"]["operations"].map { |op| op["name"] })
-    .to eq(%w[latest_events reply create_issue])
+    .to eq(%w[latest_events list_issues reply create_issue])
   expect(by_id["teams"]["operations"].map { |op| op["name"] })
     .to eq(%w[latest_events reply send_message create_issue])
 
