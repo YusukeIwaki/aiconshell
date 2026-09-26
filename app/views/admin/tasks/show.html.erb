@@ -1,0 +1,129 @@
+<% content_for(:title, "タスク ##{@task.id}") %>
+<h1>タスク #<%= @task.id %>：<%= @task.title %></h1>
+<p><%= link_to "← タスクボードに戻る", admin_tasks_path %></p>
+
+<div class="admin-card">
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <tr><th>状態</th><td><span class="admin-badge admin-badge-idle"><%= task_status_label(@task.status) %></span>（<%= @task.status %>）</td></tr>
+      <tr><th>優先度</th><td><%= @task.priority %></td></tr>
+      <tr><th>説明</th><td><div class="admin-verbatim"><%= @task.description %></div></td></tr>
+      <tr><th>作業計画</th><td><div class="admin-verbatim"><%= @task.work_plan.presence || "未設定" %></div></td></tr>
+      <tr><th>参照元</th><td><%= @task.source_plugin %> <%= @task.source_resource_id %></td></tr>
+      <tr><th>次回予定</th><td><%= @task.next_action_at %></td></tr>
+      <tr><th>更新日時</th><td><%= @task.updated_at %></td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>フィードバック（<%= @feedbacks.size %>件）</h2>
+<% if @feedbacks.empty? %>
+  <div class="admin-card"><p>まだフィードバックはありません。</p></div>
+<% else %>
+  <% @feedbacks.each do |feedback| %>
+    <div class="admin-card">
+      <p><strong><%= feedback.author.presence || "匿名" %></strong>（人間・<%= feedback.created_at %>）
+        <% if feedback.processed_at %>
+          <span class="admin-badge admin-badge-good">取込済み</span>
+        <% else %>
+          <span class="admin-badge admin-badge-warn">未取込</span>
+        <% end %>
+      </p>
+      <div class="admin-verbatim"><%= feedback.body %></div>
+    </div>
+  <% end %>
+<% end %>
+
+<h2>フィードバックを投稿する</h2>
+<div class="admin-card">
+  <p>投稿内容は整理層への情報として保存され、タスクの状態・優先度は直接変更しません。</p>
+  <%= form_with model: [@task, @feedback], url: admin_task_feedbacks_path(@task), scope: :task_feedback do |form| %>
+    <div class="admin-form-grid">
+      <%= form.label :author, "投稿者" %>
+      <%= form.text_field :author, maxlength: 200 %>
+      <%= form.label :body, "内容" %>
+      <%= form.text_area :body, maxlength: 10_000, required: true %>
+    </div>
+    <div class="admin-actions">
+      <%= form.submit "投稿する", class: "admin-btn" %>
+    </div>
+  <% end %>
+</div>
+
+<h2>実行履歴（<%= @runs.size %>件）</h2>
+<% if @runs.empty? %>
+  <div class="admin-card"><p>実行履歴はありません。</p></div>
+<% else %>
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <tr>
+        <th>ID</th><th>状態</th><th>provider</th><th>model</th><th>effort</th><th>開始</th><th>終了</th><th>エラーコード</th><th>エラー</th>
+      </tr>
+      <% @runs.each do |run| %>
+        <tr>
+          <td><%= run.id %></td>
+          <td><%= run.status %></td>
+          <td><%= run.provider %></td>
+          <td><%= run.model %></td>
+          <td><%= run.effort %></td>
+          <td><%= run.started_at %></td>
+          <td><%= run.finished_at %></td>
+          <td><%= run.error_code %></td>
+          <td><%= run.error %></td>
+        </tr>
+        <tr id="run-result-<%= run.id %>">
+          <td colspan="9">
+            <% result = run.result.is_a?(Hash) ? run.result : {} %>
+            <% if result["outcome"].is_a?(String) || result["summary"].is_a?(String) %>
+              <% if result["outcome"].is_a?(String) %>
+                <p><strong>結果（outcome）:</strong> <%= result["outcome"] %></p>
+              <% end %>
+              <% if result["summary"].is_a?(String) %>
+                <strong>実行内容の要約</strong>
+                <div class="admin-verbatim"><%= result["summary"] %></div>
+              <% end %>
+            <% else %>
+              <p>構造化された実行結果はまだありません。</p>
+            <% end %>
+          </td>
+        </tr>
+      <% end %>
+    </table>
+  </div>
+<% end %>
+
+<h2>送信アクション（<%= @outbound_actions.size %>件）</h2>
+<p>整理層が起案し対話層が配送する送信意図の一覧です。ここからの再送操作はできません。</p>
+<% if @outbound_actions.empty? %>
+  <div class="admin-card"><p>送信アクションはありません。</p></div>
+<% else %>
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <tr>
+        <th>ID</th><th>プラグイン</th><th>操作</th><th>状態</th><th>試行</th><th>エラーコード</th><th>エラー</th>
+      </tr>
+      <% @outbound_actions.each do |action| %>
+        <tr>
+          <td><%= action.id %></td>
+          <td><%= action.plugin %></td>
+          <td><%= action.operation %></td>
+          <td>
+            <% if action.status == "uncertain" %>
+              <span class="admin-badge admin-badge-warn"><%= outbound_status_label(action.status) %></span>
+            <% elsif action.status == "failed" %>
+              <span class="admin-badge admin-badge-bad"><%= outbound_status_label(action.status) %></span>
+            <% elsif action.status == "sent" %>
+              <span class="admin-badge admin-badge-good"><%= outbound_status_label(action.status) %></span>
+            <% else %>
+              <span class="admin-badge admin-badge-idle"><%= outbound_status_label(action.status) %></span>
+            <% end %>
+            （<%= action.status %>）
+          </td>
+          <td><%= action.attempts %></td>
+          <td><%= action.error_code %></td>
+          <td><%= action.error %></td>
+        </tr>
+      <% end %>
+    </table>
+  </div>
+<% end %>

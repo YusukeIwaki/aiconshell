@@ -1,0 +1,59 @@
+<% content_for(:title, "プラグイン設定状況") %>
+<h1>プラグイン設定状況</h1>
+<p>各プラグインの対応操作と、設定に必要な環境変数<strong>名</strong>の一覧です。値（秘密）は表示しません。</p>
+
+<% if !@plugins_available %>
+  <div class="admin-card">
+    <p><span class="admin-badge admin-badge-idle">診断不可</span>
+      プラグイン機能はまだ接続されていません。他の管理ページは利用できます。</p>
+  </div>
+<% elsif @plugins_error %>
+  <div class="admin-card">
+    <p><span class="admin-badge admin-badge-bad">取得失敗</span>
+      プラグイン一覧の取得でエラーが発生しました（<%= @plugins_error %>）。他の管理ページは利用できます。</p>
+  </div>
+<% elsif @entries.empty? %>
+  <div class="admin-card"><p>登録済みプラグインはありません。</p></div>
+<% else %>
+  <% @entries.each do |entry| %>
+    <div class="admin-card">
+      <h2 style="margin-top:0">
+        <%= entry["id"] || entry[:id] %>
+        <% if entry["configured"] || entry[:configured] %>
+          <span class="admin-badge admin-badge-good">設定済み</span>
+        <% else %>
+          <span class="admin-badge admin-badge-warn">未設定</span>
+        <% end %>
+      </h2>
+      <p>必要な環境変数（名前のみ）：
+        <% required_env = entry["required_env"] || entry[:required_env] || [] %>
+        <% if required_env.empty? %>
+          なし
+        <% else %>
+          <% required_env.each do |name| %>
+            <code class="admin-env"><%= name %></code>
+          <% end %>
+        <% end %>
+      </p>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <tr><th>操作</th><th>scope</th><th>状態</th></tr>
+          <% Array(entry["operations"] || entry[:operations]).each do |op| %>
+            <tr>
+              <td><%= op["name"] || op[:name] %></td>
+              <td><%= op["scope"] || op[:scope] || "―" %></td>
+              <td>
+                <% if op["unsupported"] || op[:unsupported] %>
+                  <span class="admin-badge admin-badge-idle">非対応</span>
+                  <%= op["reason"] || op[:reason] %>
+                <% else %>
+                  <span class="admin-badge admin-badge-good">対応</span>
+                <% end %>
+              </td>
+            </tr>
+          <% end %>
+        </table>
+      </div>
+    </div>
+  <% end %>
+<% end %>
