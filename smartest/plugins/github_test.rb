@@ -21,33 +21,54 @@ def github_issue(number, updated:, pr: false, body: "body", title: "title")
   issue
 end
 
+def github_repo_issue_comment(id, issue_number, updated:, body: "nice")
+  {
+    "id" => id, "body" => body, "updated_at" => updated, "created_at" => updated,
+    "html_url" => "https://github.com/o/r/issues/#{issue_number}#c#{id}",
+    "issue_url" => "#{GH}/repos/o/r/issues/#{issue_number}",
+    "user" => { "login" => "reviewer", "id" => 2, "type" => "User" }
+  }
+end
+
+def github_repo_review_comment(id, pr_number, updated:, body: "nit", path: "a.rb")
+  {
+    "id" => id, "body" => body, "path" => path,
+    "updated_at" => updated, "created_at" => updated,
+    "html_url" => "https://github.com/o/r/pull/#{pr_number}#dc#{id}",
+    "pull_request_url" => "#{GH}/repos/o/r/pulls/#{pr_number}",
+    "user" => { "login" => "bot", "id" => 3, "type" => "Bot" }
+  }
+end
+
+def github_empty_lists(transport)
+  transport.stub_json("GET", %r{/repos/o/r/issues/comments}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
+end
+
 test("github poll builds real resource requests with paging") do |registry:, transport:|
   github_token_stub(transport)
   page1 = "#{GH}/repos/o/r/issues?state=all&sort=updated&direction=asc&per_page=100"
   page2 = "#{GH}/repos/o/r/issues?page=2&per_page=100"
+  repo_comments_url = "#{GH}/repos/o/r/issues/comments?sort=updated&direction=asc&per_page=100"
+  repo_rcomments_url = "#{GH}/repos/o/r/pulls/comments?sort=updated&direction=asc&per_page=100"
   transport.stub_json("GET", page1,
-                      body: [github_issue(1, updated: "2026-09-26T12:01:00Z"),
-                             github_issue(2, updated: "2026-09-26T12:02:00Z", pr: true)],
+                      body: [github_issue(1, updated: "2026-09-26T12:01:00Z", body: "issue one"),
+                             github_issue(2, updated: "2026-09-26T12:02:00Z", pr: true,
+                                          body: "pr two")],
                       headers: { "Link" => %(<#{page2}>; rel="next") })
   transport.stub_json("GET", page2, body: [github_issue(3, updated: "2026-09-26T12:03:00Z")])
-  transport.stub_json("GET", %r{/repos/o/r/issues/1/comments}, body: [
-                        { "id" => 101, "body" => "nice", "updated_at" => "2026-09-26T12:04:00Z",
-                          "html_url" => "https://github.com/o/r/issues/1#c101",
-                          "user" => { "login" => "reviewer", "type" => "User" } }
+  transport.stub_json("GET", repo_comments_url, body: [
+                        github_repo_issue_comment(101, 1, updated: "2026-09-26T12:04:00Z")
                       ])
-  transport.stub_json("GET", %r{/repos/o/r/issues/2/comments}, body: [])
-  transport.stub_json("GET", %r{/repos/o/r/issues/3/comments}, body: [])
   transport.stub_json("GET", "#{GH}/repos/o/r/pulls/2/reviews?per_page=100", body: [
                         { "id" => 201, "state" => "APPROVED", "body" => "lgtm",
                           "submitted_at" => "2026-09-26T12:05:00Z",
                           "html_url" => "https://github.com/o/r/pull/2#r201",
                           "user" => { "login" => "reviewer", "type" => "User" } }
                       ])
-  transport.stub_json("GET", %r{/repos/o/r/pulls/2/comments}, body: [
-                        { "id" => 301, "body" => "nit", "path" => "a.rb",
-                          "updated_at" => "2026-09-26T12:06:00Z",
-                          "html_url" => "https://github.com/o/r/pull/2#dc301",
-                          "user" => { "login" => "bot", "type" => "Bot" } }
+  transport.stub_json("GET", repo_rcomments_url, body: [
+                        github_repo_review_comment(301, 2, updated: "2026-09-26T12:06:00Z")
                       ])
   transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: {
                         "workflow_runs" => [
@@ -74,16 +95,30 @@ test("github poll builds real resource requests with paging") do |registry:, tra
   expect(out["cursor"]).to eq({ "since" => "2026-09-26T12:07:00Z" })
   expect(JSON.parse(JSON.generate(out["cursor"]))).to eq(out["cursor"])
 
-  bot_comment = out["events"].find { |e| e["event_id"] == "github:review_comment:301" }
+  by_id = out["events"].to_h { |e| [e["event_id"], e] }
+  expect(by_id["github:issue:o/r#1"]["resource_id"]).to eq("issue:o/r#1")
+  expect(by_id["github:issue:o/r#2"]["resource_id"]).to eq("pr:o/r#2")
+  expect(by_id["github:issue_comment:101"]["resource_id"]).to eq("issue:o/r#1")
+  expect(by_id["github:review:201"]["resource_id"]).to eq("pr:o/r#2")
+  expect(by_id["github:issue:o/r#1"]["payload"]["body"]).to eq("issue one")
+  expect(by_id["github:issue:o/r#2"]["payload"]["body"]).to eq("pr two")
+  expect(by_id["github:issue_comment:101"]["payload"]["body"]).to eq("nice")
+  expect(by_id["github:review:201"]["payload"]["body"]).to eq("lgtm")
+  expect(by_id["github:review_comment:301"]["payload"]["body"]).to eq("nit")
+
+  bot_comment = by_id["github:review_comment:301"]
   expect(bot_comment["actor_type"]).to eq("bot")
   expect(bot_comment["resource_id"]).to eq("pr:o/r#2")
 
-  # Real request shapes: paged issues, per-issue comments, PR-only reviews.
+  # Real request shapes: paged issues, repository-level comments, PR-only reviews.
   expect(transport.requests_to(page1).size).to eq(1)
   expect(transport.requests_to(page2).size).to eq(1)
-  expect(transport.requests_to(%r{/issues/\d+/comments}).size).to eq(3)
+  expect(transport.requests_to(repo_comments_url).size).to eq(1)
+  expect(transport.requests_to(repo_rcomments_url).size).to eq(1)
+  expect(transport.requests_to(%r{/repos/o/r/issues/\d+/comments}).size).to eq(0)
+  expect(transport.requests_to(%r{/repos/o/r/issues/\d+$}).size).to eq(0)
   expect(transport.requests_to(%r{/pulls/1/}).size).to eq(0)
-  expect(transport.requests_to(%r{/pulls/2/}).size).to eq(2)
+  expect(transport.requests_to(%r{/pulls/2/reviews}).size).to eq(1)
   api_calls = transport.requests.reject { |r| r[:url].include?("/access_tokens") }
   expect(api_calls.map { |r| r[:headers]["Authorization"] }.uniq).to eq(["Bearer ghs_test"])
 end
@@ -91,6 +126,7 @@ end
 test("github poll mints a verifiable RS256 app JWT for the token exchange") do |registry:, transport:, plugin_env:|
   github_token_stub(transport)
   transport.stub_json("GET", %r{/repos/o/r/issues}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
   transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
 
   registry.invoke(plugin: "github", operation: "latest_events",
@@ -110,17 +146,21 @@ test("github poll mints a verifiable RS256 app JWT for the token exchange") do |
   expect(payload["exp"] - payload["iat"]).to eq(600)
 end
 
-test("github poll sends since filters and skips stale items") do |registry:, transport:|
+test("github poll sends since filters with overlap and skips stale items") do |registry:, transport:|
   github_token_stub(transport)
   transport.stub_proc("GET", %r{/repos/o/r/issues\?}) do |req|
-    expect(req[:url]).to match(/since=2026-09-26T11%3A00%3A00Z/)
+    expect(req[:url]).to match(/since=2026-09-26T10%3A59%3A00Z/)
     Plugins::Http::Response.new(status: 200, headers: {},
                                 body: JSON.generate([
-                                                      github_issue(9, updated: "2026-09-26T10:59:00Z"),
+                                                      github_issue(9, updated: "2026-09-26T10:00:00Z"),
                                                       github_issue(10, updated: "2026-09-26T12:30:00Z")
                                                     ]))
   end
-  transport.stub_json("GET", %r{/repos/o/r/issues/10/comments}, body: [])
+  transport.stub_proc("GET", %r{/repos/o/r/issues/comments}) do |req|
+    expect(req[:url]).to match(/since=2026-09-26T10%3A59%3A00Z/)
+    Plugins::Http::Response.new(status: 200, headers: {}, body: "[]")
+  end
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
   transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
 
   out = registry.invoke(plugin: "github", operation: "latest_events",
@@ -130,7 +170,76 @@ test("github poll sends since filters and skips stale items") do |registry:, tra
 
   expect(out["events"].map { |e| e["event_id"] }).to eq(["github:issue:o/r#10"])
   expect(out["cursor"]).to eq({ "since" => "2026-09-26T12:30:00Z" })
-  expect(transport.requests_to(%r{/issues/9/comments}).size).to eq(0)
+end
+
+test("github emits events at equal timestamps instead of skipping") do |registry:, transport:|
+  github_token_stub(transport)
+  transport.stub_json("GET", %r{/repos/o/r/issues\?},
+                      body: [github_issue(22, updated: "2026-09-26T11:00:00+00:00")])
+  github_empty_lists(transport)
+
+  out = registry.invoke(plugin: "github", operation: "latest_events",
+                        input: { "scope" => "o/r",
+                                 "cursor" => { "since" => "2026-09-26T11:00:00Z" } },
+                        context: {})
+
+  expect(out["events"].map { |e| e["event_id"] }).to eq(["github:issue:o/r#22"])
+  expect(out["events"][0]["occurred_at"]).to eq("2026-09-26T11:00:00Z")
+  expect(out["cursor"]).to eq({ "since" => "2026-09-26T11:00:00Z" })
+end
+
+test("github orders events by UTC instant and normalizes occurred_at") do |registry:, transport:|
+  github_token_stub(transport)
+  transport.stub_json("GET", %r{/repos/o/r/issues\?}, body: [
+                        github_issue(21, updated: "2026-09-26T11:30:00Z"),
+                        github_issue(20, updated: "2026-09-26T20:00:00+09:00")
+                      ])
+  github_empty_lists(transport)
+
+  out = registry.invoke(plugin: "github", operation: "latest_events",
+                        input: { "scope" => "o/r",
+                                 "cursor" => { "since" => "2026-09-26T10:00:00Z" } },
+                        context: {})
+
+  expect(out["events"].map { |e| e["event_id"] })
+    .to eq(["github:issue:o/r#20", "github:issue:o/r#21"])
+  expect(out["events"].map { |e| e["occurred_at"] })
+    .to eq(["2026-09-26T11:00:00Z", "2026-09-26T11:30:00Z"])
+end
+
+test("github polls repository comments independently for old issues") do |registry:, transport:|
+  github_token_stub(transport)
+  transport.stub_json("GET", %r{/repos/o/r/issues\?}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/issues/comments}, body: [
+                        github_repo_issue_comment(901, 99, updated: "2026-09-26T12:10:00Z",
+                                                             body: "late comment"),
+                        github_repo_issue_comment(902, 100, updated: "2026-09-26T12:11:00Z",
+                                                              body: "pr note")
+                      ])
+  transport.stub_json("GET", "#{GH}/repos/o/r/issues/99",
+                      body: github_issue(99, updated: "2026-09-01T00:00:00Z"))
+  transport.stub_json("GET", "#{GH}/repos/o/r/issues/100",
+                      body: github_issue(100, updated: "2026-09-01T00:00:00Z", pr: true))
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [
+                        github_repo_review_comment(903, 101, updated: "2026-09-26T12:12:00Z")
+                      ])
+  transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
+
+  out = registry.invoke(plugin: "github", operation: "latest_events",
+                        input: { "scope" => "o/r",
+                                 "cursor" => { "since" => "2026-09-26T12:00:00Z" } },
+                        context: {})
+
+  by_id = out["events"].to_h { |e| [e["event_id"], e] }
+  expect(by_id.keys.sort).to eq(%w[github:issue_comment:901 github:issue_comment:902
+                                   github:review_comment:903])
+  expect(by_id["github:issue_comment:901"]["resource_id"]).to eq("issue:o/r#99")
+  expect(by_id["github:issue_comment:901"]["payload"]["body"]).to eq("late comment")
+  expect(by_id["github:issue_comment:902"]["resource_id"]).to eq("pr:o/r#100")
+  expect(by_id["github:review_comment:903"]["resource_id"]).to eq("pr:o/r#101")
+  expect(out["cursor"]).to eq({ "since" => "2026-09-26T12:12:00Z" })
+  expect(transport.requests_to("#{GH}/repos/o/r/issues/99").size).to eq(1)
+  expect(transport.requests_to("#{GH}/repos/o/r/issues/100").size).to eq(1)
 end
 
 test("github edit keeps event_id but changes fingerprint") do |registry:, transport:|
@@ -141,7 +250,8 @@ test("github edit keeps event_id but changes fingerprint") do |registry:, transp
                                 body: JSON.generate([github_issue(1, updated: "2026-09-26T12:01:00Z",
                                                                              body: bodies.shift || "edited")]))
   end
-  transport.stub_json("GET", %r{/issues/1/comments}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/issues/comments}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
   transport.stub_json("GET", %r{/actions/runs}, body: { "workflow_runs" => [] })
 
   first = registry.invoke(plugin: "github", operation: "latest_events",
@@ -169,9 +279,43 @@ test("github page failure raises without advancing the cursor") do |registry:, t
     registry.invoke(plugin: "github", operation: "latest_events",
                     input: { "scope" => "o/r" }, context: {})
   end.to raise_error(Plugins::HttpError, /HTTP 500/)
-  # Failed before comments expansion for the completed page is irrelevant:
-  # the raise means the caller keeps its old cursor.
-  expect(transport.requests_to(%r{/issues/1/comments}).size).to eq(0)
+  # Failed before repository comment polling: the raise means the caller
+  # keeps its old cursor.
+  expect(transport.requests_to(%r{/issues/comments}).size).to eq(0)
+end
+
+test("github raises IncompletePoll when a listing exceeds its page bound") do |registry:, transport:|
+  github_token_stub(transport)
+  transport.stub_json("GET", %r{/repos/o/r/issues\?}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/issues/comments}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
+  runs1 = "#{GH}/repos/o/r/actions/runs?per_page=100"
+  runs2 = "#{GH}/repos/o/r/actions/runs?per_page=100&page=2"
+  runs3 = "#{GH}/repos/o/r/actions/runs?per_page=100&page=3"
+  runs4 = "#{GH}/repos/o/r/actions/runs?per_page=100&page=4"
+  transport.stub_json("GET", runs1, body: { "workflow_runs" => [] },
+                      headers: { "Link" => %(<#{runs2}>; rel="next") })
+  transport.stub_json("GET", runs2, body: { "workflow_runs" => [] },
+                      headers: { "Link" => %(<#{runs3}>; rel="next") })
+  transport.stub_json("GET", runs3, body: { "workflow_runs" => [] },
+                      headers: { "Link" => %(<#{runs4}>; rel="next") })
+  expect do
+    registry.invoke(plugin: "github", operation: "latest_events",
+                    input: { "scope" => "o/r" }, context: {})
+  end.to raise_error(Plugins::IncompletePoll, /workflow runs pagination exceeded 3 pages/)
+  expect(transport.requests_to(runs4).size).to eq(0)
+end
+
+test("github raises IncompletePoll when issues exceed the expansion bound") do |registry:, transport:|
+  github_token_stub(transport)
+  many = (1..51).map { |n| github_issue(n, updated: "2026-09-26T12:01:00Z") }
+  transport.stub_json("GET", %r{/repos/o/r/issues\?}, body: many)
+
+  expect do
+    registry.invoke(plugin: "github", operation: "latest_events",
+                    input: { "scope" => "o/r" }, context: {})
+  end.to raise_error(Plugins::IncompletePoll, /exceeded 50 items/)
+  expect(transport.requests_to(%r{/issues/comments}).size).to eq(0)
 end
 
 test("github refuses cross-host next links and cursor URLs") do |registry:, transport:|
@@ -193,6 +337,29 @@ test("github refuses cross-host next links and cursor URLs") do |registry:, tran
                     context: {})
   end.to raise_error(Plugins::HostRejected, /evil\.test/)
   expect(transport.requests).to eq([])
+end
+
+test("github validates cursor shape and time strictly") do |registry:, transport:|
+  github_token_stub(transport)
+  invalid_cursors = [
+    { "since" => "not-a-time" },
+    { "since" => "" },
+    { "since" => 123 },
+    { "since" => "2026-13-45T99:99:99Z" },
+    { "bogus" => "x" },
+    { "since" => "2026-09-26T11:00:00Z", "extra" => 1 },
+    { "next" => "not a url" },
+    { "next" => "" },
+    { "next" => 123 }
+  ]
+  invalid_cursors.each do |cursor|
+    expect do
+      registry.invoke(plugin: "github", operation: "latest_events",
+                      input: { "scope" => "o/r", "cursor" => cursor }, context: {})
+    end.to raise_error(Plugins::InputInvalid, /cursor/)
+    expect(transport.requests).to eq([])
+    transport.requests.clear
+  end
 end
 
 test("github surfaces rate limits with retry_after") do |registry:, transport:|
@@ -257,6 +424,7 @@ end
 test("github installation token is cached until expiry") do |registry:, transport:, clock:|
   github_token_stub(transport)
   transport.stub_json("GET", %r{/repos/o/r/issues}, body: [])
+  transport.stub_json("GET", %r{/repos/o/r/pulls/comments}, body: [])
   transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
 
   2.times do
