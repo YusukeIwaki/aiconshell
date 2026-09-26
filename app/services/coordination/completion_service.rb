@@ -59,6 +59,9 @@ module Coordination
 
     def create_reply(task, run, body)
       return if body.to_s.strip.empty? || task.source_plugin.blank? || task.source_resource_id.blank?
+      # The internal admin origin is never a reply destination, even for an
+      # execution-dispatched admin task. Admin outcomes stay in Task state.
+      return if task.source_plugin == Task::ADMIN_PLUGIN
 
       OutboundAction.create!(
         plugin: task.source_plugin, operation: "reply",

@@ -14,11 +14,33 @@ module WorkflowFakes
   class FakePluginRegistry
     attr_reader :invocations, :sent
 
+    # Catalog metadata mirroring the real registry contract
+    # (id/operations with input_schema/output_schema/scope/read_only,
+    # required_env, configured). Write inputs stay permissive about extra
+    # keys so legacy persisted intents keep delivering; strictness lives in
+    # the real plugin schemas, which production validates exactly.
+    FAKE_CATALOG = {
+      "github" => %w[latest_events reply create_issue],
+      "jira" => %w[latest_events reply create_issue],
+      "teams" => %w[latest_events reply send_message create_issue]
+    }.freeze
+
     def initialize(events_by_scope: {}, errors: {})
       @events_by_scope = events_by_scope
       @errors = errors
       @invocations = []
       @sent = []
+    end
+
+    def catalog
+      FAKE_CATALOG.map do |id, operations|
+        {
+          "id" => id,
+          "operations" => operations.map { |name| fake_operation(id, name) },
+          "required_env" => [],
+          "configured" => true
+        }
+      end
     end
 
     def invoke(plugin:, operation:, input:, context: {})
@@ -40,6 +62,65 @@ module WorkflowFakes
       else
         raise FakeUnknownPlugin, "unknown operation #{operation}"
       end
+    end
+
+    private
+
+    def fake_operation(plugin, name)
+      entry = {
+        "name" => name,
+        "input_schema" => fake_input_schema(name),
+        "output_schema" => fake_output_schema(name),
+        "scope" => "#{plugin}:#{name == 'latest_events' ? 'read' : 'write'}",
+        "read_only" => name == "latest_events"
+      }
+      if plugin == "teams" && name == "create_issue"
+        entry["unsupported"] = true
+        entry["reason"] = "Teams has no issue tracker"
+      end
+      entry
+    end
+
+    def fake_input_schema(name)
+      base = case name
+      when "latest_events"
+        { "required" => %w[scope],
+          "properties" => { "scope" => { "type" => "string", "minLength" => 1 } } }
+      when "reply"
+        { "required" => %w[resource_id body],
+          "properties" => {
+            "resource_id" => { "type" => "string", "minLength" => 1 },
+            "body" => { "type" => "string", "minLength" => 1, "maxLength" => 65_536 }
+          } }
+      when "create_issue"
+        { "required" => %w[scope title body],
+          "properties" => {
+            "scope" => { "type" => "string", "minLength" => 1 },
+            "title" => { "type" => "string", "minLength" => 1, "maxLength" => 512 },
+            "body" => { "type" => "string", "minLength" => 1, "maxLength" => 65_536 }
+          } }
+      when "send_message"
+        { "required" => %w[scope body],
+          "properties" => {
+            "scope" => { "type" => "string", "minLength" => 1 },
+            "body" => { "type" => "string", "minLength" => 1, "maxLength" => 65_536 }
+          } }
+      end
+      { "type" => "object", "required" => base["required"],
+        "properties" => base["properties"], "additionalProperties" => true }
+    end
+
+    def fake_output_schema(name)
+      return { "type" => "object" } if name == "latest_events"
+
+      {
+        "type" => "object", "required" => %w[external_id url],
+        "properties" => {
+          "external_id" => { "type" => "string", "minLength" => 1 },
+          "url" => { "type" => %w[string null] }
+        },
+        "additionalProperties" => false
+      }
     end
 
     def self.human_event(event_id: "evt-1", fingerprint: "fp-1", resource_id: "issue-1",

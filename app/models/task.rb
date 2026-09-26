@@ -3,7 +3,7 @@
 # Persistent task owned by Coordination. Only Coordination services may change
 # status/priority/next_action_at; controllers persist TaskFeedback instead.
 class Task < ApplicationRecord
-  STATUSES = %w[inbox ready running waiting_human waiting_review done failed cancelled].freeze
+  STATUSES = %w[inbox ready running waiting_human waiting_review waiting_delivery done failed cancelled].freeze
 
   # Allowed transitions. Unknown transitions are rejected by callers.
   TRANSITIONS = {
@@ -17,7 +17,19 @@ class Task < ApplicationRecord
     "cancelled" => %w[inbox]
   }.freeze
 
-  OPEN_STATUSES = %w[inbox ready running waiting_human waiting_review failed].freeze
+  OPEN_STATUSES = %w[inbox ready running waiting_human waiting_review waiting_delivery failed].freeze
+
+  # Trusted admin origin (issue #11). True only when a persisted human
+  # admin.task_request event matches this task's source reference. Source
+  # strings or payload flags alone never authorize.
+  ADMIN_PLUGIN = "admin"
+  ADMIN_EVENT_TYPE = "admin.task_request"
+
+  def admin_request?
+    source_plugin == ADMIN_PLUGIN &&
+      ExternalEvent.exists?(plugin: ADMIN_PLUGIN, event_type: ADMIN_EVENT_TYPE,
+                            actor_type: "human", resource_id: source_resource_id)
+  end
 
   has_many :task_feedbacks, class_name: "TaskFeedback", dependent: :destroy
   has_many :task_runs, class_name: "TaskRun", dependent: :destroy

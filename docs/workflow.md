@@ -128,6 +128,84 @@ resent. Interrupted local drafting can return to pending after backoff. Remote
 providers do not offer an end-to-end exactly-once guarantee; operators must
 reconcile uncertain sends before deciding whether another action is needed.
 
+## Admin result batches and delivery reconciliation (issue #11, pass 2)
+
+Cross-connector admin requests persist a validated coordination result
+`{summary, actions: [{plugin, operation, input}]}` (`summary` 1–2000 chars,
+at most 20 actions). Only tasks with a trusted persisted origin are
+eligible: `Task#admin_request?` requires a stored human `ExternalEvent`
+with plugin `admin` and event type `admin.task_request` matching the
+task's source reference. Source strings or payload flags alone never
+authorize, and ordinary external tasks keep their existing reply rules.
+
+`Coordination::ResultService.new(registry:, event_sink:, clock:,
+allowed_scopes:).apply(task_id:, task_version:, feedback_ids:, policy:,
+result:)` validates every action through
+`Interaction::ActionValidator#validate(plugin:, operation:, input:)` —
+supported non-read-only writes (`reply`, `create_issue`, `send_message`),
+exact registered input schemas, destinations derived with
+`PluginAccess` against current `AICONSHELL_ALLOWED_SCOPES` — before any
+mutation. The whole batch, `coordination_result` (`summary`,
+`action_count`), `delivery_batch_key`, state change, and exact feedback
+acknowledgements then commit atomically under the task lock, guarded by
+an unchanged task `lock_version` and an enabled/unchanged coordination
+policy. Idempotency keys are stable: batch `result-<task_id>-<version>`,
+actions `result-<task_id>-<version>-<ordinal>`. Running tasks, current
+run pointers, active runs, terminal tasks, `waiting_delivery` tasks, and
+any outstanding pending/sending action reject the result. No-action
+results complete as `done` with the stored summary; action results move
+to `waiting_delivery`, never directly to `done`. No execution is
+enqueued and no `TaskRun` is created. The shared `Task::TRANSITIONS` map
+is unchanged; the result path uses its own explicit from-state
+allowlist. Result codes: `:ok`, `:invalid_result`, `:unknown_task`,
+`:duplicate_result`, `:stale_task`, `:stale_policy`,
+`:not_admin_origin`, `:task_running`, `:terminal_task`, `:batch_active`,
+`:outstanding_actions`, plus validator codes (`:unknown_plugin`,
+`:unknown_operation`, `:unsupported_operation`,
+`:operation_not_allowed`, `:not_writable`, `:input_invalid`,
+`:scope_not_allowed`) with the failing `action_index`.
+
+Only `Coordination::DeliveryReconciler` leaves `waiting_delivery`.
+`reconcile(task_id:)` verifies exact batch membership against the
+persisted batch key and a positive expected count; missing, deleted, or
+mismatched counts recover to `waiting_human` (`batch_mismatch`), never
+vacuously succeeding. Batches with any pending/sending action stay
+`waiting_delivery`. All-`sent` batches complete as `done`; any
+`failed`/`uncertain` delivery parks as `waiting_human` with a
+content-free reason (`delivery_failed`, `delivery_uncertain`, or
+`delivery_partial`), clears `next_action_at`, and never autonomously
+resends or replans. Reconciliation never acknowledges human feedback;
+new explicit feedback unlocks later Coordination handling, and prior
+batch metadata stays until a new authorized result replaces it.
+`WorkflowMaintenanceJob` runs `reconcile_all(limit: 100)` before its
+execution-policy early return, so settlement works with execution
+disabled. PostgreSQL treats `waiting_delivery` as open in
+`index_tasks_one_open_per_source`.
+
+`CompletionService` never creates replies for the internal admin
+origin, including execution-dispatched admin tasks. `WorkContext`
+additionally exposes the bounded prior `coordination_result`
+(summary truncated to 500 chars, `action_count`) and recent delivery
+metadata (batch key, plugin, operation, normalized destination, status,
+content-free `error_code`) without action bodies, so replanning after a
+failed/uncertain batch sees previously attempted writes.
+
+Outbound delivery validates the exact registered plugin input/output
+schemas for the action's operation and preserves the full input,
+including custom required fields; unknown/unsupported operations and
+schema violations fail before any transport or handler call. Schemas
+permit only `reply`, `create_issue`, and `send_message`; no other write
+operations were added. The admin task board still groups unknown
+statuses into its inbox column (controllers/views are a separate
+lane); surfacing `coordination_result` there is a follow-up handoff.
+
+Not implemented in this pass (next phase): the Triage typed read loop
+that will call `ResultService#apply` under its existing snapshots.
+Triage currently still snapshots `waiting_delivery` tasks with pending
+feedback, so the next pass must route those to reconciliation (or skip
+them) instead of acknowledging feedback without effect, and keep the
+legacy `reply` field source-bound alongside the new result path.
+
 ## Runtime configuration
 
 Pure Ruby plugin, AI, and observability entrypoints are explicitly required at

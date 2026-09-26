@@ -37,14 +37,16 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 | --- | --- |
 | ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし、親スナップショットは改訂を鎖状に識別する |
 | IntegrationCursor | plugin と scope ごとの cursor JSON、lease、last_polled_at、error。全ページの durable ingest 完了後のみ更新 |
-| Task | title、description、status、priority、source reference、next_action_at、lock_version。状態更新は Coordination のみ |
+| Task | title、description、status、priority、source reference、next_action_at、lock_version、coordination_result、delivery_batch_key。状態更新は Coordination のみ |
 | TaskFeedback | task、body、author、processed_at。人間の意見を保持し、直接的な状態変更をしない |
 | TaskRun | task、provider/model/effort/instructions snapshot、status、lease token/expiry、result、error、開始/終了時刻 |
 | LayerPolicy | layer（interaction/coordination/execution）、provider（claude/codex/muse）、model、effort、instructions、enabled。layer一意 |
-| OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error。Coordination が作り Interaction が送る |
+| OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error、delivery_batch_key。Coordination が作り Interaction が送る |
 | EventDelivery | redacted envelope、event_id、宛先別配信/再試行状態。配信済みの短期 retention |
 
-Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
+Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `waiting_delivery`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
+
+管理画面起点の cross-connector 要求（issue #11）は、永続化された人間 `admin.task_request` イベントと一致する Task に限り、Coordination が検証済みの書き込みバッチ（`coordination_result` の要約/件数と `delivery_batch_key`）を原子的に永続化する。アクション付きの結果は `waiting_delivery` に遷移し、配信の確定は Coordination の reconciler のみが行う（全件送信で `done`、失敗/不確定の混入で `waiting_human`）。Interaction は Task のライフサイクルを更新しない。Outbound 配信は登録済みプラグインの入出力スキーマを正確に検証し、カスタム必須フィールドを保持する。AI read loop（Triage 拡張）は後続パスで実装する。
 
 5 分 polling、滞留 inbox の再処理、実行 lease 回復、EventLog outbox 配信、outbound action 配信は再起動後も続けられる recurring jobs とする。control と execution の queue を分ける。更新イベントは ID だけでなく fingerprint を持ち、同じメッセージの編集を区別する。
 
