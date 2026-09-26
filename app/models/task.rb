@@ -26,9 +26,9 @@ class Task < ApplicationRecord
   ADMIN_EVENT_TYPE = "admin.task_request"
 
   def admin_request?
-    source_plugin == ADMIN_PLUGIN &&
-      ExternalEvent.exists?(plugin: ADMIN_PLUGIN, event_type: ADMIN_EVENT_TYPE,
-                            actor_type: "human", resource_id: source_resource_id)
+    persisted? && source_plugin == ADMIN_PLUGIN &&
+      external_events.exists?(plugin: ADMIN_PLUGIN, event_type: ADMIN_EVENT_TYPE,
+                              actor_type: "human", resource_id: source_resource_id)
   end
 
   has_many :task_feedbacks, class_name: "TaskFeedback", dependent: :destroy

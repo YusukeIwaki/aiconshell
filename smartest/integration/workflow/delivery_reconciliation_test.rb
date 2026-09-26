@@ -6,7 +6,7 @@ require_relative "workflow_test_helper"
 # Delivery reconciliation for waiting_delivery tasks (issue #11, pass 2).
 # Real PostgreSQL; no network, no AI.
 def delivering_task!(resource_id, action_count:, status: "waiting_delivery")
-  ExternalEvent.create!(
+  origin = ExternalEvent.create!(
     plugin: "admin", event_id: "evt-#{resource_id}", fingerprint: "fp-#{resource_id}",
     event_type: "admin.task_request", resource_id: resource_id,
     actor_id: "alice", actor_type: "human", occurred_at: Time.current,
@@ -16,6 +16,7 @@ def delivering_task!(resource_id, action_count:, status: "waiting_delivery")
                       source_plugin: "admin", source_resource_id: resource_id,
                       coordination_result: { "summary" => "Batch for #{resource_id}", "action_count" => action_count },
                       delivery_batch_key: "result-batch-#{resource_id}")
+  origin.update!(task: task, processed_at: Time.current)
   [task, "result-batch-#{resource_id}"]
 end
 
@@ -231,7 +232,7 @@ test("work context exposes bounded prior result and delivery metadata without bo
 
     context = Coordination::WorkContext.for_task(task)
 
-    expect(context["coordination_result"]).to eq({ "summary" => "x" * 500, "action_count" => 2 })
+    expect(context["coordination_result"]).to eq({ "summary" => "x" * 500, "summary_truncated" => true, "action_count" => 2 })
     expect(context["deliveries"]).to eq([
       { "batch_key" => "result-ctx-1", "plugin" => "github", "operation" => "reply",
         "destination" => "owner/repo", "status" => "failed", "error_code" => "delivery_rejected" },

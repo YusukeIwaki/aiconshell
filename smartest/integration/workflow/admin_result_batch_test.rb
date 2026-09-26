@@ -15,9 +15,10 @@ def admin_origin!(resource_id)
 end
 
 def admin_task!(resource_id, status: "ready", **attrs)
-  admin_origin!(resource_id)
-  Task.create!({ title: "admin request #{resource_id}", status: status,
-                 source_plugin: "admin", source_resource_id: resource_id }.merge(attrs))
+  task = Task.create!({ title: "admin request #{resource_id}", status: status,
+                        source_plugin: "admin", source_resource_id: resource_id }.merge(attrs))
+  admin_origin!(resource_id).update!(task: task, processed_at: Time.current)
+  task
 end
 
 def result_policy!(enabled: true)
@@ -32,6 +33,99 @@ def apply_result(service, task, policy, result, feedback_ids: nil)
   ids = feedback_ids.nil? ? task.task_feedbacks.unprocessed.where(author_type: "human").order(:id).pluck(:id) : feedback_ids
   service.apply(task_id: task.id, task_version: task.lock_version,
                 feedback_ids: ids, policy: policy, result: result)
+end
+
+test("admin source strings copied from another task do not grant linked-origin privilege") do |db:|
+  with_workflow_env(scopes: "") do
+    original = admin_task!("req-owned")
+    copied = Task.create!(title: "Copied identifiers", source_plugin: original.source_plugin,
+      source_resource_id: original.source_resource_id, status: "done")
+    expect(original.admin_request?).to eq(true)
+    expect(copied.admin_request?).to eq(false)
+    result = apply_result(result_service(WorkflowFakes::FakeEventSink.new), copied, result_policy!,
+      { "summary" => "Unauthorized result", "actions" => [] })
+    expect(result.code).to eq(:not_admin_origin)
+    expect(copied.reload.coordination_result).to eq(nil)
+  end
+end
+
+test("public admin result boundary rejects blank summaries and non-coordination policies") do |db:|
+  with_workflow_env(scopes: "") do
+    task = admin_task!("req-boundary")
+    service = result_service(WorkflowFakes::FakeEventSink.new)
+    feedback = TaskFeedback.create!(task: task, body: "Pending clarification", author: "alice")
+    policy = result_policy!
+    expect(apply_result(service, task, policy, { "summary" => " \n\t", "actions" => [] }).code).to eq(:invalid_result)
+    wrong = LayerPolicy.create!(layer: "execution", provider: "codex", enabled: true)
+    expect(apply_result(service, task, wrong, { "summary" => "No work", "actions" => [] }).code).to eq(:stale_policy)
+    expect(task.reload.status).to eq("ready")
+    expect(task.coordination_result).to eq(nil)
+    expect(feedback.reload.processed?).to eq(false)
+  end
+end
+
+test("late batch persistence failure rolls back its savepoint without poisoning the caller transaction") do |db:|
+  with_workflow_env(scopes: "github:owner/repo") do
+    task = admin_task!("req-savepoint")
+    feedback = TaskFeedback.create!(task: task, body: "Keep pending on conflict", author: "alice")
+    policy = result_policy!
+    collision = OutboundAction.create!(plugin: "github", operation: "reply", input: {},
+      idempotency_key: "result-#{task.id}-#{task.lock_version}-2")
+    action = { "plugin" => "github", "operation" => "reply", "input" => { "resource_id" => "issue:owner/repo#1", "body" => "hello" } }
+    Task.transaction do
+      outcome = apply_result(result_service(WorkflowFakes::FakeEventSink.new), task, policy,
+        { "summary" => "Atomic batch", "actions" => [action, action] })
+      expect(outcome.code).to eq(:invalid_result)
+      expect(task.outbound_actions.count).to eq(0)
+      expect(task.reload.status).to eq("ready")
+      expect(task.coordination_result).to eq(nil)
+      expect(feedback.reload.processed?).to eq(false)
+      expect(OutboundAction.where(id: collision.id).exists?).to eq(true)
+      expect(db.select_value("SELECT 1")).to eq(1)
+    end
+  end
+end
+
+test("non-storable result text is classified before any PostgreSQL batch mutation") do |db:|
+  with_workflow_env(scopes: "github:owner/repo,custom:scope-1") do
+    custom = Class.new(Aiconshell::Plugins::Base) do
+      plugin_id "custom"
+      operation "reply", scope: "custom:write",
+        input_schema: { "type" => "object", "required" => %w[resource_id body metadata],
+          "properties" => { "resource_id" => { "type" => "string" }, "body" => { "type" => "string" },
+            "metadata" => { "type" => "array", "items" => { "type" => "object" } } } },
+        output_schema: Aiconshell::Plugins::Schemas::WRITE_OUTPUT
+    end
+    registry = Aiconshell::Plugins::Registry.new(env: {}).register(Aiconshell::Plugins::Github.new).register(custom.new)
+    sink = WorkflowFakes::FakeEventSink.new
+    service = Coordination::ResultService.new(registry: registry, event_sink: sink)
+    task = admin_task!("req-nul")
+    feedback = TaskFeedback.create!(task: task, body: "Keep pending on invalid data", author: "alice")
+    policy = result_policy!
+    action = { "plugin" => "github", "operation" => "reply",
+      "input" => { "resource_id" => "issue:owner/repo#1", "body" => "valid" } }
+    cases = [
+      [{ "summary" => "bad\u0000summary", "actions" => [action] }, :invalid_result],
+      [{ "summary" => "valid", "actions" => [action, action.deep_merge("input" => { "body" => "bad\u0000body" })] }, :input_invalid]
+    ]
+    [{ "custom" => "bad\u0000value" }, { "bad\u0000key" => "value" }].each do |metadata|
+      custom_action = { "plugin" => "custom", "operation" => "reply",
+        "input" => { "resource_id" => "scope-1", "body" => "valid", "metadata" => [metadata] } }
+      cases << [{ "summary" => "valid", "actions" => [action, custom_action] }, :input_invalid]
+    end
+    cases.each do |result, expected|
+      expect(apply_result(service, task, policy, result).code).to eq(expected)
+      expect(task.reload.status).to eq("ready")
+      expect(task.coordination_result).to eq(nil)
+      expect(task.delivery_batch_key).to eq(nil)
+      expect(task.outbound_actions.count).to eq(0)
+      expect(feedback.reload.processed_at).to eq(nil)
+      expect(db.select_value("SELECT 1")).to eq(1)
+    end
+    expect(sink.events.to_json.include?("bad")).to eq(false)
+    # A literal escape sequence is ordinary text, not the forbidden character.
+    expect(apply_result(service, task, policy, { "summary" => 'literal \\u0000', "actions" => [] }).ok).to eq(true)
+  end
 end
 
 test("no-action admin result completes with summary and no runs") do |db:|
@@ -75,7 +169,7 @@ test("validated batch persists atomically with stable idempotency keys") do |db:
           { "plugin" => "github", "operation" => "reply",
             "input" => { "resource_id" => "issue:owner/repo#1", "body" => "noted" } },
           { "plugin" => "teams", "operation" => "send_message",
-            "input" => { "scope" => "team/t1/channel/c1", "body" => "urgent work exists" } }
+            "input" => { "scope" => "channel:t1/c1", "body" => "urgent work exists" } }
         ] }
     )
 
@@ -345,6 +439,8 @@ test("new batch rejects while older actions remain outstanding") do |db:|
 
     legacy.update!(status: "sent", external_id: "ext-1")
     task.reload
+    expect(apply_result(service, task, policy, result).code).to eq(:feedback_required)
+    TaskFeedback.create!(task: task, body: "Please apply the revised plan", author: "alice")
     version_before = task.lock_version
     outcome = apply_result(service, task, policy, result)
     expect(outcome.ok).to eq(true)

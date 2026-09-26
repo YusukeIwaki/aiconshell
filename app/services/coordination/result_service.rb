@@ -11,7 +11,7 @@ module Coordination
   # acknowledgements commit atomically under the task lock. No execution is
   # enqueued and no TaskRun is created here.
   #
-  # The next pass calls this from Triage under its existing snapshots:
+  # Triage calls this under its task/policy/feedback snapshots:
   #
   #   Coordination::ResultService.new.apply(
   #     task_id: task.id, task_version: task.lock_version,
@@ -58,7 +58,8 @@ module Coordination
 
     def apply(task_id:, task_version:, feedback_ids:, policy:, result:)
       value = result.is_a?(Hash) ? result.deep_stringify_keys : nil
-      unless value.is_a?(Hash) && JSONSchemer.schema(RESULT_SCHEMA).valid?(value)
+      unless value.is_a?(Hash) && JSONSchemer.schema(RESULT_SCHEMA).valid?(value) &&
+          value["summary"].strip.present? && !value["summary"].include?("\u0000")
         emit_rejected(task_id, :invalid_result)
         return Result.new(ok: false, code: :invalid_result)
       end
@@ -66,7 +67,7 @@ module Coordination
       batch_key = "result-#{task_id}-#{task_version}"
       actions = value.fetch("actions")
 
-      Task.transaction do
+      Task.transaction(requires_new: true) do
         task = Task.lock.find_by(id: task_id)
         return reject(task_id, :unknown_task) unless task
         return reject(task_id, :duplicate_result) if task.delivery_batch_key == batch_key
@@ -79,6 +80,10 @@ module Coordination
           return reject(task_id, code)
         end
         return reject(task_id, :outstanding_actions) if outstanding_actions?(task)
+        if %w[waiting_human waiting_review].include?(task.status)
+          pending = task.task_feedbacks.unprocessed.where(author_type: "human", id: Array(feedback_ids))
+          return reject(task_id, :feedback_required) unless pending.exists?
+        end
 
         actions.each_with_index do |action, index|
           verdict = @validator.validate(plugin: action["plugin"], operation: action["operation"], input: action["input"])
@@ -106,7 +111,7 @@ module Coordination
         task.last_error = nil
         task.save!
         task.touch(time: now)
-        TaskFeedback.unprocessed.where(task_id: task.id, id: Array(feedback_ids)).update_all(processed_at: now)
+        TaskFeedback.unprocessed.where(task_id: task.id, author_type: "human", id: Array(feedback_ids)).update_all(processed_at: now)
         @event_sink.emit(layer: "coordination", kind: "result.applied", message: "Admin result applied",
                          task_id: task.id,
                          data: { action_count: actions.size, status: task.status, task_version: task_version })
@@ -115,14 +120,16 @@ module Coordination
     rescue ActiveRecord::RecordNotUnique
       # A concurrent identical application won the idempotency-key race.
       reject(task_id, :duplicate_result)
+    rescue ActiveRecord::RecordInvalid, SystemStackError
+      reject(task_id, :invalid_result)
     end
 
     private
 
     def policy_current?(policy)
-      return false unless policy.is_a?(LayerPolicy) && policy.id && policy.updated_at
+      return false unless policy.is_a?(LayerPolicy) && policy.id && policy.updated_at && policy.layer == "coordination"
 
-      LayerPolicy.where(id: policy.id, enabled: true, updated_at: policy.updated_at).exists?
+      LayerPolicy.where(id: policy.id, layer: "coordination", enabled: true, updated_at: policy.updated_at).exists?
     end
 
     def task_running?(task)

@@ -27,25 +27,40 @@ module Interaction
     end
 
     def validate(plugin:, operation:, input:)
+      return failure(:input_invalid) unless input.is_a?(Hash)
+
       normalized = normalize_input!(input)
+      # JSON Schema permits NUL, but PostgreSQL text/jsonb cannot store it.
+      # Check custom nested fields and object keys before a batch is persisted.
+      return failure(:input_invalid) if contains_nul?(normalized)
+
       entry, op = lookup_operation(plugin.to_s, operation.to_s)
       return failure(:unknown_plugin) if entry.nil?
       return failure(:unknown_operation) if op.nil?
       return failure(:unsupported_operation) if op["unsupported"] == true
       return failure(:operation_not_allowed) unless SUPPORTED_WRITES.include?(operation.to_s)
-      return failure(:not_writable) if op["read_only"] == true
+      return failure(:not_writable) unless op["read_only"] == false
+      return failure(:schema_invalid) unless op["input_schema"].is_a?(Hash) && op["output_schema"].is_a?(Hash)
 
       unless Aiconshell::Plugins::Schemas.error_details(op["input_schema"], normalized).empty?
         return failure(:input_invalid)
       end
-      return failure(:input_invalid) if normalized.fetch("body", "").to_s.strip.empty?
+      return failure(:input_invalid) unless normalized["body"].is_a?(String) && normalized["body"].strip.present?
+      target = normalized[operation.to_s == "reply" ? "resource_id" : "scope"]
+      return failure(:input_invalid) unless target.is_a?(String) && target.strip.present?
 
       destination = PluginAccess.destination(plugin.to_s, operation.to_s, normalized)
       return failure(:scope_not_allowed) unless scope_allowed?(plugin.to_s, destination)
 
+      @registry.validate_input(plugin: plugin.to_s, operation: operation.to_s, input: normalized,
+        context: PluginAccess.context(plugin.to_s, operation.to_s, registry: @registry))
       Result.new(ok: true, code: :ok)
-    rescue SystemStackError
+    rescue SystemStackError, Aiconshell::Plugins::InputInvalid
       failure(:input_invalid)
+    rescue Aiconshell::Plugins::PermissionDenied
+      failure(:permission_denied)
+    rescue StandardError
+      failure(:validation_failed)
     end
 
     private
@@ -62,9 +77,16 @@ module Interaction
     end
 
     def normalize_input!(input)
-      raise SystemStackError unless input.is_a?(Hash)
-
       deep_stringify_keys(input)
+    end
+
+    def contains_nul?(value)
+      case value
+      when String then value.include?("\u0000")
+      when Hash then value.any? { |key, entry| contains_nul?(key) || contains_nul?(entry) }
+      when Array then value.any? { |entry| contains_nul?(entry) }
+      else false
+      end
     end
 
     def deep_stringify_keys(value)

@@ -16,9 +16,9 @@ module WorkflowFakes
 
     # Catalog metadata mirroring the real registry contract
     # (id/operations with input_schema/output_schema/scope/read_only,
-    # required_env, configured). Write inputs stay permissive about extra
-    # keys so legacy persisted intents keep delivering; strictness lives in
-    # the real plugin schemas, which production validates exactly.
+    # required_env, configured). This scripted fixture declares permissive
+    # input shapes for its synthetic IDs; real-plugin tests exercise strict
+    # production schemas and destination formats separately.
     FAKE_CATALOG = {
       "github" => %w[latest_events reply create_issue],
       "jira" => %w[latest_events reply create_issue],
@@ -62,6 +62,25 @@ module WorkflowFakes
       else
         raise FakeUnknownPlugin, "unknown operation #{operation}"
       end
+    end
+
+    def validate_input(plugin:, operation:, input:, context: {})
+      require_relative "../../lib/aiconshell/plugins"
+      entry = catalog.find { |item| item["id"] == plugin.to_s }
+      raise Aiconshell::Plugins::UnknownPlugin.new(plugin) unless entry
+
+      op = entry.fetch("operations").find { |item| item["name"] == operation.to_s }
+      raise Aiconshell::Plugins::UnknownOperation.new(plugin: plugin, operation: operation) unless op
+      if op["unsupported"]
+        raise Aiconshell::Plugins::UnsupportedOperation.new(plugin: plugin, operation: operation, reason: op["reason"])
+      end
+      if context["scopes"] && !context["scopes"].include?(op["scope"])
+        raise Aiconshell::Plugins::PermissionDenied.new(plugin: plugin, operation: operation, required_scope: op["scope"])
+      end
+      unless Aiconshell::Plugins::Schemas.valid?(op["input_schema"], input)
+        raise Aiconshell::Plugins::InputInvalid.new(plugin: plugin, operation: operation, details: ["invalid fixture input"])
+      end
+      input
     end
 
     private

@@ -56,6 +56,20 @@ def custom_schema_delivery(plugin:, transport:)
                                    event_sink: WorkflowFakes::FakeEventSink.new)
 end
 
+test("action validation rejects malformed types and impossible builtin write targets before I/O") do |db:|
+  with_workflow_env(scopes: "teams:team/t1/channel/c1") do
+    transport = CustomSchemaRecordingTransport.new
+    registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport).register(Aiconshell::Plugins::Teams.new)
+    validator = Interaction::ActionValidator.new(registry: registry)
+    expect(validator.validate(plugin: "teams", operation: "send_message", input: "invalid").code).to eq(:input_invalid)
+    expect(validator.validate(plugin: "teams", operation: "send_message",
+      input: { "scope" => "team/t1/channel/c1", "body" => "hello" }).code).to eq(:input_invalid)
+    expect(validator.validate(plugin: "teams", operation: "send_message",
+      input: { "scope" => "channel:t1/c1", "body" => "hello" }).ok?).to eq(true)
+    expect(transport.calls).to eq([])
+  end
+end
+
 test("custom required input fields survive delivery") do |db:|
   expect(db.transaction_open?).to eq(true)
   with_workflow_env(scopes: "custom:scope-1") do

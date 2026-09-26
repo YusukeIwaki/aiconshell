@@ -34,6 +34,7 @@ module Coordination
 
       {
         "summary" => stored["summary"].to_s[0, SUMMARY_LIMIT],
+        "summary_truncated" => stored["summary"].to_s.length > SUMMARY_LIMIT,
         "action_count" => stored["action_count"].to_i
       }
     end

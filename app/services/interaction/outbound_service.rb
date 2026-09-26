@@ -33,28 +33,26 @@ module Interaction
       if snapshot[:plugin] == "jira" && PluginAccess.self_actor_ids("jira").empty?
         return settle(action_id, token, status: "failed", code: :self_actor_not_configured)
       end
+      validator = ActionValidator.new(registry: @registry)
+      checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
+      return settle(action_id, token, status: "failed", code: checked.code) unless checked.ok?
+
       operation = registered_operation(snapshot[:plugin], snapshot[:operation])
-      if operation.nil?
-        code = registry_entry(snapshot[:plugin]).nil? ? :unknown_plugin : :unknown_operation
-        return settle(action_id, token, status: "failed", code: code)
-      end
-      if operation["unsupported"] == true
-        return settle(action_id, token, status: "failed", code: :unsupported_operation)
-      end
       # Exact registered input schema; the full input (including custom
       # required fields) is preserved for the handler, never sliced.
-      unless Aiconshell::Plugins::Schemas.error_details(operation["input_schema"], input).empty? &&
-          input.fetch("body", "").to_s.strip.present?
-        return settle(action_id, token, status: "failed", code: :input_invalid)
-      end
       input = draft(input) if %w[reply send_message].include?(snapshot[:operation])
+      checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
+      return settle(action_id, token, status: "failed", code: checked.code) unless checked.ok?
+
       unless start_request(action_id, token)
         return Result.new(ok: false, code: :stale_delivery)
       end
       request_started = true
       output = @registry.invoke(plugin: snapshot[:plugin], operation: snapshot[:operation],
         input: input, context: PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry))
-      unless Aiconshell::Plugins::Schemas.error_details(operation["output_schema"], output).empty?
+      unless Aiconshell::Plugins::Schemas.error_details(operation["output_schema"], output).empty? &&
+          output.is_a?(Hash) && output["external_id"].is_a?(String) && output["external_id"].present? &&
+          (output["url"].nil? || output["url"].is_a?(String))
         return settle(action_id, token, status: "uncertain", code: :invalid_delivery_response)
       end
       settle(action_id, token, status: "sent", code: :ok,
