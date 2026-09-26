@@ -58,6 +58,14 @@ test("emit! raises ValidationError for strict callers") do |memory_outbox:|
     .to raise_error(Aiconshell::Observability::ValidationError)
 end
 
+test("emit contains a simultaneous outbox and diagnostic logger failure") do
+  broken_logger = Object.new
+  def broken_logger.warn(*) = raise(IOError, "log device unavailable")
+  Observability.configure { |config| config.logger = broken_logger }
+
+  expect(Observability.emit(layer: "invalid", kind: "x", message: "m")).to be_nil
+end
+
 test("search delegates to the configured backend") do
   backend = EventLogTestSupport::FakeSearchBackend.new([{ "event_id" => "e1" }])
   Observability.configure { |config| config.search_backend = backend }

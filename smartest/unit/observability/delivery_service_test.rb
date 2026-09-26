@@ -69,7 +69,7 @@ test("clickhouse failure backs off per destination and keeps teams flowing") do 
   record = memory_outbox.find_by_event_id(envelope["event_id"])
   expect(record["clickhouse"]["attempts"]).to eq(1)
   expect(record["clickhouse"]["next_retry_at"]).to eq(fixed_clock.now.utc + 120)
-  expect(record["clickhouse"]["last_error"]).to match(/ch down/)
+  expect(record["clickhouse"]["last_error"]).to eq("RuntimeError")
 end
 
 test("disabled teams sink skips instead of retrying forever") do |memory_outbox:, test_logger:, fixed_clock:|

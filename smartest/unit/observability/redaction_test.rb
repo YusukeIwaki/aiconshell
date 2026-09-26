@@ -54,11 +54,13 @@ test("redacts values inside arrays without mutating the input") do
   expect(input[0]).to eq({ "secret" => "s" })
 end
 
-test("sanitize_error is single-line, bounded, and redacted") do
-  error = RuntimeError.new("failed token=supersecret user bob@example.com\nline2 " + ("x" * 600))
+test("sanitize_error never copies arbitrary exception messages") do
+  error = RuntimeError.new("unlabelled-sensitive-sentinel token=supersecret user bob@example.com\n" + ("x" * 600))
 
   message = Redaction.sanitize_error(error)
 
+  expect(message).to eq("RuntimeError")
+  expect(message).not_to match(/unlabelled-sensitive-sentinel/)
   expect(message).not_to match(/\n/)
   expect(message).not_to match(/supersecret/)
   expect(message).not_to match(/bob@example\.com/)

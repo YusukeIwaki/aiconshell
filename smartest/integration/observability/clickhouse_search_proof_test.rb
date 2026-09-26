@@ -21,21 +21,22 @@ def build_proof_table!(real_clickhouse:)
   # tiny rows ClickHouse adaptive granularity would merge all 9000 into a
   # single granule and the narrowing proof would be vacuous.
   pad = "x" * 1100
+  base_time = Time.now.utc - 86_400
   rows = Array.new(PROOF_FILLER_ROWS) do |i|
     { "event_id" => SecureRandom.uuid, "layer" => "coordination", "kind" => "bulk.noise",
       "message" => "routine heartbeat log entry number #{i} #{pad}",
-      "occurred_at" => "2026-09-01 00:00:00.000", "data" => {},
+      "occurred_at" => base_time.iso8601(3), "data" => {},
       "task_id" => nil, "correlation_id" => nil, "version" => 1 }
   end
   en_id = SecureRandom.uuid
   ja_id = SecureRandom.uuid
   rows << { "event_id" => en_id, "layer" => "coordination", "kind" => "task.prioritized",
             "message" => "special event holding #{PROOF_RARE_EN} marker",
-            "occurred_at" => "2026-09-02 00:00:00.000", "data" => {},
+            "occurred_at" => (base_time + 3600).iso8601(3), "data" => {},
             "task_id" => 1, "correlation_id" => "corr-rare", "version" => 1 }
   rows << { "event_id" => ja_id, "layer" => "execution", "kind" => "run.finished",
             "message" => "特別な日本語イベント #{PROOF_RARE_JA} を含む",
-            "occurred_at" => "2026-09-02 01:00:00.000", "data" => {},
+            "occurred_at" => (base_time + 7200).iso8601(3), "data" => {},
             "task_id" => 2, "correlation_id" => "corr-rare-ja", "version" => 1 }
   proof_adapter(real_clickhouse).insert(rows)
   cfg.execute!("OPTIMIZE TABLE #{PROOF_TABLE} FINAL")

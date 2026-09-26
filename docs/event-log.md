@@ -46,9 +46,10 @@ posted to Teams:
 - Strings: email addresses → `[redacted-email]`; `Bearer`/`Basic`
   credentials → `[REDACTED]`; `password=`/`token=`-style fragments inside
   URLs and query strings → `[REDACTED]`.
-- Errors recorded in `*_last_error` or logs are single-line, truncated to
-  500 chars, and redacted; backtraces are never stored (they can embed
-  arguments and environment).
+- Unexpected errors recorded in `*_last_error` or logs contain only the
+  exception class (bounded to 500 chars). Arbitrary exception messages and
+  backtraces are never stored: they can contain unlabelled credentials,
+  SQL row values, or raw provider output that pattern redaction would miss.
 
 Callers must still avoid passing AI prompts or raw provider output: the
 carrier-key list is a backstop, not permission.
@@ -156,8 +157,9 @@ outage cannot recurse into the outbox.
   fail loudly in logs and retry on the next tick. Events emitted during the
   outage are lost — the documented trade-off for "logging never breaks
   business updates".
-- ClickHouse down: rows stay pending with backoff; nothing is dropped and
-  Teams delivery continues independently.
+- ClickHouse down: rows stay pending with backoff for up to 25 attempts;
+  persistent failures then become skipped as described above. Teams
+  delivery continues independently.
 - ClickHouse unconfigured (`CLICKHOUSE_URL` unset): rows stay pending and
   each run logs an error. This is a deploy misconfiguration — alert on it,
   do not let the spool grow silently.
