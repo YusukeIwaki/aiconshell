@@ -11,7 +11,7 @@ module Admin
     LAYERS = %w[interaction coordination execution].freeze
     DEFAULT_LIMIT = 50
     MAX_LIMIT = 200
-    MAX_QUERY_LENGTH = 500
+    MAX_QUERY_LENGTH = 200
     MAX_FIELD_LENGTH = 200
     KIND_PATTERN = /\A[a-zA-Z0-9_.\-:]+\z/
 

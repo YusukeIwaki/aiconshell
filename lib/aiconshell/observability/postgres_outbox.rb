@@ -16,7 +16,7 @@ module Aiconshell
       COLUMNS = %w[
         id event_id envelope layer kind task_id correlation_id occurred_at
         teams_channel
-        clickhouse_delivered_at clickhouse_attempts clickhouse_next_retry_at clickhouse_last_error
+        clickhouse_delivered_at clickhouse_attempts clickhouse_next_retry_at clickhouse_last_error clickhouse_skipped_at
         teams_delivered_at teams_attempts teams_next_retry_at teams_last_error teams_skipped_at
         created_at updated_at
       ].freeze
@@ -99,7 +99,7 @@ module Aiconshell
         result = @connection.exec_params(<<~SQL, [before.utc.iso8601(3)])
           DELETE FROM event_deliveries
           WHERE created_at < $1::timestamptz
-            AND clickhouse_delivered_at IS NOT NULL
+            AND (clickhouse_delivered_at IS NOT NULL OR clickhouse_skipped_at IS NOT NULL)
             AND (teams_channel IS NULL OR teams_channel = ''
                  OR teams_delivered_at IS NOT NULL OR teams_skipped_at IS NOT NULL)
         SQL

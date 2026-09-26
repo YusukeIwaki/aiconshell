@@ -17,9 +17,10 @@
 -- * PARTITION BY month keeps TTL drops and range scans partition-local.
 -- * TTL 180 days: the EventLog is operational history, not a compliance
 --   archive. Adjust per operations policy with an ALTER ... MODIFY TTL.
--- * idx_message_ngram (ngrambf) accelerates substring search
---   (position/LIKE/match), including Japanese, which has no whitespace
---   tokens. idx_message_text covers ASCII token queries via hasToken.
+-- * Substring search is message LIKE %...% (literal, escaped). On 26.8
+--   LIKE is what idx_message_text (ASCII) and idx_message_ngram
+--   accelerate, including Japanese, which has no whitespace tokens.
+--   position()/match() predicates use no skipping and are not used.
 -- * Writes use JSONEachRow over HTTP; reads use parameterized {name:Type}
 --   placeholders (see lib/aiconshell/observability/clickhouse_adapter.rb).
 

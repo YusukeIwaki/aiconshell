@@ -1,14 +1,6 @@
 # frozen_string_literal: true
 
-# Admin console routes (issue 7). Loaded from the application routes with:
-#
-#   Rails.application.routes.draw do
-#     ...
-#     draw(:admin)
-#   end
-#
-# Kept in a separate file so this lane never edits config/routes.rb itself;
-# the coordinator adds the one-line `draw(:admin)` call at merge time.
+# Admin console routes loaded by draw(:admin) in config/routes.rb.
 namespace :admin do
   root "tasks#index"
 

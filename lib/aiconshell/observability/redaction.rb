@@ -96,15 +96,15 @@ module Aiconshell
         end
       end
 
-      # Single-line, redacted, bounded error description safe for logs and
-      # outbox `last_error` columns. Never includes backtraces (they may
-      # embed environment or arguments).
+      # Exception messages can contain arbitrary provider output, SQL row
+      # values, or credentials without recognizable labels. Record only
+      # the exception class; pattern redaction cannot make those messages safe.
       def sanitize_error(error, max_chars: 500)
-        message = error.respond_to?(:message) ? error.message.to_s : error.to_s
-        one_line = message.gsub(/\s+/, " ").strip
-        truncate_string(redact_string(one_line), max_chars)
+        name = error.class.name.to_s
+        name = "Error" unless name.match?(/\A[A-Z]\w*(?:::[A-Z]\w*)*\z/)
+        truncate_string(name, max_chars)
       rescue StandardError
-        "#{error.class}"
+        "Error"
       end
     end
   end

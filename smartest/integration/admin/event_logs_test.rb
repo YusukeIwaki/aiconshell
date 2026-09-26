@@ -75,8 +75,8 @@ test("invalid filters show errors and never reach the backend") do |http:|
     http.get "/admin/event_logs", { search: { kind: "a b; DROP TABLE x" } }
     expect(http.last_response.body.include?("種別は英数字")).to eq(true)
 
-    http.get "/admin/event_logs", { search: { query: "q" * 501 } }
-    expect(http.last_response.body.include?("500文字以内")).to eq(true)
+    http.get "/admin/event_logs", { search: { query: "q" * 201 } }
+    expect(http.last_response.body.include?("200文字以内")).to eq(true)
 
     expect(fake.calls).to eq([])
   end
