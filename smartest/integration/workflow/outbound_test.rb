@@ -58,7 +58,7 @@ test("outbound delivery without an interaction policy sends the body as-is") do 
   end
 end
 
-test("transient send failures stay retryable and visible") do |db:|
+test("ambiguous send failures require review rather than duplicate a post") do |db:|
   expect(db.transaction_open?).to eq(true)
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
@@ -79,11 +79,11 @@ test("transient send failures stay retryable and visible") do |db:|
     ).call(action.id)
 
     expect(result.ok).to eq(false)
-    expect(result.code).to eq(:transient_error)
-    expect(action.reload.status).to eq("pending")
+    expect(result.code).to eq(:delivery_uncertain)
+    expect(action.reload.status).to eq("uncertain")
     expect(action.attempts).to eq(1)
     expect(action.error.nil?).to eq(false)
-    expect(sink.kinds.include?("outbound.retryable")).to eq(true)
+    expect(sink.kinds.include?("outbound.uncertain")).to eq(true)
   end
 end
 
