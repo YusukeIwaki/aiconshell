@@ -29,7 +29,8 @@ module Aiconshell
       operation "latest_events",
                 input_schema: Schemas::LATEST_EVENTS_INPUT,
                 output_schema: Schemas::LATEST_EVENTS_OUTPUT,
-                scope: "jira:read"
+                scope: "jira:read",
+                read_only: true
       operation "reply",
                 input_schema: Schemas::REPLY_INPUT,
                 output_schema: Schemas::WRITE_OUTPUT,
@@ -49,6 +50,19 @@ module Aiconshell
 
       # email + token + exactly one endpoint source (base URL wins, then site,
       # then cloud id).
+      def validate_operation_input(op, input)
+        case op.name
+        when "reply"
+          unless RESOURCE_PATTERN.match?(input.fetch("resource_id"))
+            raise InputInvalid.new(plugin: plugin_id, operation: op.name, details: ['resource_id must look like "issue:PROJ-123"'])
+          end
+        when "create_issue"
+          unless PROJECT_PATTERN.match?(input.fetch("scope"))
+            raise InputInvalid.new(plugin: plugin_id, operation: op.name, details: ['scope must be a Jira project key like "PROJ"'])
+          end
+        end
+      end
+
       def configured?(env)
         present?(env["JIRA_EMAIL"]) &&
           (present?(env["JIRA_API_TOKEN"]) || present?(env["JIRA_API_TOKEN_FILE"])) &&

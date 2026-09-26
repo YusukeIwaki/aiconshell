@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_010000) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_020000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -110,6 +110,8 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_010000) do
     t.datetime "lease_expires_at"
     t.datetime "request_started_at"
     t.datetime "next_attempt_at"
+    t.string "delivery_batch_key"
+    t.index ["delivery_batch_key"], name: "index_outbound_actions_on_delivery_batch_key"
     t.index ["idempotency_key"], name: "index_outbound_actions_on_idempotency_key", unique: true
     t.index ["lease_expires_at"], name: "index_outbound_actions_on_lease_expires_at"
     t.index ["status", "next_attempt_at"], name: "index_outbound_actions_on_status_and_next_attempt_at"
@@ -337,10 +339,12 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_010000) do
     t.datetime "updated_at", null: false
     t.bigint "current_run_id"
     t.text "work_plan", default: "", null: false
+    t.jsonb "coordination_result"
+    t.string "delivery_batch_key"
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"
-    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY (ARRAY[('inbox'::character varying)::text, ('ready'::character varying)::text, ('running'::character varying)::text, ('waiting_human'::character varying)::text, ('waiting_review'::character varying)::text, ('failed'::character varying)::text])))"
+    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
     t.index ["status"], name: "index_tasks_on_status"
   end
 

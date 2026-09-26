@@ -36,15 +36,18 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 | モデル | 主な情報 / 制約 |
 | --- | --- |
 | ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし、親スナップショットは改訂を鎖状に識別する |
+| TaskRequest | 管理画面・管理APIの依頼受付。公開UUID、UI/API別の冪等キー、title/description、固有のExternalEventへの参照。受付とイベントを同じtransactionで保存する |
 | IntegrationCursor | plugin と scope ごとの cursor JSON、lease、last_polled_at、error。全ページの durable ingest 完了後のみ更新 |
-| Task | title、description、status、priority、source reference、next_action_at、lock_version。状態更新は Coordination のみ |
+| Task | title、description、status、priority、source reference、next_action_at、lock_version、coordination_result、delivery_batch_key。状態更新は Coordination のみ |
 | TaskFeedback | task、body、author、processed_at。人間の意見を保持し、直接的な状態変更をしない |
 | TaskRun | task、provider/model/effort/instructions snapshot、status、lease token/expiry、result、error、開始/終了時刻 |
 | LayerPolicy | layer（interaction/coordination/execution）、provider（claude/codex/muse）、model、effort、instructions、enabled。layer一意 |
-| OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error。Coordination が作り Interaction が送る |
+| OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error、delivery_batch_key。Coordination が作り Interaction が送る |
 | EventDelivery | redacted envelope、event_id、宛先別配信/再試行状態。配信済みの短期 retention |
 
-Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
+Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `waiting_delivery`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
+
+管理画面・管理API 起点の cross-connector 要求（issue #11）は、Task に関連付けられた永続化済みの人間 `admin.task_request` イベントで出所を確認する。source 文字列や AI が返す属性だけでは権限を与えない。Coordination は Interaction の型付き読み取りを通して情報を取得し、結果と検証済み書き込みバッチ（`coordination_result` の要約/件数と `delivery_batch_key`）を原子的に永続化する。アクションなしは `done`、アクション付きは `waiting_delivery` とし、後者の確定は Coordination の reconciler のみが行う。全期待アクションが終端状態になるまで待ち、全件 `sent` なら `done`、`failed` / `uncertain` があれば `waiting_human` にする。欠損・件数不一致は成功扱いにしない。Interaction は Task のライフサイクルを更新せず、Execution はこの読み取り・通知経路には不要。
 
 5 分 polling、滞留 inbox の再処理、実行 lease 回復、EventLog outbox 配信、outbound action 配信は再起動後も続けられる recurring jobs とする。control と execution の queue を分ける。更新イベントは ID だけでなく fingerprint を持ち、同じメッセージの編集を区別する。
 
@@ -56,11 +59,13 @@ pure Ruby のルートは `lib/aiconshell/plugins.rb`, `lib/aiconshell/ai.rb`, `
 
 ```ruby
 registry = Aiconshell::Plugins::Registry.default
-registry.catalog # Array<Hash>: id, operations with input_schema/output_schema, required_env, configured
-registry.invoke(plugin: "github", operation: "latest_events", input: {}, context: {})
+registry.catalog # Array<Hash>: id, operations with input_schema/output_schema/read_only, required_env, configured
+registry.invoke(plugin: "github", operation: "latest_events",
+                input: { "scope" => "owner/repo", "cursor" => nil },
+                context: { "scopes" => ["github:read"] })
 ```
 
-`context` は信頼できるアプリケーション側で構築し、許可 scope 等を渡す。ユーザー入力から無制限に構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。
+`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
 
 `latest_events` の入力: `{"scope": "...", "cursor": null または object}`。
 返却: `{"events": [...], "cursor": object}`。
@@ -73,7 +78,29 @@ registry.invoke(plugin: "github", operation: "latest_events", input: {}, context
 
 HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検証。秘密は ENV または private ファイルから読む。catalog は値を表示しない。プラグイン登録は信頼されたコードのみ。MCP wire protocol の互換サーバーは初期スコープに含めない。
 
+`Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
+
 GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+
+### 管理依頼の read / result / receipt
+
+`Coordination::TriageService.new(ai_runner:, registry:, event_sink:, clock:)` に同じ Registry を注入すると、読み取りと結果の検証でその catalog を共有する。AI は次のいずれかを返す。`read_requests` と `rulings` の混在は禁止する。
+
+```json
+{"read_requests":[{"task_id":123,"plugin":"github","operation":"list_issues","input":{"scope":"owner/repo"}}]}
+```
+
+```json
+{"rulings":[{"task_id":123,"result":{"summary":"高優先度の issue が 1 件見つかったため通知を依頼する。","actions":[{"plugin":"teams","operation":"send_message","input":{"scope":"channel:team-id/channel-id","body":"確認が必要な issue があります。"}}]}}]}
+```
+
+`Interaction::QueryService` は登録済み read-only operation の正確な入出力スキーマと宛先を検証する。読み取り上限は 3 ラウンド・合計 10 件、同一ラウンド内の Task 重複は禁止。クエリ失敗は内容を含まない分類コードでその処理を終了し、結果保存や通知を行わない。成功した観測は `OBSERVATIONS` JSON として次の AI 呼出しへ渡す。`list_issues` は open issue の 1 ページのみを返し、PR を除外する。`complete` / `next_cursor` / `truncated` / `limit_reached` と各項目の省略フラグを必ず解釈する。ページ数上限では未完了かつ継続 cursor なしとなり、全件確認済みとは扱わない。可変な外部一覧の時点一貫性は保証しない。詳細は [GitHub plugin](../plugins/github/README.md) と [workflow](workflow.md) を参照。
+
+最終 `result` は空白でない 1–2000 文字の要約と最大 20 件の `actions`。`status` / `dispatch` / `reply` / `work_plan` と併用できない。許可される書き込みは `reply` / `create_issue` / `send_message`。未登録 operation、allowlist 外宛先、スキーマ不一致、PostgreSQL に保存できない NUL 文字を拒否する。通常の外部起点 Task は引き続き source に紐付いた legacy `reply` のみを使い、管理依頼用の権限を得ない。
+
+新しい read ラウンドおよび `result` を含む最終ラウンドは、未知・重複 Task 参照を全体として拒否する。結果ラウンドは全提案を検証してから savepoint 内で保存し、途中の拒否で全件を巻き戻す。legacy ruling だけのラウンドは従来どおり個別に適用する。Task version、現在の coordination policy、関連付けられた admin origin を再確認し、適用に成功した snapshot 内の人間フィードバックだけを確認済みにする。
+
+`waiting_delivery` は AI が設定・解除できず、新着フィードバックがあっても triage 対象から除外する。配信中のフィードバックは保存し、reconciler も確認済みにしない。実行中 Task や active/current run を持つ Task への result は拒否する。失敗・不確定な配信は `next_action_at` を消して人間の判断を待ち、勝手に再送しない。再検討には以前の要約と配信先・状態・分類エラーを渡す。`sent` は外部 API の受理を示し、人間の閲覧や外部での exactly-once を保証するものではない。
 
 ### AI
 

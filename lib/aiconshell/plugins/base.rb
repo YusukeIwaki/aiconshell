@@ -9,9 +9,13 @@ module Aiconshell
     # hold. Unsupported operations are listed in the catalog with a reason and
     # rejected at invoke time.
     Operation = Struct.new(:name, :input_schema, :output_schema, :scope,
-                           :unsupported, :reason, keyword_init: true) do
+                           :unsupported, :reason, :read_only, keyword_init: true) do
       def unsupported?
         !!unsupported
+      end
+
+      def read_only?
+        !!read_only
       end
     end
 
@@ -32,14 +36,15 @@ module Aiconshell
         end
 
         def operation(name, input_schema:, output_schema:, scope: nil,
-                      unsupported: false, reason: nil)
+                      unsupported: false, reason: nil, read_only: false)
           operations[name.to_s] = Operation.new(
             name: name.to_s,
             input_schema: input_schema,
             output_schema: output_schema,
             scope: scope&.to_s,
             unsupported: unsupported,
-            reason: reason&.to_s
+            reason: reason&.to_s,
+            read_only: !!read_only
           )
         end
 
@@ -66,7 +71,8 @@ module Aiconshell
             "name" => op.name,
             "input_schema" => deep_dup(op.input_schema),
             "output_schema" => deep_dup(op.output_schema),
-            "scope" => op.scope
+            "scope" => op.scope,
+            "read_only" => op.read_only?
           }
           if op.unsupported?
             entry["unsupported"] = true
@@ -88,6 +94,12 @@ module Aiconshell
           raise UnknownOperation.new(plugin: plugin_id, operation: op.name)
         end
         send(handler, input, invoke_ctx)
+      end
+
+      # Optional semantic preflight after JSON Schema validation. Implementations
+      # must be pure: no credentials, transport, or mutable application state.
+      # Registry#validate_input and #invoke both call this hook.
+      def validate_operation_input(op, input)
       end
 
       protected
