@@ -302,6 +302,7 @@ Muse binary が無ければ Muse は未構成のままであり、選択時に�
 | `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
 | `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
+| `ADMIN_API_TOKEN` | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値（未設定は fail closed。UI 認証とは別。`docs/task-requests.md`） |
 | `RAILS_ENV` | 3 サービスに `production` |
 | `EVENT_LOG_TEAMS_CHANNEL` | 3 サービスに同じ `channel:<team>/<channel>`。空なら通知しない |
 | `TEAMS_BOT_TARGETS_FILE` | control の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |

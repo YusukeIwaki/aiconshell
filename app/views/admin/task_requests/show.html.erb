@@ -1,0 +1,29 @@
+<% content_for(:title, "タスク依頼の受付") %>
+<h1>タスク依頼の受付</h1>
+<p>依頼を受け付けました。受付内容の確認画面です。</p>
+
+<div class="admin-card">
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <tr><th>受付ID</th><td><%= @receipt.request_id %></td></tr>
+      <tr><th>状態</th><td><%= @receipt.processed? ? "タスク作成済み" : "タスク整理待ち" %></td></tr>
+      <tr>
+        <th>タスク</th>
+        <td>
+          <% if @event.task_id %>
+            <%= link_to "タスク ##{@event.task_id}", admin_task_path(@event.task_id) %>
+          <% else %>
+            タスク整理待ち
+          <% end %>
+        </td>
+      </tr>
+      <tr><th>タイトル</th><td><%= @receipt.title %></td></tr>
+      <tr><th>内容</th><td><div class="admin-verbatim"><%= @receipt.description %></div></td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="admin-actions">
+  <%= link_to "← タスクボードに戻る", admin_tasks_path %>
+  <%= link_to "新しい依頼を作成する", new_admin_task_request_path %>
+</div>

@@ -57,6 +57,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 | `TEST_DATABASE_URL` | integration suite 用（`*_test` 必須） | `DATABASE_URL`、無ければ localhost の `_test` |
 | `SECRET_KEY_BASE` | Rails secret | compose は開発用ダミー。共有環境では必須 |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | 管理画面の Basic 認証 | 未設定では fail closed |
+| `ADMIN_API_TOKEN` | JSON 管理 API（`/api/admin/task_requests`）の Bearer 認証（[docs/task-requests.md](docs/task-requests.md)） | 未設定では fail closed |
 | `AICONSHELL_EXECUTION_ROOT` | AI 作業領域ルート（production 必須） | compose は `/workspaces` volume |
 | `AICONSHELL_ALLOWED_SCOPES` | 取り込み/送信対象の `plugin:scope` 一覧 | 空（何も対象にしない） |
 | `AICONSHELL_LEASE_SECONDS` / `AICONSHELL_AI_TIMEOUT_SECONDS` | 実行 lease / AI 実行上限（lease > timeout + 10 が必須） | `1800` / `600` |
