@@ -1,0 +1,79 @@
+<% content_for(:title, "EventLog検索") %>
+<h1>EventLog検索</h1>
+<p>層・種別・タスク・期間・キーワードでイベントを検索します（新しい順）。</p>
+
+<div class="admin-card">
+  <%= form_with url: admin_event_logs_path, method: :get, scope: :search do |form| %>
+    <div class="admin-search-form">
+      <div class="admin-search-field">
+        <%= form.label :query, "キーワード" %>
+        <%= form.text_field :query, value: @form[:query], maxlength: 500 %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :layer, "層" %>
+        <%= form.select :layer, options_for_select([["指定なし", ""], ["対話層", "interaction"], ["整理層", "coordination"], ["実行層", "execution"]], @form[:layer]) %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :kind, "種別" %>
+        <%= form.text_field :kind, value: @form[:kind], maxlength: 200 %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :task_id, "タスクID" %>
+        <%= form.text_field :task_id, value: @form[:task_id].is_a?(Integer) ? @form[:task_id] : @form[:task_id], maxlength: 10, inputmode: "numeric" %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :correlation_id, "相関ID" %>
+        <%= form.text_field :correlation_id, value: @form[:correlation_id], maxlength: 200 %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :limit, "件数（最大200）" %>
+        <%= form.text_field :limit, value: @form[:limit].is_a?(Integer) ? @form[:limit] : 50, maxlength: 4, inputmode: "numeric" %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :since, "開始（ISO8601）" %>
+        <%= form.text_field :since, value: @form[:since].is_a?(String) ? @form[:since] : "", placeholder: "2026-09-01T00:00:00Z", maxlength: 40 %>
+      </div>
+      <div class="admin-search-field">
+        <%= form.label :until, "終了（ISO8601）" %>
+        <%= form.text_field :until, value: @form[:until_time].is_a?(String) ? @form[:until_time] : "", placeholder: "2026-09-27T00:00:00Z", maxlength: 40 %>
+      </div>
+      <div class="admin-search-actions">
+        <%= form.submit "検索する", class: "admin-btn", name: nil %>
+      </div>
+    </div>
+  <% end %>
+</div>
+
+<% if @search_error %>
+  <div class="admin-card">
+    <p><span class="admin-badge admin-badge-bad">検索できませんでした</span> <%= @search_error %></p>
+  </div>
+<% elsif @form[:submitted] %>
+  <h2>検索結果（<%= @events.size %>件）</h2>
+  <% if @events.empty? %>
+    <div class="admin-card"><p>条件に一致するイベントはありませんでした。</p></div>
+  <% else %>
+    <div class="admin-table-wrap">
+      <table class="admin-table">
+        <tr><th>発生日時</th><th>層</th><th>種別</th><th>タスク</th><th>メッセージ</th><th>詳細</th></tr>
+        <% @events.each do |event| %>
+          <% data = event["data"] || event[:data] %>
+          <tr>
+            <td><%= event["occurred_at"] || event[:occurred_at] %></td>
+            <td><%= event["layer"] || event[:layer] %></td>
+            <td><%= event["kind"] || event[:kind] %></td>
+            <td><%= event["task_id"] || event[:task_id] %></td>
+            <td><%= event["message"] || event[:message] %></td>
+            <td>
+              event_id: <%= event["event_id"] || event[:event_id] %><br>
+              correlation_id: <%= event["correlation_id"] || event[:correlation_id] %>
+              <% if data.present? %>
+                <pre class="admin-pre"><%= JSON.pretty_generate(data) rescue data.to_s %></pre>
+              <% end %>
+            </td>
+          </tr>
+        <% end %>
+      </table>
+    </div>
+  <% end %>
+<% end %>

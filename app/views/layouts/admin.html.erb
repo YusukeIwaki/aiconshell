@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <title><%= content_for(:title) || "管理画面" %> - Aiconshell</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <%= csrf_meta_tags %>
+    <%= csp_meta_tag %>
+    <%= stylesheet_link_tag "admin" %>
+  </head>
+
+  <body>
+    <header class="admin-header">
+      <div class="admin-header-inner">
+        <span class="admin-brand">Aiconshell 管理画面</span>
+        <nav class="admin-nav" aria-label="管理メニュー">
+          <% admin_nav_items.each do |label, path, key| %>
+            <%= link_to label, path, class: ["admin-nav-link", ("is-active" if admin_nav_active?(key))] %>
+          <% end %>
+        </nav>
+      </div>
+    </header>
+
+    <main class="admin-main">
+      <% if flash[:notice] %>
+        <p class="admin-flash admin-flash-notice"><%= flash[:notice] %></p>
+      <% end %>
+      <% if flash[:alert] %>
+        <p class="admin-flash admin-flash-alert"><%= flash[:alert] %></p>
+      <% end %>
+      <%= yield %>
+    </main>
+
+    <footer class="admin-footer">
+      <p>操作用設定のみ表示します。秘密情報（APIキー・認証内容）は表示しません。</p>
+    </footer>
+  </body>
+</html>

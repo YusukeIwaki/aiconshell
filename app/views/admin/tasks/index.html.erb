@@ -1,0 +1,26 @@
+<% content_for(:title, "タスクボード") %>
+<h1>タスクボード</h1>
+<p>状態ごとのタスク一覧です（優先度順、最大200件）。タスクの状態変更は整理層だけが行います。</p>
+
+<div class="admin-board">
+  <% @columns.each do |status, tasks| %>
+    <section class="admin-column" aria-label="<%= task_status_label(status) %>">
+      <h2 class="admin-column-title">
+        <span><%= task_status_label(status) %></span>
+        <span class="admin-column-count"><%= tasks.size %>件</span>
+      </h2>
+      <% if tasks.empty? %>
+        <p class="admin-task-meta">なし</p>
+      <% else %>
+        <% tasks.each do |task| %>
+          <article class="admin-task-card">
+            <%= link_to task.title, admin_task_path(task) %>
+            <div class="admin-task-meta">
+              #<%= task.id %> / 優先度 <%= task.priority %>
+            </div>
+          </article>
+        <% end %>
+      <% end %>
+    </section>
+  <% end %>
+</div>
