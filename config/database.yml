@@ -1,0 +1,47 @@
+# Web, Solid Queue workers, and recurring tasks share ONE PostgreSQL database.
+# The connection is selected by DATABASE_URL (TEST_DATABASE_URL in test).
+# There is intentionally no separate queue/cache/cable database; see
+# docs/architecture.md and config/application.rb.
+#
+# Local setup: copy .env.example to .env and adjust, or export DATABASE_URL
+# (and TEST_DATABASE_URL) in your shell. Never commit .env itself.
+
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  # For details on connection pooling, see Rails configuration guide
+  # https://guides.rubyonrails.org/configuring.html#database-pooling
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+
+development:
+  <<: *default
+  url: <%= ENV.fetch("DATABASE_URL", "postgresql://localhost/aiconshell_development") %>
+
+test:
+  <<: *default
+  # A dedicated test database so suites never touch development data.
+  # Falls back to DATABASE_URL only when it points at a *_test database is
+  # NOT enforced here; smartest/db_helper.rb aborts unless the resolved test
+  # database name ends with _test.
+  url: <%= ENV.fetch("TEST_DATABASE_URL", ENV.fetch("DATABASE_URL", "postgresql://localhost/aiconshell_test")) %>
+
+production:
+  <<: *default
+  # Production must always configure an explicit database URL (fail closed).
+  # NOTE: ERB renders the whole file before Rails selects its env section,
+  # so this expression runs in development/test too. Raise only when actually
+  # booting production; other envs get an unused placeholder. Asset
+  # precompilation (SECRET_KEY_BASE_DUMMY=1, see Dockerfile) is exempt so
+  # `docker build` works without credentials.
+  url: <%= begin
+    url = ENV["DATABASE_URL"]
+    if url.nil? || url.empty?
+      if ENV["RAILS_ENV"] == "production" && !ENV.key?("SECRET_KEY_BASE_DUMMY")
+        raise KeyError, "DATABASE_URL is required in production"
+      else
+        "postgresql://localhost/aiconshell_production_unused"
+      end
+    else
+      url
+    end
+  end %>

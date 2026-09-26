@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+# Run the Smartest suites.
+#
+#   bin/test              run unit + integration suites
+#   bin/test unit         run smartest/unit (no Rails boot, no DB, no network)
+#   bin/test integration  run smartest/integration (needs TEST_DATABASE_URL
+#                         pointing at a *_test PostgreSQL database; run
+#                         bin/setup once first so db:prepare has run)
+#
+# Directory args expand recursively (<dir>/**/*_test.rb), so lanes add suites
+# under smartest/unit/<area>/ (DB-free) or smartest/integration/<area>/ and
+# they are discovered automatically. Full multi-suite discovery/CI wiring is
+# owned by issues #8/#9; this foundation script only runs these two trees.
+set -e
+
+suite="${1:-all}"
+
+run_unit() {
+  bundle exec smartest smartest/unit
+}
+
+run_integration() {
+  RAILS_ENV=test bundle exec smartest smartest/integration
+}
+
+case "$suite" in
+  unit)
+    run_unit
+    ;;
+  integration)
+    run_integration
+    ;;
+  all)
+    run_unit
+    run_integration
+    ;;
+  *)
+    echo "usage: bin/test [unit|integration|all]" >&2
+    exit 1
+    ;;
+esac
