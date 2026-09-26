@@ -7,7 +7,7 @@
     <div class="admin-search-form">
       <div class="admin-search-field">
         <%= form.label :query, "キーワード" %>
-        <%= form.text_field :query, value: @form[:query], maxlength: 500 %>
+        <%= form.text_field :query, value: @form[:query], maxlength: Admin::EventLogsController::MAX_QUERY_LENGTH %>
       </div>
       <div class="admin-search-field">
         <%= form.label :layer, "層" %>
