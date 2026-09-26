@@ -1,189 +1,83 @@
-# Verification (issue #9, bounded acceptance slice — part 2)
+# 検証記録
 
-Branch: `codex/issue-9-acceptance`. This file records only what was actually
-observed in this worktree. Anything not listed here was not verified here.
+2026-09-27 にローカルで実施。実装セッションの報告に加え、統合担当が最終プラグインと
+スナップショット改訂処理を組み合わせた checkout で再実行した。
 
-Part 2 supersedes the part-1 note about a fake event sink: this lane merged
-`codex/issue-7-admin` (merge `5483e69`, tip `db8eaee`: reviewed EventLog
-boot wiring, corrected migrations `20260927000001`/`20260927000601..603`,
-complete `db/schema.rb`, admin/wiring test isolation) as a root-authorized
-dependency merge. No pull request was created, nothing was pushed to main,
-and no issue was closed from this session.
+## Smartest
 
-## Scope of this bounded part
+| 対象 | 結果 | 境界 |
+| --- | --- | --- |
+| `smartest/unit` | 62 / 62 | 共通契約・層の境界・EventLog の純粋ロジック |
+| `smartest/plugins` | 96 / 96 | schema、認証要求、改ページ、cursor、HTTP エラー。注入 transport と localhost HTTP サーバー |
+| `smartest/ai` | 79 / 79 | argv、環境変数、schema、timeout、プロセス群・出力上限。fake CLI / runner |
+| `smartest/integration` | 153 / 153 | 実 PostgreSQL と実 ClickHouse、管理画面・workflow・配信・受け入れ経路 |
+| `bin/rails zeitwerk:check` | 成功 | Rails の定数ロード |
 
-New/owned files in this lane only:
+合計 390 件、失敗 0 件。ClickHouse 系を含め、統合テストの skip はない。
+Ruby 3.4.9、Rails 8.0.5.1、PostgreSQL 17.2、ClickHouse 26.8.11.7 を使用した。
+新規の `*_test` データベースで `RAILS_ENV=test bin/rails db:prepare` を実行し、
+Solid Queue と domain / EventLog テーブル、改訂管理の追加 migration を確認した。
 
-- `smartest/integration/acceptance/acceptance_helper.rb`
-- `smartest/integration/acceptance/end_to_end_test.rb`
-- `docs/verification.md` (this file)
+再実行は `bin/test unit` と `bin/test integration` を使う。前者は fixture の名前空間を
+分離するため、unit / plugins / ai を別プロセスで実行する。複数 suite を一度の
+`smartest` コマンドへ連結する実行方法はサポートしない。
 
-No product code was changed. Issue-3 (GitHub cursor/pagination) files were
-not merged and not touched; the acceptance stubs still target the old
-adapter endpoints (exact surface documented below) and will need a final
-adjustment after root integrates issue-3.
+統合テストに指定する環境変数:
 
-## What the acceptance test proves
+- `RAILS_ENV=test`、`TEST_DATABASE_URL`（末尾が `_test` の PostgreSQL DB）。
+- `TEST_PG_HOST` / `TEST_PG_PORT` / `TEST_PG_DBNAME` / `TEST_PG_USER` /
+  `TEST_PG_PASSWORD` も同じ DB に合わせる（EventLog の PostgreSQL ポート試験）。
+- `TEST_CLICKHOUSE_URL` / `TEST_CLICKHOUSE_DATABASE` / `TEST_CLICKHOUSE_USER` /
+  `TEST_CLICKHOUSE_PASSWORD` は専用テスト DB に向ける。
 
-`smartest/integration/acceptance/end_to_end_test.rb` runs one human GitHub
-issue through the real stack on the exclusive PostgreSQL database
-`aiconshell_issue_9_integrated_test`:
+テスト対象 DB のテーブルを作成・削除する試験があるため、開発・本番 DB は指定しない。
 
-poll (real `Github` adapter) -> inbox ingest -> structured coordination
-triage/dispatch (real `Ai::Runner`) -> leased execution in a dedicated
-workspace consuming the immutable dispatch snapshot -> coordinator
-completion -> persisted outbound -> interaction draft + schema-validated
-external reply (real registry both ways).
+## 受け入れ経路
 
-Real under test: `Aiconshell::Plugins::Registry` + `Github` adapter,
-`Aiconshell::Ai::Runner` + `ProcessRunner` (real subprocess spawn, one
-process per layer call), `Interaction` / `Coordination` / `Execution`
-services, all shared tables including `SolidQueue::Job`, and the real
-`WorkflowEvents` -> `Aiconshell::Observability` -> `EventLogging::
-OutboxAdapter` boot wiring from `config/initializers/event_log.rb`.
+`smartest/integration/acceptance/end_to_end_test.rb` は次のアプリケーションコードを
+実際につなぐ。外部サービスの HTTP transport と、一時ディレクトリに作る `claude`
+実行ファイルだけを置き換える。subscription login や外部投稿は行わない。
 
-The event sink is no longer a fake: `RecordingEventSink` forwards every
-emit to the real `WorkflowEvents` facade and keeps the real return values.
-The test then proves persistence rather than mirroring:
+1. 実 GitHub adapter / Registry が installation token 交換、課題、独立した
+   repository comment streams、workflow runs を読み、schema を検証する。
+2. Interaction がイベントと cursor を実 DB に保存する。
+3. Coordination が課題を inbox にし、追加コメントを人間のフィードバックとして保持する。
+   コメント追加による親課題の日時更新だけでは新しい課題改訂を作らない。
+4. 実 Ai::Runner / ProcessRunner が別プロセスへ stdin で prompt を渡し、
+   Coordination が構造化した判断を検証して実行依頼と Solid Queue job を保存する。
+5. Execution が確定済みの work snapshot で実行する。後から来たフィードバックを
+   実行中の依頼へ混入させず、結果を Coordination に返す。
+6. Interaction が返信文を生成し、実 Registry で schema を検証して返信要求を送る。
+7. 各層の lifecycle event が実 EventDelivery 行として保存される。
+   無作為な canary を環境変数と人間の入力に埋め、入力が AI prompt へ到達しても
+   EventLog に残らないことを確認する。token、prompt、生の CLI 出力も保存しない。
 
-- every forwarded emit returned a non-nil envelope (a dropped emit returns
-  nil and would fail here);
-- every forwarded `event_id` is present as an `EventDelivery` row, and
-  `EventDelivery.count` equals the forwarded count (no drops, no extras);
-- the persisted rows cover all three layers and the seven expected
-  lifecycle kinds (`poll.completed`, `triage.ingested`, `triage.completed`,
-  `dispatch.created`, `run.leased`, `run.completed`, `outbound.sent`), with
-  no `*.failed` / `triage.ai_failed` rows;
-- each row's envelope matches its identity columns (`event_id`, `layer`,
-  `kind`) and carries `occurred_at`.
+外部課題本文・コメント本文が prompt へ到達すること、返信の resource と body、
+人間のフィードバックによる直接 dispatch 禁止、実行 lease と immutable snapshot を確認する。
 
-Leak check on the real path: a random `ACCEPTANCE_CANARY_SECRET` is planted
-in ENV and inside the untrusted issue title, so it travels through
-`ExternalEvent` payloads, Task title/description, `TaskFeedback`, and AI
-prompt stdin (asserted present in stdin, making the absence below
-meaningful). Every persisted envelope is then scanned and contains neither
-the canary, nor the fetched installation token, nor prompt markers, nor raw
-CLI stdout fragments (`"structured_output"`, `"subtype":"success"`).
+## 障害・並行処理・検索
 
-Faked at the boundary only:
+- 複数 cursor の同時取得、古い lease の完了、重複 job、失敗後の再起動・再 enqueue。
+- 親スナップショットの A→B→A の復元、日時だけの更新、古いページの遅延到着、
+  ロック待ち中の lease 失効。cursor とイベント／watermark は同じ transaction で確定する。
+- EventLog の配信先ごとの再試行、永続化失敗時の業務 transaction 保護、試行回数上限。
+- 実 PostgreSQL の advisory lock と別 Ruby プロセス／SIGKILL による配信排他と回復。
+- ClickHouse の `FINAL` 重複排除、英語・日本語の検索と index による読み取り絞り込み。
+- 管理画面の認証、CSRF、入力 validation、本文 escaping、未設定 provider の選択・保存。
 
-- HTTP transport is scripted (fake installation token, issues, comments,
-  runs, comment creation). No network, no real GitHub posting.
-- The `claude` executable is a temporary generated script answering the
-  three layer prompts with schema-valid `structured_output`. No
-  subscription login, no model call, no host auth read (child auth home
-  points at a temp dir; the child environment is asserted to exclude
-  `TEST_DATABASE_URL`, `DATABASE_URL`, `GITHUB_*`, and the planted canary).
+管理画面はローカルブラウザーでも、タスクボード、詳細・構造化実行結果、フィードバック、
+provider 設定を確認した。provider の表示は web ローカルの存在診断であり、worker の
+subscription login 成功を示すものではない。
 
-This test is therefore NOT real AI-account verification. It proves
-wiring, schemas, leases, snapshots, workspaces, EventLog persistence, and
-secret handling; it says nothing about model answer quality or real
-provider/CLIs.
+## CLI と未実施の確認
 
-## Exact scripted HTTP surface (old adapter)
+Linux の AI image に入る Claude Code 2.1.283 / Codex CLI 0.157.1 について、
+実行ファイルの `--version` と利用 flag の `--help` を確認した。
+Muse Code の CLI 契約は 1.4.0 の help とログイン不要な echo provider で確認している。
+モデルへの実リクエストはテストの対象外。
 
-All served in-process by `ScriptedTransport`; no request leaves the test
-process. Shapes match the pre-issue-3 `Github` adapter:
-
-1. `POST https://api.github.com/app/installations/789/access_tokens` ->
-   `{"token": "fake-installation-token", "expires_at": "2030-01-01T00:00:00Z"}`.
-   The test asserts the exchange happened (POST) and that listing requests
-   actually carried `Authorization: Bearer fake-installation-token`.
-2. `GET https://api.github.com/repos/o/r/issues?<query>` (Regexp
-   `%r{/repos/o/r/issues\?}`) -> first call one issue
-   (`number 1`, `updated_at 2026-09-26T12:01:00Z`), later calls the same
-   issue with `updated_at 2026-09-26T12:10:00Z`. Title carries the canary:
-   `"Login fails on retry (ref <canary>)"`.
-3. `GET .../repos/o/r/issues/1/comments...` (Regexp) -> first call comment
-   101 (`"clarification: only affects Safari"`), later calls 101 plus 102
-   (`"still broken after deploy"`).
-4. `GET .../repos/o/r/actions/runs...` (Regexp) ->
-   `{"workflow_runs": []}`.
-5. `POST .../repos/o/r/issues/1/comments` (Regexp) ->
-   `{"id": 555, "html_url": "https://github.com/o/r/issues/1#c555"}`.
-   Exactly one POST is asserted: a duplicate post would be a real bug.
-
-Deliberately NOT asserted: exact per-poll GET counts for listing
-endpoints. Pagination can legitimately add requests, so the test asserts
-each resource family was listed at least once, the second poll re-listed,
-auth was used, and the reply POST happened exactly once with
-schema-valid input.
-
-## Commands run and observed output
-
-Exclusive database (created 2026-09-27; `psql` is not installed on this
-host, so creation used the `pg` gem):
-
-```sh
-RBENV_VERSION=3.4.9 rbenv exec ruby -r pg -e \
-  'PG.connect("postgresql://postgres:aiconshell_dev@127.0.0.1:55432/postgres") \
-   .exec("CREATE DATABASE aiconshell_issue_9_integrated_test")'
-# observed: created, no error
-```
-
-`db:prepare` is valid after the merge (corrected migrations + complete
-schema). `db/schema.rb` untouched (`git status` shows no modification):
-
-```sh
-RAILS_ENV=test \
-TEST_DATABASE_URL='postgresql://postgres:aiconshell_dev@127.0.0.1:55432/aiconshell_issue_9_integrated_test' \
-RBENV_VERSION=3.4.9 rbenv exec bundle exec rails db:prepare
-# observed: success, no output; event_deliveries and all workflow/solid_queue tables present
-```
-
-Acceptance slice on the exclusive database:
-
-```sh
-RAILS_ENV=test TEST_DATABASE_URL='.../aiconshell_issue_9_integrated_test' \
-RBENV_VERSION=3.4.9 rbenv exec bundle exec smartest smartest/integration/acceptance
-# observed: 1 test, 1 passed, 0 failed
-```
-
-Full integration suite against real PostgreSQL + real ClickHouse:
-
-```sh
-RAILS_ENV=test \
-TEST_DATABASE_URL='postgresql://postgres:aiconshell_dev@127.0.0.1:55432/aiconshell_issue_9_integrated_test' \
-TEST_PG_DBNAME='aiconshell_issue_9_integrated_test' \
-TEST_CLICKHOUSE_DATABASE='aiconshell_issue_9_integrated_test' \
-TEST_CLICKHOUSE_URL='http://127.0.0.1:58123' \
-TEST_CLICKHOUSE_USER='aiconshell' \
-TEST_CLICKHOUSE_PASSWORD='aiconshell_dev' \
-RBENV_VERSION=3.4.9 rbenv exec bundle exec smartest smartest/integration
-# observed: 145 tests, 145 passed, 0 failed, 0 skipped, exit 0
-# (144 baseline + 1 acceptance; ClickHouse search-proof/FINAL-dedupe and
-# cross-process delivery-lock tests all ran unskipped against real services)
-```
-
-Disk had room (`/dev/vda1` 76% used, ~13.4G available in
-`aiconshell-dev-postgres`); no prune was needed and no Docker resources
-were touched.
-
-## Not verified here (explicitly out of scope for this part)
-
-- Real AI accounts / real subscription CLIs / model answer quality.
-- `smartest/unit` and the plugin/AI suites (checked separately by root).
-- Docker Compose build/up, web+worker shared-DB check, admin manual
-  browsing, Railway deploy, GitHub CI, provider login flows.
-
-No Railway deployment, no GitHub CI result, no Compose acceptance, and no
-real provider login is claimed: none was observed.
-
-## Product/integration findings for root
-
-1. Old Github adapter drops human text from event payloads
-   (`lib/aiconshell/plugins/github.rb`, not this lane's file, not changed):
-   issue events keep `title` but no `body`; comment events keep only
-   `owner/repo/number/comment_id/url`. Consequence observed in this slice:
-   `TaskFeedback` rows built from comments contain metadata JSON instead of
-   the human's words, and the only untrusted text reaching AI prompts is
-   the issue title. The canary carrier was chosen accordingly (issue
-   title). Suggested follow-up for the issue-3 lane: confirm whether the
-   new cursor/pagination adapter preserves bodies; the acceptance stubs
-   need a final pass after that integration regardless.
-2. No other defects found. The only failure seen during development was a
-   wrong assumption in the new acceptance test itself (canary first placed
-   in a comment body, which this adapter version never forwards); fixed in
-   the owned test files. No product change was needed and none is
-   proposed. No temporary debug output remains in the committed files (a
-   throwaway Smartest failure-line probe was used from `/tmp` only).
+実サービスの GitHub App / Teams Bot / Jira service account、各 AI subscription login、
+Railway への実デプロイ、ngrok での実公開は未実施。運営者の設定後に
+[deployment.md](deployment.md) と各 [plugin README](../plugins/README.md) に従って確認する。
+API の時刻精度・取得上限・offset pagination の制約、送信後に応答を失った場合の不確実性は
+[workflow.md](workflow.md) と各 plugin README に記載している。

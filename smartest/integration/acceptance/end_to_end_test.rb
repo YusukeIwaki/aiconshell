@@ -31,7 +31,7 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
     expect(issue_event.resource_id).to eq("issue:o/r#1")
     expect(issue_event.task).to eq(nil)
     # The adapter's own auth + resource request shapes reached the transport:
-    # installation-token exchange, issues listing, comment expansion, runs.
+    # installation-token exchange, issues, repository comments, and runs.
     # Exact per-poll request counts are the plugin lane's business (paging
     # can legitimately add requests), so this slice asserts the meaningful
     # behavior: auth happened, the fetched token was actually used, and
@@ -44,7 +44,8 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
     expect(list_hits.all? do |entry|
       entry[:headers]["Authorization"] == "Bearer #{AcceptanceHelper::FAKE_INSTALLATION_TOKEN}"
     end).to eq(true)
-    expect(ctx.transport.requests_to(%r{/repos/o/r/issues/1/comments}).empty?).to eq(false)
+    expect(ctx.transport.requests_to(%r{/repos/o/r/issues/comments\?}).empty?).to eq(false)
+    expect(ctx.transport.requests_to(%r{/repos/o/r/pulls/comments\?}).empty?).to eq(false)
     expect(ctx.transport.requests_to(%r{/repos/o/r/actions/runs}).empty?).to eq(false)
 
     # 2. Ingest creates the inbox task without any AI call yet.
@@ -65,10 +66,13 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
     expect(second_poll.ok).to eq(true)
     expect(ctx.transport.requests_to(%r{/repos/o/r/issues\?}).size > listed_before).to eq(true)
     second = triage.call
-    expect(second.ingested).to eq(2)
+    expect(second.ingested).to eq(1)
+    expect(ExternalEvent.where(event_type: "github.issue").count).to eq(1)
     clarification_ids = task.task_feedbacks.where(author_type: "human").order(:id).pluck(:id)
     expect(clarification_ids.empty?).to eq(false)
     expect(task.task_feedbacks.unprocessed.count).to eq(clarification_ids.size)
+    expect(task.task_feedbacks.pluck(:body).any? { |body| body.include?("only affects Safari") }).to eq(true)
+    expect(task.task_feedbacks.pluck(:body).any? { |body| body.include?("still broken after deploy") }).to eq(true)
 
     # 4. Structured coordination triage dispatches through the real AI runner.
     %w[coordination execution interaction].each do |layer|
@@ -112,6 +116,8 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
     end
     expect(execution_call["stdin"].include?("\"id\":#{late.id},")).to eq(false)
     expect(execution_call["stdin"].include?("rewrite everything")).to eq(false)
+    expect(execution_call["stdin"].include?("only affects Safari")).to eq(true)
+    expect(execution_call["stdin"].include?("please fix the login bug")).to eq(true)
 
     # 6. Completion persisted the outbound intent; interaction delivers it
     # through the real registry with schema validation on both sides.
@@ -196,9 +202,7 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
 
     # 9. No persisted envelope leaks the injected canary, the fetched
     # installation token, raw CLI stdout, or AI prompts. The canary was
-    # planted in ENV and inside the untrusted issue title, which this
-    # adapter version preserves in event payloads (comment bodies are
-    # dropped from payloads by the old adapter; see docs/verification.md).
+    # planted in ENV and inside the untrusted issue title and comment.
     # It therefore travelled through ExternalEvent payloads, Task
     # title/description, TaskFeedback, and AI prompt stdin (asserted
     # present there, so its absence below is meaningful rather than
@@ -216,10 +220,9 @@ test("human issue flows from poll to schema-validated external reply") do |db:|
   end
 end
 
-# Exact scripted HTTP surface for this slice (old Github adapter endpoints;
-# see docs/verification.md). No request leaves the process; every URL below
-# is served by the ScriptedTransport. After root integrates the issue-3
-# cursor/pagination work, these stubs move to the new endpoint shapes.
+# Exact scripted HTTP surface for this slice. No request leaves the process;
+# every URL below is served by the ScriptedTransport, including independent
+# repository-wide comment streams used by the resumable reconciliation scan.
 def stub_github_flow(ctx, canary:)
   helper = self
   ctx.transport.stub_json("POST", "#{AcceptanceHelper::GH_API}/app/installations/789/access_tokens",
@@ -237,20 +240,21 @@ def stub_github_flow(ctx, canary:)
     )
   end
   comment_calls = 0
-  ctx.transport.stub_proc("GET", %r{/repos/o/r/issues/1/comments}) do |_entry|
+  ctx.transport.stub_proc("GET", %r{/repos/o/r/issues/comments\?}) do |_entry|
     comment_calls += 1
     comments = [
       helper.github_comment(id: 101, body: "clarification: only affects Safari",
                             updated: "2026-09-26T12:04:00Z")
     ]
     if comment_calls > 1
-      comments << helper.github_comment(id: 102, body: "still broken after deploy",
+      comments << helper.github_comment(id: 102, body: "still broken after deploy (ref #{canary})",
                                         updated: "2026-09-26T12:09:00Z")
     end
     Aiconshell::Plugins::Http::Response.new(
       status: 200, headers: {}, body: JSON.generate(comments)
     )
   end
+  ctx.transport.stub_json("GET", %r{/repos/o/r/pulls/comments\?}, body: [])
   ctx.transport.stub_json("GET", %r{/repos/o/r/actions/runs}, body: { "workflow_runs" => [] })
   ctx.transport.stub_json("POST", %r{/repos/o/r/issues/1/comments},
                           body: { "id" => 555, "html_url" => "https://github.com/o/r/issues/1#c555" })

@@ -195,6 +195,7 @@ module AcceptanceHelper
   def github_comment(id:, body:, updated:, login: "alice")
     {
       "id" => id, "body" => body, "updated_at" => updated,
+      "issue_url" => "#{GH_API}/repos/#{SCOPE}/issues/1",
       "html_url" => "https://github.com/#{SCOPE}/issues/1#c#{id}",
       "user" => { "login" => login, "id" => 1, "type" => "User" }
     }

@@ -115,11 +115,12 @@ discarded — no excerpts, redacted or otherwise). Never set `META_API_KEY`,
 scope by design.
 
 Token refresh is left to the CLIs themselves: keep the credential homes on
-persistent volumes so refresh writes survive restarts. The Rails lane must
-mount one private volume per provider (e.g. `/private/ai/claude`,
+persistent volumes so refresh writes survive restarts. Mount private credential directories (e.g. `/private/ai/claude`,
 `/private/ai/codex`, `/private/ai/muse-xdg`) and point the `AICONSHELL_*`
-overrides at them. The volumes are mounted in control and execution workers, since all three
-layers can use AI. Web does not need them; its presence diagnostic is local to
+overrides at them. Compose uses named volumes; Railway uses separate subdirectories
+on each worker's single `/data` volume. Configure and log in on both control and
+execution workers, since all three layers can use AI. Do not assume that separate
+Railway services share a volume or refresh tokens. Web does not need them; its presence diagnostic is local to
 the Web process and does not establish worker readiness.
 
 Muse layout note: `AICONSHELL_MUSE_HOME` is the XDG config home itself (the
@@ -157,7 +158,7 @@ No real subscription login or billed model call is part of the automated tests.
 
 ## Tests
 
-`RBENV_VERSION=3.4.9 rbenv exec smartest smartest/ai/` runs the offline
+`RBENV_VERSION=3.4.9 rbenv exec bundle exec smartest smartest/ai/` runs the offline
 suite: catalog, argv construction (no prompt in argv, layer tool policy,
 noninteractive flags), parsing, schema validation, error sanitization
 (unprefixed sentinels absent from errors), timeouts, symlink workspace
