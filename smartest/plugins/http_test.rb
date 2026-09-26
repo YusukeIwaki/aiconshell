@@ -45,6 +45,77 @@ test("check_host! allows listed hosts, rejects anything else") do
   end.to raise_error(Plugins::HostRejected)
 end
 
+test("check_host! rejects http downgrade, wrong port, and userinfo") do
+  # Same host over plain http is a downgrade, not a match.
+  expect do
+    Http.check_host!("http://api.github.com/repos/o/r", ["api.github.com"])
+  end.to raise_error(Plugins::HostRejected)
+
+  # Same host with an explicit wrong port is rejected.
+  expect do
+    Http.check_host!("https://api.github.com:8443/repos/o/r", ["api.github.com"])
+  end.to raise_error(Plugins::HostRejected)
+
+  # Explicit origin entries also bind scheme and port.
+  expect do
+    Http.check_host!("http://api.github.com/repos/o/r", ["https://api.github.com"])
+  end.to raise_error(Plugins::HostRejected)
+  expect do
+    Http.check_host!("https://api.github.com:8443/x", ["https://api.github.com:9443"])
+  end.to raise_error(Plugins::HostRejected)
+  uri = Http.check_host!("https://api.github.com:8443/x", ["https://api.github.com:8443/base"])
+  expect(uri.port).to eq(8443)
+
+  # Userinfo never forwards: rejected without echoing credentials.
+  begin
+    Http.check_host!("https://user:pass@api.github.com/x", ["api.github.com"])
+    raise "expected HostRejected"
+  rescue Plugins::HostRejected => e
+    expect(e.message).not_to include("pass")
+    expect(e.message).to include("api.github.com")
+  end
+end
+
+test("check_host! allows explicit loopback http origins for test injection") do
+  port = free_local_port
+  origin = "http://127.0.0.1:#{port}"
+  uri = Http.check_host!("#{origin}/next?page=2", [origin])
+  expect(uri.host).to eq("127.0.0.1")
+
+  # ...but never implies loopback http from a bare hostname, and binds port.
+  expect do
+    Http.check_host!("#{origin}/x", ["127.0.0.1"])
+  end.to raise_error(Plugins::HostRejected)
+  expect do
+    Http.check_host!("http://127.0.0.1:#{port + 1}/x", [origin])
+  end.to raise_error(Plugins::HostRejected)
+end
+
+test("TransportError drops arbitrary cause text") do
+  long = "line1\nline2 secret=abc " + ("x" * 500)
+  err = Plugins::TransportError.new(http_method: "GET",
+                                    url: "https://a.test/x?token=1",
+                                    cause_message: long)
+  expect(err.message).not_to include("\n")
+  expect(err.message).not_to include("x" * 500)
+  expect(err.message).not_to include("token=1")
+  expect(err.message).not_to include("secret=abc")
+  expect(err.message).to include("network I/O failed")
+  expect(err.message.length < 400).to eq(true)
+end
+
+test("strict_json! never echoes server text on invalid JSON") do
+  secret_body = '{"leak":"top-secret-value" not json'
+  begin
+    Http.strict_json!(secret_body, plugin: "github", operation: "latest_events")
+    raise "expected OutputInvalid"
+  rescue Plugins::OutputInvalid => e
+    expect(e.message).not_to include("top-secret-value")
+  end
+  expect(Http.strict_json!("", plugin: "g", operation: "o")).to eq(nil)
+  expect(Http.strict_json!('{"a":1}', plugin: "g", operation: "o")).to eq({ "a" => 1 })
+end
+
 test("raise_for_status! maps HTTP failures to typed errors") do |clock:|
   ok = Http::Response.new(status: 200, headers: {}, body: "{}")
   expect(Http.raise_for_status!("GET", "https://a.test/x", ok, clock: clock)).to eq(ok)
@@ -147,9 +218,85 @@ test("NetHttpTransport performs a real loopback request") do
   end
 end
 
+test("NetHttpTransport rejects oversize bodies while streaming") do
+  server = TCPServer.new("127.0.0.1", 0)
+  port = server.addr[1]
+  worker = Thread.new do
+    2.times do
+      client = server.accept
+      client.gets("\r\n\r\n")
+      payload = '{"data":"' + ("y" * 200) + '"}'
+      client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{payload.bytesize}\r\nConnection: close\r\n\r\n#{payload}")
+      client.close
+    end
+  rescue StandardError
+    nil
+  end
+  begin
+    transport = Http::NetHttpTransport.new(open_timeout: 2, read_timeout: 2,
+                                           max_body_bytes: 64)
+    begin
+      transport.request(method: "GET", url: "http://127.0.0.1:#{port}/big",
+                        headers: {}, body: nil)
+      raise "expected ResponseTooLarge"
+    rescue Plugins::ResponseTooLarge => e
+      expect(e.limit_bytes).to eq(64)
+      expect(e.message).not_to include("y" * 10)
+    end
+
+    ok_transport = Http::NetHttpTransport.new(open_timeout: 2, read_timeout: 2,
+                                              max_body_bytes: 4096)
+    response = ok_transport.request(method: "GET", url: "http://127.0.0.1:#{port}/big",
+                                    headers: {}, body: nil)
+    expect(response.status).to eq(200)
+    expect(response.json["data"].length).to eq(200)
+  ensure
+    worker.join(5)
+    server.close
+  end
+end
+
+test("NetHttpTransport rejects URLs carrying userinfo") do
+  transport = Http::NetHttpTransport.new(open_timeout: 1, read_timeout: 1)
+  begin
+    transport.request(method: "GET", url: "https://user:secret@example.test/x",
+                      headers: {}, body: nil)
+    raise "expected TransportError"
+  rescue Plugins::TransportError => e
+    expect(e.message).not_to include("secret")
+  end
+end
+
 def free_local_port
   server = TCPServer.new("127.0.0.1", 0)
   port = server.addr[1]
   server.close
   port
+end
+
+test("NetHttpTransport bounds chunked responses without Content-Length") do
+  server = TCPServer.new("127.0.0.1", 0)
+  port = server.addr[1]
+  worker = Thread.new do
+    client = server.accept
+    client.gets("\r\n\r\n")
+    client.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+    3.times { client.write("20\r\n#{'z' * 32}\r\n") }
+    client.write("0\r\n\r\n")
+  rescue IOError, SystemCallError
+    nil
+  ensure
+    client&.close
+  end
+  begin
+    transport = Http::NetHttpTransport.new(open_timeout: 1, read_timeout: 1, max_body_bytes: 64)
+    expect do
+      transport.request(method: "GET", url: "http://127.0.0.1:#{port}/chunked")
+    end.to raise_error(Plugins::ResponseTooLarge)
+  ensure
+    server.close
+    worker.join(2)
+    worker.kill if worker.alive?
+  end
 end
