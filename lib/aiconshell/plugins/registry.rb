@@ -59,26 +59,14 @@ module Aiconshell
         end
       end
 
+      # No-I/O preflight for callers that must validate a complete batch before
+      # invoking any operation. Returns the normalized String-keyed input.
+      def validate_input(plugin:, operation:, input:, context: {})
+        validated_invocation(plugin, operation, input, context)[2]
+      end
+
       def invoke(plugin:, operation:, input:, context: {})
-        record = @plugins[plugin.to_s]
-        raise UnknownPlugin.new(plugin) if record.nil?
-
-        op = record.find_operation(operation.to_s)
-        raise UnknownOperation.new(plugin: record.plugin_id, operation: operation) if op.nil?
-        if op.unsupported?
-          raise UnsupportedOperation.new(plugin: record.plugin_id,
-                                         operation: op.name, reason: op.reason)
-        end
-
-        normalized = normalize_input!(record.plugin_id, op.name, input)
-        ctx_hash = context.is_a?(Hash) ? context : {}
-        check_permission!(record.plugin_id, op, ctx_hash)
-
-        details = Schemas.error_details(op.input_schema, normalized)
-        unless details.empty?
-          raise InputInvalid.new(plugin: record.plugin_id, operation: op.name,
-                                 details: details)
-        end
+        record, op, normalized, ctx_hash = validated_invocation(plugin, operation, input, context)
 
         invoke_ctx = InvokeContext.new(
           plugin_id: record.plugin_id,
@@ -102,6 +90,31 @@ module Aiconshell
       end
 
       private
+
+      def validated_invocation(plugin, operation, input, context)
+        record = @plugins[plugin.to_s]
+        raise UnknownPlugin.new(plugin) if record.nil?
+
+        op = record.find_operation(operation.to_s)
+        raise UnknownOperation.new(plugin: record.plugin_id, operation: operation) if op.nil?
+        if op.unsupported?
+          raise UnsupportedOperation.new(plugin: record.plugin_id,
+                                         operation: op.name, reason: op.reason)
+        end
+
+        normalized = normalize_input!(record.plugin_id, op.name, input)
+        ctx_hash = context.is_a?(Hash) ? context : {}
+        check_permission!(record.plugin_id, op, ctx_hash)
+
+        details = Schemas.error_details(op.input_schema, normalized)
+        unless details.empty?
+          raise InputInvalid.new(plugin: record.plugin_id, operation: op.name,
+                                 details: details)
+        end
+
+        record.validate_operation_input(op, normalized)
+        [record, op, normalized, ctx_hash]
+      end
 
       def normalize_input!(plugin, operation, input)
         unless input.is_a?(Hash)

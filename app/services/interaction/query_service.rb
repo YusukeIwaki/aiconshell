@@ -27,7 +27,7 @@ module Interaction
     MAX_OUTPUT_BYTES = 128_000
 
     def initialize(registry: Aiconshell::Plugins::Registry.default,
-                   event_sink: nil, allowed_scopes: nil)
+                   event_sink: WorkflowEvents, allowed_scopes: nil)
       @registry = registry
       @event_sink = event_sink
       @allowed_scopes_override = allowed_scopes
@@ -55,15 +55,18 @@ module Interaction
 
     # Preflight without I/O: unknown/unsupported/non-read_only operations,
     # input schema violations, and disallowed destinations fail here with no
-    # transport request. Plugin-level semantics (scope shape, cursor binding)
-    # are enforced at call time, also before any I/O.
+    # transport request. Registry preflight includes the plugin's pure semantic
+    # validation (for example repository-bound query cursors).
     def validate(plugin:, operation:, input:)
+      return failure(:input_invalid) unless input.is_a?(Hash)
+
       normalized = normalize_input!(input)
       entry, op = lookup_operation(plugin.to_s, operation.to_s)
       return failure(:unknown_plugin) if entry.nil?
       return failure(:unknown_operation) if op.nil?
       return failure(:unsupported_operation) if op["unsupported"] == true
       return failure(:not_read_only) unless op["read_only"] == true
+      return failure(:schema_invalid) unless op["input_schema"].is_a?(Hash) && op["output_schema"].is_a?(Hash)
 
       unless Aiconshell::Plugins::Schemas.error_details(op["input_schema"], normalized).empty?
         return failure(:input_invalid)
@@ -72,9 +75,15 @@ module Interaction
       destination = PluginAccess.destination(plugin.to_s, operation.to_s, normalized)
       return failure(:scope_not_allowed) unless scope_allowed?(plugin.to_s, destination)
 
+      @registry.validate_input(plugin: plugin.to_s, operation: operation.to_s, input: normalized,
+        context: PluginAccess.context(plugin.to_s, operation.to_s, registry: @registry))
       Result.new(ok: true, code: :ok, data: nil)
-    rescue SystemStackError
+    rescue SystemStackError, Aiconshell::Plugins::InputInvalid
       failure(:input_invalid)
+    rescue Aiconshell::Plugins::PermissionDenied
+      failure(:permission_denied)
+    rescue StandardError
+      failure(:internal_error)
     end
 
     # Repeats validation, then invokes the plugin once. Output is validated
@@ -161,8 +170,6 @@ module Interaction
     end
 
     def normalize_input!(input)
-      raise SystemStackError unless input.is_a?(Hash)
-
       deep_stringify_keys(input)
     end
 
@@ -194,10 +201,12 @@ module Interaction
     def emit(code, plugin:, operation:)
       return if @event_sink.nil?
 
+      entry, op = lookup_operation(plugin, operation)
       @event_sink.emit(layer: "interaction",
                        kind: code == :ok ? "query.completed" : "query.failed",
                        message: "Query #{code}",
-                       data: { plugin: plugin, operation: operation, code: code.to_s })
+                       data: { plugin: entry ? entry.fetch("id") : "unknown",
+                               operation: op ? op.fetch("name") : "unknown", code: code.to_s })
     rescue StandardError
       nil
     end

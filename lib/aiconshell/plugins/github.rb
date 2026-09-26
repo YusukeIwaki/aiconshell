@@ -58,8 +58,8 @@ module Aiconshell
       OVERLAP_SECONDS = 60
       STREAM_NAMES = %w[issues issue_comments review_comments workflow_runs].freeze
       TIMESTAMP_PATTERN = /\A\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\z/
-      # list_issues bounds: one page of 30 open issues per call. Worst-case
-      # truncated output stays within Interaction::QueryService's byte budget.
+      # Text limits count JSON-encoded content bytes (excluding its quotes),
+      # keeping even escaped and multibyte full pages below the query budget.
       LIST_ISSUES_PER_PAGE = 30
       LIST_ISSUES_MAX_ISSUES = 30
       LIST_ISSUES_MAX_CURSOR_PAGE = 100
@@ -68,6 +68,12 @@ module Aiconshell
       LIST_ISSUES_MAX_LABELS = 10
       LIST_ISSUES_LABEL_LIMIT = 100
       LIST_ISSUES_URL_LIMIT = 512
+
+      def validate_operation_input(op, input)
+        return unless op.name == "list_issues"
+
+        validated_list_cursor(input, input.fetch("scope"))
+      end
 
       def configured?(env)
         present?(env["GITHUB_APP_ID"]) &&
@@ -321,8 +327,7 @@ module Aiconshell
                                page_size: LIST_ISSUES_PER_PAGE)
         issues = []
         items.each do |item|
-          next unless item.is_a?(Hash)
-          next unless item["pull_request"].nil?
+          next if item.key?("pull_request")
 
           issues << normalize_list_issue!(item)
           break if issues.length >= LIST_ISSUES_MAX_ISSUES
@@ -332,13 +337,16 @@ module Aiconshell
           issue["body_truncated"] || issue["title_truncated"] ||
             issue["labels_truncated"] || issue["url_truncated"]
         end
-        if nxt
+        if nxt && page >= LIST_ISSUES_MAX_CURSOR_PAGE
+          { "issues" => issues, "complete" => false,
+            "next_cursor" => nil, "limit_reached" => true, "truncated" => truncated }
+        elsif nxt
           { "issues" => issues, "complete" => false,
             "next_cursor" => { "version" => 1, "scope" => full, "page" => page + 1 },
-            "truncated" => truncated }
+            "limit_reached" => false, "truncated" => truncated }
         else
           { "issues" => issues, "complete" => true,
-            "next_cursor" => nil, "truncated" => truncated }
+            "next_cursor" => nil, "limit_reached" => false, "truncated" => truncated }
         end
       end
 
@@ -686,9 +694,20 @@ module Aiconshell
       end
 
       def truncate_text!(value, limit, _field)
-        return [value, false] if value.length <= limit
+        return [value, false] if JSON.generate(value).bytesize - 2 <= limit
 
-        [value[0, limit], true]
+        # Binary search preserves UTF-8 character boundaries and also accounts
+        # for JSON escaping (a control character can require six bytes).
+        low, high = 0, [value.length, limit].min
+        while low < high
+          middle = (low + high + 1) / 2
+          if JSON.generate(value[0, middle]).bytesize - 2 <= limit
+            low = middle
+          else
+            high = middle - 1
+          end
+        end
+        [value[0, low], true]
       end
 
       def normalize_labels!(labels)
@@ -703,19 +722,16 @@ module Aiconshell
         cut = names.length > LIST_ISSUES_MAX_LABELS
         names = names.first(LIST_ISSUES_MAX_LABELS)
         names = names.map do |name|
-          if name.length > LIST_ISSUES_LABEL_LIMIT
-            cut = true
-            name[0, LIST_ISSUES_LABEL_LIMIT]
-          else
-            name
-          end
+          value, shortened = truncate_text!(name, LIST_ISSUES_LABEL_LIMIT, "label")
+          cut ||= shortened
+          value
         end
         [names, cut]
       end
 
       def normalize_url!(url)
         return [nil, false] if url.nil?
-        return [url, false] if url.length <= LIST_ISSUES_URL_LIMIT
+        return [url, false] if JSON.generate(url).bytesize - 2 <= LIST_ISSUES_URL_LIMIT
 
         [nil, true]
       end

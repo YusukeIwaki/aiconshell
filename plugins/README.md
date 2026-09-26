@@ -56,6 +56,13 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
 
 - `Registry#invoke` が入力と出力の JSON Schema 検証を毎回実施します。
   入力は外部 I/O の前、出力は呼び出し元へ返す前に検証します。
+- `Registry#validate_input(plugin:, operation:, input:, context: {})` は I/O なしで
+  操作・権限・入力スキーマを検証し、文字列キーに正規化した入力を返します。
+  スキーマだけでは表せない入力間の制約は、任意の公開メソッド
+  `validate_operation_input(operation, input)` で検証できます。既定は追加検証なしです。
+  このフックは `validate_input` と `invoke` の両方で呼ばれます。
+  認証情報・HTTP・DB・変更可能なアプリケーション状態に依存せず、純粋な検証に限定し、
+  不正入力では `InputInvalid` を送出してください。ハンドラーの処理を先取りしません。
 - `required_env` と `configured?` は診断用です。実行時の認証情報確認もハンドラーで行います。
   値とファイルの選択肢がある場合は `configured?` を実装し、README に説明します。
 - 操作権限 `context["scopes"]` と投稿先の allowlist は別です。Interaction は許可された
@@ -78,6 +85,9 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
   常に `true` / `false` を返します。`latest_events` などの参照操作は `true`、
   返信・作成などの書込操作は `false` のままにします。
   `Interaction::QueryService` は `read_only: true` の操作だけを呼び出します。
+  `validate` は同じ pure preflight を使い、`call` はさらに出力スキーマと
+  JSON 128,000 バイト上限を検証します。Rails での既定の event sink は `WorkflowEvents`。
+  単体テストでは `event_sink: nil` または明示した fake を注入できます。
 
 `smartest/plugins/*_test.rb` の注入された transport / clock / env を使い、認証情報や
 実アカウントなしで正常系、スキーマ違反、改ページ、重複、429、曖昧な投稿失敗を確認します。

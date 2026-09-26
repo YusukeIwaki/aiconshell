@@ -96,6 +96,12 @@ module Aiconshell
         send(handler, input, invoke_ctx)
       end
 
+      # Optional semantic preflight after JSON Schema validation. Implementations
+      # must be pure: no credentials, transport, or mutable application state.
+      # Registry#validate_input and #invoke both call this hook.
+      def validate_operation_input(op, input)
+      end
+
       protected
 
       def present?(value)

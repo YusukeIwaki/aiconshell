@@ -98,15 +98,28 @@ module Aiconshell
         "additionalProperties" => false
       }.freeze
 
-      # list_issues input: {"scope": "owner/repo", "cursor": null | object}.
-      # Cursor shape is validated strictly at the handler (version/scope/page
-      # binding) before any auth or network I/O.
+      LIST_ISSUES_SCOPE = {
+        "type" => "string", "maxLength" => 256,
+        "pattern" => '\\A[A-Za-z0-9_-]+/(?!\\.{1,2}\\z)[A-Za-z0-9_.-]+\\z'
+      }.freeze
+      LIST_ISSUES_CURSOR = {
+        "type" => "object",
+        "required" => %w[version scope page],
+        "properties" => {
+          "version" => { "type" => "integer", "enum" => [1] },
+          "scope" => LIST_ISSUES_SCOPE,
+          "page" => { "type" => "integer", "minimum" => 2, "maximum" => 100 }
+        },
+        "additionalProperties" => false
+      }.freeze
+
+      # The pure operation preflight additionally binds cursor.scope to scope.
       LIST_ISSUES_INPUT = {
         "type" => "object",
         "required" => %w[scope],
         "properties" => {
-          "scope" => { "type" => "string", "minLength" => 1 },
-          "cursor" => { "type" => %w[object null] }
+          "scope" => LIST_ISSUES_SCOPE,
+          "cursor" => { "anyOf" => [{ "type" => "null" }, { "type" => "object", "maxProperties" => 0 }, LIST_ISSUES_CURSOR] }
         },
         "additionalProperties" => false
       }.freeze
@@ -118,8 +131,8 @@ module Aiconshell
         "required" => %w[id number title title_truncated body body_truncated
                           labels labels_truncated state url url_truncated],
         "properties" => {
-          "id" => { "type" => "integer", "minimum" => 1 },
-          "number" => { "type" => "integer", "minimum" => 1 },
+          "id" => { "type" => "integer", "minimum" => 1, "maximum" => 9223372036854775807 },
+          "number" => { "type" => "integer", "minimum" => 1, "maximum" => 2147483647 },
           "title" => { "type" => "string", "maxLength" => 300 },
           "title_truncated" => { "type" => "boolean" },
           "body" => { "type" => "string", "maxLength" => 2000 },
@@ -134,31 +147,25 @@ module Aiconshell
         "additionalProperties" => false
       }.freeze
 
-      # list_issues continuation. Null when complete is true.
-      LIST_ISSUES_CURSOR = {
-        "type" => "object",
-        "required" => %w[version scope page],
-        "properties" => {
-          "version" => { "type" => "integer", "enum" => [1] },
-          "scope" => { "type" => "string", "minLength" => 1 },
-          "page" => { "type" => "integer", "minimum" => 2, "maximum" => 100 }
-        },
-        "additionalProperties" => false
-      }.freeze
-
       # list_issues output: {"issues": [...], "complete": bool,
-      # "next_cursor": object|null, "truncated": bool}. next_cursor is null
-      # exactly when complete is true (enforced by the handler).
+      # "next_cursor": object|null, "truncated": bool, "limit_reached": bool}.
+      # Page 100 can be incomplete with no usable continuation.
       LIST_ISSUES_OUTPUT = {
         "type" => "object",
-        "required" => %w[issues complete next_cursor truncated],
+        "required" => %w[issues complete next_cursor truncated limit_reached],
         "properties" => {
           "issues" => { "type" => "array", "maxItems" => 30, "items" => LIST_ISSUE },
           "complete" => { "type" => "boolean" },
           "next_cursor" => { "anyOf" => [{ "type" => "null" }, LIST_ISSUES_CURSOR] },
-          "truncated" => { "type" => "boolean" }
+          "truncated" => { "type" => "boolean" },
+          "limit_reached" => { "type" => "boolean" }
         },
-        "additionalProperties" => false
+        "additionalProperties" => false,
+        "oneOf" => [
+          { "properties" => { "complete" => { "const" => true }, "next_cursor" => { "type" => "null" }, "limit_reached" => { "const" => false } } },
+          { "properties" => { "complete" => { "const" => false }, "next_cursor" => LIST_ISSUES_CURSOR, "limit_reached" => { "const" => false } } },
+          { "properties" => { "complete" => { "const" => false }, "next_cursor" => { "type" => "null" }, "limit_reached" => { "const" => true } } }
+        ]
       }.freeze
 
       class << self

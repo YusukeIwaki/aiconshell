@@ -120,11 +120,11 @@ test("list_issues follows one continuation page and never claims complete when p
 end
 
 test("list_issues rejects unsafe scopes before auth or network") do |registry:, transport:|
-  %w[. .. "o/r " " o/r" "o//r" "o/r#" "o*r" "o/r?x=1" "o%2Fr" "o/r%00" ""].each do |scope|
+  [".", "..", "o/.", "o/..", "o/r ", " o/r", "o//r", "o/r#", "o*r", "o/r?x=1", "o%2Fr", "o/r%00", ""].each do |scope|
     expect do
       registry.invoke(plugin: "github", operation: "list_issues",
                       input: { "scope" => scope }, context: {})
-    end.to raise_error(Plugins::InputInvalid, /owner\/repo/)
+    end.to raise_error(Plugins::InputInvalid)
   end
   expect(transport.requests).to eq([])
 end
@@ -190,21 +190,36 @@ test("list_issues enforces operation scope and input schema before I/O") do |reg
   expect(transport.requests).to eq([])
 end
 
-test("list_issues worst-case truncated output fits the query byte budget") do |registry:, transport:|
-  list_token_stub(transport)
-  body = "b" * 2000
-  title = "t" * 300
-  labels = Array.new(10) { "l" * 100 }
-  url = "https://github.com/" + ("u" * 490)
-  issues = (1..30).map do |n|
-    { "id" => 9000 + n, "number" => n, "title" => title, "body" => body,
-      "state" => "open", "labels" => labels.map { |name| { "name" => name } },
-      "html_url" => url }
+{ "ASCII" => "a", "Japanese" => "あ", "emoji" => "😀", "JSON escaping" => "\u0000" }.each do |name, fill|
+  test("list_issues full #{name} page fits the serialized query byte budget") do |registry:, transport:|
+    list_token_stub(transport)
+    issues = Array.new(30) do
+      { "id" => 9223372036854775807, "number" => 2147483647,
+        "title" => fill * 400, "body" => fill * 2100,
+        "state" => "open", "labels" => Array.new(10) { { "name" => fill * 110 } },
+        "html_url" => "https://github.com/" + ("u" * 490) }
+    end
+    transport.stub_json("GET", GH_LIST_URL, body: issues)
+    out = registry.invoke(plugin: "github", operation: "list_issues", input: { "scope" => "o/r" }, context: {})
+    expect(out["issues"].size).to eq(30)
+    expect(JSON.generate(out).bytesize < 128_000).to eq(true)
+    expect(out["truncated"]).to eq(true)
+    expect(out["issues"].all? { |issue| issue["body_truncated"] && issue["title_truncated"] && issue["labels_truncated"] }).to eq(true)
+    expect(out["issues"].all? { |issue| JSON.generate(issue["body"]).bytesize - 2 <= 2000 }).to eq(true)
   end
-  transport.stub_json("GET", GH_LIST_URL, body: issues)
+end
 
+test("list_issues final bounded page explicitly reports an unusable continuation") do |registry:, transport:|
+  list_token_stub(transport)
+  last = GH_LIST_URL.sub("page=1", "page=100")
+  beyond = GH_LIST_URL.sub("page=1", "page=101")
+  transport.stub_json("GET", last, body: [list_issue_raw(1, 1)], headers: { "Link" => %(<#{beyond}>; rel="next") })
   out = registry.invoke(plugin: "github", operation: "list_issues",
-                        input: { "scope" => "o/r" }, context: {})
-  bytes = JSON.generate(out).bytesize
-  expect(bytes < 128_000).to eq(true)
+    input: { "scope" => "o/r", "cursor" => { "version" => 1, "scope" => "o/r", "page" => 100 } })
+  expect(out["issues"].size).to eq(1)
+  expect(out["complete"]).to eq(false)
+  expect(out["next_cursor"]).to eq(nil)
+  expect(out["limit_reached"]).to eq(true)
+  expect(Plugins::Schemas.valid?(Plugins::Schemas::LIST_ISSUES_OUTPUT, out)).to eq(true)
+  expect(transport.requests_to(beyond)).to eq([])
 end

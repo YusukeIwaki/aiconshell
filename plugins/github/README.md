@@ -64,24 +64,31 @@ poll のみの場合:
 - `list_issues`（`read_only: true`）: 現在の open issue を 1 ページ分読む
   on-demand 照会。`pull_request` キーを持つ PR は除外する。入力は
   `{"scope": "owner/repo", "cursor": null または {"version":1,"scope":"owner/repo","page":N}}`。
-  出力は `{"issues": [...], "complete": bool, "next_cursor": object|null, "truncated": bool}`。
+  出力は `{"issues": [...], "complete": bool, "next_cursor": object|null, "truncated": bool, "limit_reached": bool}`。
   各 issue は `id` / `number` / `title` / `body` / `labels` / `state: "open"` / `url` と
   `title_truncated` / `body_truncated` / `labels_truncated` / `url_truncated` の
   明示フラグを持つ。`complete: true` のとき `next_cursor` は null、
   未読ページが残るときは `complete: false` で次ページの cursor を返す。
+  ただし上限の 100 ページ目に続きがある場合は `limit_reached: true`、
+  `complete: false`、`next_cursor: null` とし、未取得分を完了扱いにしない。
   部分結果が `complete: true` を主張しない。cursor は当該 repository と
   固定クエリに束縛し、token 取得前に検証する。
 
 ## list_issues の固定制限
 
 - 1 回の呼び出しで 1 ページ（`per_page=30`）、最大 30 件の正規化 issue。
-- 本文 2000 文字、件名 300 文字、ラベル 10 件×各 100 文字、URL 512 文字で
+- 本文 2000、件名 300、ラベル 10 件×各 100、URL 512 バイトで
   打ち切り、対応する `*_truncated` を `true` にする。本文が長い通常の issue も
   全体を読まずに捨てない。URL が制限超えの場合は `url: null` とする。
+  バイト数は各フィールドを JSON にエンコードした内容（外側の引用符を除く）で数える。
+  日本語・絵文字・エスケープ文字でも UTF-8 の文字境界を維持して切り詰める。
 - cursor の `page` は 2〜100。`Link: rel="next"` の origin・path・filter・
   ページ件数が一致し、現在ページの次を指す場合のみ継続ありと判定する。
 - worst-case の打ち切り済み出力は `Interaction::QueryService` の
   128,000 バイト予算に収まる。権限は Issues Read-only で足りる。
+- `complete` は当該ページの後に続きがないことを示す。各ページは現在の API の
+  観測であり、ページ間で issue の作成・クローズが起きると一貫した時点の一覧にはならない。
+  結果が partial または truncated の場合、未取得・省略した内容がないとは判断できない。
 
 ## Cursor と履歴巡回
 

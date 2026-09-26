@@ -15,7 +15,7 @@ def qs_token_stub(transport)
 end
 
 def qs_service(registry, scopes = { "github" => ["o/r"] })
-  Interaction::QueryService.new(registry: registry, allowed_scopes: scopes)
+  Interaction::QueryService.new(registry: registry, allowed_scopes: scopes, event_sink: nil)
 end
 
 def qs_issue(number, title: "t", body: "b")
@@ -102,7 +102,64 @@ test("query maps plugin-level scope and cursor failures to safe codes") do |regi
                         input: { "scope" => "o/r",
                                  "cursor" => { "version" => 1, "scope" => "evil/r", "page" => 2 } })
   expect(result.code).to eq(:input_invalid)
+  expect(service.validate(plugin: "github", operation: "list_issues",
+    input: { "scope" => "o/r", "cursor" => { "version" => 1, "scope" => "evil/r", "page" => 2 } }).code).to eq(:input_invalid)
   expect(transport.requests).to eq([])
+end
+
+test("registry pure preflight normalizes input and rejects semantic cursors before transport") do |registry:, transport:|
+  value = registry.validate_input(plugin: "github", operation: "list_issues",
+    input: { scope: "o/r", cursor: nil }, context: { "scopes" => ["github:read"] })
+  expect(value).to eq({ "scope" => "o/r", "cursor" => nil })
+  expect do
+    registry.validate_input(plugin: "github", operation: "list_issues",
+      input: { "scope" => "o/r", "cursor" => { "version" => 1, "scope" => "elsewhere/repo", "page" => 2 } })
+  end.to raise_error(Plugins::InputInvalid)
+  expect(transport.requests).to eq([])
+end
+
+test("query rejects truly recursive input safely") do |registry:, transport:|
+  input = { "scope" => "o/r" }
+  input["cursor"] = input
+  expect(qs_service(registry).validate(plugin: "github", operation: "list_issues", input: input).code).to eq(:input_invalid)
+  expect(transport.requests).to eq([])
+end
+
+test("custom read operation uses schema-only preflight and bounded validated output") do
+  custom = Class.new(Plugins::Base) do
+    plugin_id "query_example"
+    operation "inspect", read_only: true, scope: "query_example:read",
+      input_schema: Plugins::Schemas::LATEST_EVENTS_INPUT,
+      output_schema: { "type" => "object", "required" => ["text"], "additionalProperties" => false,
+                       "properties" => { "text" => { "type" => "string" } } }
+    attr_reader :calls
+    def initialize
+      @calls = 0
+    end
+    def handle_inspect(input, _ctx)
+      @calls += 1
+      { "text" => "x" * (input["scope"] == "large" ? 128_001 : 2) }
+    end
+  end.new
+  registry = Plugins::Registry.new(env: {}, transport: Object.new).register(custom)
+  service = qs_service(registry, { "query_example" => %w[small large] })
+  expect(service.validate(plugin: "query_example", operation: "inspect", input: { "scope" => "small" }).ok?).to eq(true)
+  expect(custom.calls).to eq(0)
+  expect(service.call(plugin: "query_example", operation: "inspect", input: { "scope" => "small" }).data).to eq({ "text" => "xx" })
+  result = service.call(plugin: "query_example", operation: "inspect", input: { "scope" => "large" })
+  expect(result.code).to eq(:output_too_large)
+  expect(result.data).to eq(nil)
+end
+
+test("query rejects a declared operation without complete schemas") do
+  custom = Class.new(Plugins::Base) do
+    plugin_id "invalid_contract"
+    operation "inspect", read_only: true, input_schema: Plugins::Schemas::LATEST_EVENTS_INPUT, output_schema: nil
+    def handle_inspect(*) = raise("handler must not run")
+  end.new
+  registry = Plugins::Registry.new(env: {}, transport: Object.new).register(custom)
+  service = qs_service(registry, { "invalid_contract" => ["target"] })
+  expect(service.validate(plugin: "invalid_contract", operation: "inspect", input: { "scope" => "target" }).code).to eq(:schema_invalid)
 end
 
 test("query failures never include upstream text") do |registry:, transport:|
@@ -117,6 +174,16 @@ test("query failures never include upstream text") do |registry:, transport:|
   serialized = JSON.generate({ ok: result.ok?, code: result.code, data: result.data })
   expect(serialized).not_to include("secret")
   expect(serialized).not_to include("leak")
+end
+
+test("query event metadata does not echo unknown AI supplied operation names") do |registry:|
+  sink = Object.new
+  events = []
+  sink.define_singleton_method(:emit) { |**event| events << event }
+  service = Interaction::QueryService.new(registry: registry, allowed_scopes: {}, event_sink: sink)
+  expect(service.call(plugin: "secret request text", operation: "private message", input: {}).code).to eq(:unknown_plugin)
+  expect(events.size).to eq(1)
+  expect(events.first[:data]).to eq({ plugin: "unknown", operation: "unknown", code: "unknown_plugin" })
 end
 
 test("query catalog helpers expose schemas without credentials") do |registry:|
