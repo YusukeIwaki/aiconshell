@@ -162,45 +162,141 @@ execution 両方に `ai_workspaces` volume としてマウントされる。ア�
 
 ## 5. Railway
 
-実デプロイは運営者作業。構成は Compose と同じ分割にする。
+実デプロイ・有料リソース作成・ログインは運営者作業。同一 project / environment に
+同じ repository を使う web・control・execution と、PostgreSQL・ClickHouse を配置する。
+DB / ClickHouse は private networking で接続し、公開ポートを作らない。
 
-1. 同一プロジェクト・環境に 3 サービス（同リポジトリ）+ PostgreSQL
-   プラグイン + ClickHouse テンプレートを用意する。
-2. `railway.toml`（本リポジトリ直下）は **web 用**。control / execution
-   はダッシュボードで以下を上書きする:
+### サービスごとの設定とビルド
 
-   | サービス | startCommand | predeploy | healthcheck |
-   | --- | --- | --- | --- |
-   | web | `./bin/thrust ./bin/rails server`（既定） | `./bin/rails db:prepare`（SQL のみ） | `/up` |
-   | control | `./bin/jobs --config-file=config/queue_control.yml` | （空） | なし |
-   | execution | `./bin/jobs --config-file=config/queue_execution.yml --skip-recurring` | （空） | なし |
+**2026-09-27 確認:** Railway は Config-as-Code を非推奨としており、新規サービスは
+TOML / JSON に opt-in できない。既存利用サービスの対応期限は 2026-12-01。
+新規サービスは下表を dashboard の Build / Deploy 設定に指定する。
+このリポジトリの TOML は既存サービス用の互換設定であり、新規サービスを自動構築しない。
+継続的な構成管理には Railway の Infrastructure as Code への移行が必要。
+[公式 Config-as-Code と移行案内](https://docs.railway.com/config-as-code)
 
-   predeploy は SQL マイグレーション専用。ClickHouse スキーマは分離し、
-   ClickHouse 到達後に別途 `railway run ./bin/setup-clickhouse`（または
-   同等の one-off 実行）で適用する。logging 障害でデプロイを止めない。
-3. 環境変数（`Service Variables` の参照を使う）:
+| サービス | 既存サービスの Config File Path | Start Command | Pre-deploy Command | Healthcheck Path |
+| --- | --- | --- | --- | --- |
+| web | `/railway.toml` | `./bin/thrust ./bin/rails server` | `./bin/rails db:prepare` | `/up`（timeout 300 秒） |
+| control | `/railway.control.toml` | `./bin/jobs --config-file=config/queue_control.yml` | なし | なし |
+| execution | `/railway.execution.toml` | `./bin/jobs --config-file=config/queue_execution.yml --skip-recurring` | なし | なし |
 
-   | 変数 | 値の例 |
-   | --- | --- |
-   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}`（3 サービス共通） |
-   | `CLICKHOUSE_URL` | `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
-   | `CLICKHOUSE_DATABASE/USER/PASSWORD` | ClickHouse サービスの値 |
-   | `SECRET_KEY_BASE` | `bin/rails secret` で生成（必須） |
-   | `ADMIN_USERNAME/ADMIN_PASSWORD` | 管理画面用（必須、未設定は fail closed） |
-   | `RAILS_ENV` | `production` |
-   | ワークフロー設定 | `AICONSHELL_EXECUTION_ROOT`（必須）・`AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE`（全サービス共通値） |
-   | 連携資格情報 | control・web のみ（execution には設定しない） |
-   | 自アクタ ID | `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID`（control のみ） |
-   | AI home/bin | `CLAUDE_CONFIG_DIR`・`CODEX_HOME`・`AICONSHELL_MUSE_HOME`・`AICONSHELL_AI_HOME`・`AICONSHELL_*_BIN`（control・execution のみ） |
+全サービスの Builder は Dockerfile、Dockerfile Path は `Dockerfile`、Root Directory は
+repository のルート。通常の Restart Policy は On Failure、最大 retry は 10。
+既存 Config-as-Code サービスは Settings で **サービスごとに上表の絶対 repository path を選択**する。
+設定ファイル内の値は dashboard より優先されるため、web の TOML のまま worker の
+Start Command を dashboard で上書きしても切り替わらない。
+worker の dashboard に残っている Healthcheck Path と Pre-deploy Command も削除し、
+deployment details で実際の起動コマンド・設定元を確認する。
+[設定の優先順位](https://docs.railway.com/config-as-code/reference)
 
-4. Private networking を使い、DB・ClickHouse の公開ポートは開けない。
-5. Volume を control・execution に追加し、`/private/claude`・
-   `/private/codex`・`/private/muse`・`/workspaces` にマウントする
-   （web は不要）。
-6. `PORT` は Railway が注入する（Thruster・Puma が参照）。固定しない。
-7. CLI 付き worker は、CI 等で `ai` ターゲットをビルドしてレジストリに
-   push し、そのイメージを control・execution サービスに指定する
-   （Railway の Dockerfile ビルドは既定 `app` のため）。
+Service Variables の `RUNTIME_TARGET` は web に `app`、control / execution に `ai` を設定する。
+Dockerfile の最後の `runtime` stage がこの build argument で既存の `app` / `ai` stage を選ぶ。
+Railway は Dockerfile に宣言した `ARG` に service variable を渡す。
+Compose の明示的な `target: app` / `target: ai` は従来どおり使える。
+[Railway の Docker build variables](https://docs.railway.com/builds/dockerfiles#using-variables-at-build-time)
+
+repo build の `ai` には Claude / Codex CLI が入る。Muse は認可された Linux binary を
+BuildKit secret で渡す既存の手順が別途必要で、Railway service variable から binary や認証を
+image に埋め込まない。Muse を使う worker は「4.」で作った private registry の image を
+source にする運用も可能。その場合も上表の worker 設定・以下の専用 volume / 個別ログインを使う。
+Muse binary が無ければ Muse は未構成のままであり、選択時に実行エラーになる。
+
+### 環境変数と独立した volume
+
+| 変数 | 設定先と値の例 |
+| --- | --- |
+| `DATABASE_URL` | 3 サービスに `${{Postgres.DATABASE_URL}}` |
+| `CLICKHOUSE_URL` | web / control に `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
+| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
+| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
+| `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
+| `RAILS_ENV` | 3 サービスに `production` |
+| `AICONSHELL_EXECUTION_ROOT` | control / execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
+| ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は 3 サービスに同じ値 |
+| 連携資格情報 | control / web のみ。execution には設定しない |
+| 自アクタ ID | control に `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID` |
+| `CLAUDE_CONFIG_DIR` | control / execution に `/data/auth/claude` |
+| `CODEX_HOME` | control / execution に `/data/auth/codex` |
+| `AICONSHELL_MUSE_HOME` | control / execution に `/data/auth/muse` |
+| `AICONSHELL_AI_HOME` | control / execution に `/tmp/aiconshell-ai-home`（子プロセスの一時 HOME） |
+| `AICONSHELL_CLAUDE_BIN` / `AICONSHELL_CODEX_BIN` / `AICONSHELL_MUSE_BIN` | control / execution に `/usr/local/bin/claude` / `/usr/local/bin/codex` / `/usr/local/bin/muse` |
+
+control と execution の**それぞれに別の volume を 1 個だけ作り、両方とも `/data` に mount**する。
+各 volume 内に `auth/claude`・`auth/codex`・`auth/muse`・`workspaces` を置く。
+同じ path でも別サービスの別 filesystem であり、認証・token refresh・workspace は同期されない。
+各 worker で個別にログインし、一方のログインで他方も認証済みになるとは扱わない。
+web には AI 用 volume を付けない。
+
+Railway の volume は 1 サービス 1 個で、volume を持つサービスは複数 replica にできない。
+control / execution は各 1 instance にし、volume を使う再デプロイには停止時間がある。
+image 内の `chown` は、後から mount される Railway volume の所有権を変更しない。
+[公式 volume 制約・権限](https://docs.railway.com/volumes/reference#caveats)
+
+### 初回だけ volume の所有者を設定する
+
+新しい空の worker volume に対し、control と execution を 1 サービスずつ初期化する。
+まだ通常の Rails worker と AI ログインを起動しない。
+
+1. 対象サービスに `/data` volume を mount し、`RAILWAY_RUN_UID=0` を一時設定する。
+   `AICONSHELL_RUN_DB_SETUP` は未設定または `0` にする。Start Command は `/bin/sleep infinity`、
+   Pre-deploy Command / Healthcheck Path は空、Restart Policy は Never にする。
+   既存 Config-as-Code サービスでは `/railway.volume-init.toml` を選択して同じ設定を使う。
+   この変更を deploy し、Rails / jobs を起動しない待機コンテナにする。
+2. 運営者のローカル端末から対象の remote shell に接続する（project / environment を事前に link）。
+
+   ```sh
+   railway ssh --service control
+   # execution の初期化時は railway ssh --service execution
+   ```
+
+   **接続先コンテナ内**で次を実行する。`id -u` が 0 でなければ続行しない。
+
+   ```sh
+   test "$(id -u)" = 0 || exit 1
+   test -d /data || exit 1
+   install -d -o 1000 -g 1000 -m 0700 \
+     /data/auth /data/auth/claude /data/auth/codex /data/auth/muse /data/workspaces
+   chown 1000:1000 /data
+   chmod 0700 /data
+   stat -c '%u:%g %a %n' /data /data/auth /data/auth/claude /data/auth/codex /data/auth/muse /data/workspaces
+   exit
+   ```
+
+3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻す。
+   まず待機コマンドのまま再 deploy し、`railway ssh --service control -- id -u` が `1000`、
+   `railway ssh --service control -- test -w /data/workspaces` が成功することを確認する。
+   execution でもサービス名を変えて同じ確認を行う。
+4. UID 1000 の remote shell 内で、その worker が使う provider に個別ログインする。
+   「4.」の公式 subscription login 手順を使い、Muse の対話シェルでは
+   `export XDG_CONFIG_HOME="$AICONSHELL_MUSE_HOME"` を先に実行する。
+   通常の token refresh はそのサービスの volume だけに保存される。
+5. web の SQL migration 成功後、対象 worker の通常 Start Command / On Failure policy に戻す。
+   既存 Config-as-Code サービスでは `/railway.control.toml` または `/railway.execution.toml` を
+   再選択して deploy する。`RAILWAY_RUN_UID=0` と volume-init 設定を通常運用に残さない。
+
+volume は build / pre-deploy での権限初期化には使わず、mount 済みの待機コンテナで設定する。
+root を要するのはこの初回の filesystem 設定だけで、通常の Rails / CLI は非 root で動かす。
+
+### SQL と ClickHouse の初期化
+
+web の Pre-deploy Command は `./bin/rails db:prepare` のみ。必要な workflow env は
+pre-deploy にも渡す。worker は SQL migration 成功後に起動する。
+ClickHouse スキーマは logging availability とアプリ起動を分離し、control が稼働してから
+運営者のローカル端末で以下を実行する。コマンド本体は remote container 内で動く。
+
+```sh
+railway ssh --service control -- /rails/bin/setup-clickhouse
+```
+
+`railway run` は service variables を取得して**ローカルで**実行する CLI なので、
+private DNS の ClickHouse 初期化には使わない。SSH 接続には Railway に登録済みの SSH key が必要。
+初期化成功まで EventLog delivery は PostgreSQL に残って再試行する。
+`PORT` は Railway の注入値を使い、web の公開ドメインだけを有効化する。
+[railway ssh](https://docs.railway.com/cli/ssh)・[railway run](https://docs.railway.com/cli/run)
+
+この手順の local 検証は TOML / Docker target / volume 権限に限定する。
+Railway 実環境での deploy・private DNS 到達・SSH・subscription login は運営者による別確認とする。
 
 ## 6. ngrok（明示 opt-in）
 

@@ -1,0 +1,15 @@
+# Legacy Config-as-Code service: select /railway.control.toml.
+# Set the service variable RUNTIME_TARGET=ai to include subscription CLIs.
+# Clear any dashboard healthcheck path; workers do not serve HTTP.
+# See docs/deployment.md for the one-time /data volume initialization and
+# the supported dashboard setup for new Railway services.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "./bin/jobs --config-file=config/queue_control.yml"
+preDeployCommand = []
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

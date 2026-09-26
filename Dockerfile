@@ -3,7 +3,7 @@
 # aiconshell runtime image.
 #
 # Targets:
-#   app (default) - Rails web / Solid Queue workers without AI CLIs.
+#   app           - Rails web / Solid Queue workers without AI CLIs.
 #                   Missing AI credentials or binaries never block this image.
 #   ai            - `app` plus Node.js, git, and the Claude/Codex subscription
 #                   CLIs (pinned, overridable versions). The Muse CLI is an
@@ -14,6 +14,8 @@
 #                   without the secret the binary is simply absent and the
 #                   provider fails at execution time. Auth credentials always
 #                   stay outside the image (mounted volumes, never baked in).
+#   runtime       - Final target, selects app by default; build arg
+#                   RUNTIME_TARGET=ai selects the CLI image for Railway.
 #
 #   docker build -t aiconshell:app .
 #   docker build --target ai --no-cache -t aiconshell:ai \
@@ -24,6 +26,7 @@
 # See docs/deployment.md ("AI CLI provisioning") for the operator flow.
 
 ARG RUBY_VERSION=3.4.9
+ARG RUNTIME_TARGET=app
 FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
 
 WORKDIR /rails
@@ -75,7 +78,7 @@ RUN bundle exec bootsnap precompile app/ lib/
 # Precompile assets for production without requiring a real secret.
 RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
 
-# Optional CLI-enabled worker image. Built only with `--target ai`.
+# Optional CLI-enabled worker image. Select with --target ai or RUNTIME_TARGET=ai.
 FROM base AS ai
 
 # Pinned, overridable toolchain. Verify replacements at:
@@ -164,3 +167,8 @@ ENTRYPOINT ["/rails/script/docker-entrypoint"]
 # Thruster and Puma both honor PORT (Railway injects it; compose sets 3000).
 EXPOSE 3000
 CMD ["./bin/thrust", "./bin/rails", "server"]
+
+# Railway forwards declared service variables as Docker build arguments.
+# Keep explicit app/ai targets for Compose while selecting the final target
+# with the nonsecret RUNTIME_TARGET service variable on repo-backed services.
+FROM ${RUNTIME_TARGET} AS runtime

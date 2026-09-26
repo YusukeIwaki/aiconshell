@@ -1,15 +1,14 @@
 # Railway service config (Config-as-Code) for the WEB service.
 #
-# Attach the same repository as three services; this file is the web default
-# (root). Control/execution overrides live in the dashboard per
-# docs/deployment.md ("Railway" section): same image, different start
-# commands, no healthcheck path, no predeploy command.
+# Existing Config-as-Code services: select /railway.toml for web,
+# /railway.control.toml for control, /railway.execution.toml for execution.
+# Code settings override dashboard settings. Config-as-Code is deprecated;
+# new services use the dashboard procedure in docs/deployment.md.
 #
 # Provision from the Railway catalog in the same project/environment:
 #   - PostgreSQL plugin  -> provides DATABASE_URL (reference it, see below)
 #   - ClickHouse template -> provides CLICKHOUSE_URL/USER/PASSWORD/DATABASE
-# Attach private volumes for /private/claude, /private/codex, /private/muse
-# and /workspaces on the control and execution services only.
+# Each worker has its own single /data volume. Web has no AI auth volume.
 
 [build]
 builder = "DOCKERFILE"
@@ -21,7 +20,8 @@ startCommand = "./bin/thrust ./bin/rails server"
 # SQL migrations only (db:prepare is idempotent). ClickHouse schema setup
 # is intentionally separate (see docs/deployment.md): the EventLog is
 # eventually consistent, so a logging outage must never block deploys.
-# Run `./bin/setup-clickhouse` via `railway run` when ClickHouse is up.
+# Run `railway ssh --service control -- /rails/bin/setup-clickhouse` remotely
+# when ClickHouse is up; `railway run` would execute on the local machine.
 preDeployCommand = "./bin/rails db:prepare"
 healthcheckPath = "/up"
 healthcheckTimeout = 300
