@@ -17,6 +17,8 @@
 Ruby 3.4.9、Rails 8.0.5.1、PostgreSQL 17.2、ClickHouse 26.8.11.7 を使用した。
 新規の `*_test` データベースで `RAILS_ENV=test bin/rails db:prepare` を実行し、
 Solid Queue と domain / EventLog テーブル、改訂管理の追加 migration を確認した。
+別の空 DB では schema load に頼らず `db:create db:migrate` で全 migration を順に適用し、
+続けて `db:migrate` を再実行して差分なく成功することも確認した。
 
 再実行は `bin/test unit` と `bin/test integration` を使う。前者は fixture の名前空間を
 分離するため、unit / plugins / ai を別プロセスで実行する。複数 suite を一度の
@@ -68,6 +70,33 @@ Solid Queue と domain / EventLog テーブル、改訂管理の追加 migration
 管理画面はローカルブラウザーでも、タスクボード、詳細・構造化実行結果、フィードバック、
 provider 設定を確認した。provider の表示は web ローカルの存在診断であり、worker の
 subscription login 成功を示すものではない。
+
+## Docker Compose と運用設定
+
+最終コードを含む Compose を build / up し、同一 PostgreSQL を使う web / control /
+execution、6 種類の定期ジョブ、ClickHouse の `event_log` を確認した。
+`bin/smoke` は失敗 0・警告 0。設定は外部の env ファイルだけに置き、変更したポートと
+資格情報が Compose と smoke の両方へ反映されることを確認した。
+管理画面は認証なし 401、認証あり 200。トップページからの管理画面リンクと、
+管理画面から実 ClickHouse に対するログ検索も HTTP で確認した。
+
+ClickHouse だけを停止した状態で Web と両 worker を再起動し、稼働継続と outbox の
+滞留を確認した。復旧・スキーマ初期化後に定期ジョブが自動配信することを確認した。
+これは無期限の保存保証ではなく、既定で 25 回までの再試行（指数 backoff）を伴う。
+
+標準イメージと `RUNTIME_TARGET=ai` による Railway 向け最終 stage のビルドが成功した。
+CLI を含む image は UID 1000 で動く。production-mode probe の `/up` は
+redirect なしの 200 で、未認証の管理画面は拒否された。
+ngrok は実公開せず、Rails の Host / forwarded Host 許可と拒否、origin・CSRF の維持を
+実 middleware で確認した。
+
+Railway の設定ファイルは公式 schema で検証し、worker の空 volume の権限を初期化して
+UID 1000 で読み書き・再作成後の永続化ができることをローカルコンテナで確認した。
+実 Railway へのデプロイ検証ではない。新規サービスは dashboard 設定を使う。
+
+[GitHub CI](https://github.com/YusukeIwaki/aiconshell/actions/workflows/ci.yml) は
+unit、実 PostgreSQL / ClickHouse integration、Zeitwerk、Docker / Compose、
+ClickHouse setup の 5 jobs を実行する。GitHub Actions はアプリの実行基盤には使わない。
 
 ## CLI と未実施の確認
 
