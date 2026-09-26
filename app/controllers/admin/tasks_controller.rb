@@ -6,7 +6,7 @@ module Admin
   # or scheduling, and never creates runs or dispatches workers: those
   # decisions belong to Coordination (issue 6).
   class TasksController < BaseController
-    STATUSES = %w[inbox ready running waiting_human waiting_review done failed cancelled].freeze
+    STATUSES = Task::STATUSES
     BOARD_PAGE_SIZE = 50
 
     def index

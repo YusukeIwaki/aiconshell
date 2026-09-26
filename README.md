@@ -64,6 +64,63 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 | `RAILS_MAX_THREADS` | Puma + DB プール | `5` |
 | `JOB_CONCURRENCY` | `bin/jobs` の worker プロセス数 | `1` |
 
+## 自然言語で依頼する
+
+管理画面の「タスク依頼を作成する」、または管理 API から依頼できる。例:
+
+> owner/repo の未完了 Issue を確認し、障害の影響とラベルから優先度を判断してください。
+> 緊急の Issue があれば Teams の指定チャネルへ要約を送り、なければ通知せず結果を残してください。
+> 取得範囲が一部なら、その範囲を要約に明記してください。
+
+整理層の AI ポリシーを有効にし、provider・model・effort を設定する。
+選んだ CLI の公式サブスクリプション認証、専用 AI 作業領域、
+起動中の control worker が必要。未設定 provider も選択できるが、実行時に
+分類済みエラーをタスク詳細と受付 API に表示する。API キー課金へは切り替えない。
+
+連携には次の設定が必要（秘密値は private 環境変数・ファイルで渡す）:
+
+- UI は `ADMIN_USERNAME` / `ADMIN_PASSWORD`、API は別の `ADMIN_API_TOKEN`。
+- GitHub App の `GITHUB_APP_ID` / `GITHUB_INSTALLATION_ID` と
+  `GITHUB_PRIVATE_KEY` または `GITHUB_PRIVATE_KEY_FILE`。
+  権限は [GitHub 設定](plugins/github/README.md) を参照。
+- Teams の tenant / app / Bot 認証、実際の `TEAMS_SERVICE_URL` と
+  `TEAMS_BOT_TARGETS_FILE`。Bot を対象へ導入し、実際の conversation 参照を
+  [Teams 設定](plugins/teams/README.md) に従って対応付ける。対応表は自動生成しない。
+- 許可対象の例は
+  `AICONSHELL_ALLOWED_SCOPES=github:owner/repo,teams:team/TEAM_ID/channel/CHANNEL_ID`。
+  Teams 送信入力の宛先は `channel:TEAM_ID/CHANNEL_ID` である。
+
+サーバーに設定したトークンを手元の `ADMIN_API_TOKEN` に設定して実行する:
+
+```sh
+curl -i -X POST http://127.0.0.1:3000/api/admin/task_requests \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: open-issues-review-001" \
+  --data-binary @- <<'JSON'
+{"title":"未完了Issueの確認","description":"owner/repoの未完了Issueを確認し、緊急ならTeamsのchannel:TEAM_ID/CHANNEL_IDへ要約を送ってください。なければ通知せず、取得範囲も結果に残してください。"}
+JSON
+
+# POST の request_id を設定する（Idempotency-Key とは別のサーバー発行 UUID）
+REQUEST_ID='POSTで返されたrequest_id'
+curl -sS "http://127.0.0.1:3000/api/admin/task_requests/$REQUEST_ID" \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN"
+```
+
+`202` は受付済みを表す。同じキー・同じ内容の再送は同じ受付になり、
+異なる内容では `409` になる。受付の `status` は `accepted` / `processed`、
+処理状態は別の `task_status` で確認する。通知を起案すると `waiting_delivery`、
+全送信確認後に `done`、失敗・送信結果不明は `waiting_human` になる。
+結果は `coordination_result` の要約・通知件数と `last_error` で確認できる。
+通知が不要なら送信せず `done` になる。
+
+利用可能なのは宣言済み操作と許可済み宛先だけ。GitHub 取得は 1 回最大 30 件、
+AI の読み取りは 1 回の調整処理で最大 3 ラウンド・計 10 回で、本文切り詰めや続きの有無も
+判断に渡すため、部分取得を全件調査と同一視しない。
+成功確認済みの重複配送は抑止するが、外部送信直後のクラッシュや応答不明を含む
+完全な一回配送は保証しない。詳細は [受付 API](docs/task-requests.md) と
+[ワークフロー](docs/workflow.md) を参照。
+
 ## テスト
 
 ```sh
@@ -82,6 +139,8 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 - live provider・実アカウントは使わない。pinned CLI の Linux
   `--version` 確認は自動化するが、サブスクリプションのログインは
   運営者作業であり自動検証しない（「検証範囲」参照）。
+- 境界フィクスチャ、単体と実 DB の使い分け、受け入れテストの実行方法は
+  [docs/testing.md](docs/testing.md) を参照。
 
 ## 操作・デプロイ
 
