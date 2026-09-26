@@ -1,0 +1,50 @@
+<% content_for(:title, "タスクボード") %>
+<h1>タスクボード</h1>
+<p>状態ごとのタスク一覧です（優先度順、1ページ50件）。タスクの状態変更は整理層だけが行います。</p>
+
+<div class="admin-card">
+  <%= form_with url: admin_tasks_path, method: :get do |form| %>
+    <div class="admin-form-grid">
+      <%= form.label :status, "状態で絞り込む" %>
+      <%= form.select :status, [["すべての状態", ""]] + Admin::TasksController::STATUSES.map { |status| [task_status_label(status), status] }, selected: @status %>
+    </div>
+    <div class="admin-actions">
+      <%= form.submit "表示する", class: "admin-btn" %>
+      <%= link_to "絞り込みを解除", admin_tasks_path if @status %>
+    </div>
+  <% end %>
+</div>
+<p>全<%= @total_count %>件</p>
+
+<div class="admin-board">
+  <% @columns.each do |status, tasks| %>
+    <section class="admin-column" aria-label="<%= task_status_label(status) %>">
+      <h2 class="admin-column-title">
+        <span><%= task_status_label(status) %></span>
+        <span class="admin-column-count"><%= tasks.size %>件</span>
+      </h2>
+      <% if tasks.empty? %>
+        <p class="admin-task-meta">なし</p>
+      <% else %>
+        <% tasks.each do |task| %>
+          <article class="admin-task-card">
+            <%= link_to task.title, admin_task_path(task) %>
+            <div class="admin-task-meta">
+              #<%= task.id %> / 優先度 <%= task.priority %>
+            </div>
+          </article>
+        <% end %>
+      <% end %>
+    </section>
+  <% end %>
+</div>
+
+<nav class="admin-actions" aria-label="タスク一覧のページ送り">
+  <% if @page > 1 %>
+    <%= link_to "前のページ", admin_tasks_path(status: @status, page: @page - 1), rel: "prev" %>
+  <% end %>
+  <span aria-current="page"><%= @page %> / <%= @total_pages %>ページ</span>
+  <% if @page < @total_pages %>
+    <%= link_to "次のページ", admin_tasks_path(status: @status, page: @page + 1), rel: "next" %>
+  <% end %>
+</nav>

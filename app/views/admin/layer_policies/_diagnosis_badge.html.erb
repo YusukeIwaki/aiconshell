@@ -1,0 +1,10 @@
+<%# diagnosis: Admin::AiStatus.diagnosis の戻り値、または nil %>
+<% if diagnosis.nil? %>
+  <span class="admin-badge admin-badge-idle">―</span>
+<% elsif diagnosis[:available] == false %>
+  <span class="admin-badge admin-badge-idle">診断不可</span>
+<% elsif diagnosis[:configured] %>
+  <span class="admin-badge admin-badge-good">設定済み</span>
+<% else %>
+  <span class="admin-badge admin-badge-warn">未設定（保存可・実行時要設定）</span>
+<% end %>

@@ -1,0 +1,33 @@
+<% content_for(:title, "層別AIポリシー") %>
+<h1>層別AIポリシー</h1>
+<p>各層が使う provider / model / effort / 仕事の指示です。未設定の provider も選択・保存でき、設定不足は実行時にエラーになります。秘密情報はここに保存しません。</p>
+<p>設定状態の表示はこの Web プロセス上での診断であり、ワーカーでの利用可否を保証しません（CLI がワーカーにだけ入っている場合があります）。</p>
+
+<div class="admin-table-wrap">
+  <table class="admin-table">
+    <tr>
+      <th>層</th><th>有効</th><th>provider</th><th>設定状態</th><th>model</th><th>effort</th><th>操作</th>
+    </tr>
+    <% @rows.each do |row| %>
+      <tr>
+        <td><strong><%= layer_label(row[:layer]) %></strong>（<%= row[:layer] %>）</td>
+        <% if row[:policy]&.persisted? %>
+          <td>
+            <% if row[:policy].enabled %>
+              <span class="admin-badge admin-badge-good">有効</span>
+            <% else %>
+              <span class="admin-badge admin-badge-idle">無効</span>
+            <% end %>
+          </td>
+          <td><%= row[:policy].provider %></td>
+          <td><%= render "diagnosis_badge", diagnosis: row[:diagnosis] %></td>
+          <td><%= row[:policy].model %></td>
+          <td><%= row[:policy].effort %></td>
+        <% else %>
+          <td colspan="4"><span class="admin-badge admin-badge-warn">未設定</span></td>
+        <% end %>
+        <td><%= link_to "編集", edit_admin_layer_policy_path(row[:layer]) %></td>
+      </tr>
+    <% end %>
+  </table>
+</div>
