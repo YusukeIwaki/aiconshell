@@ -236,16 +236,20 @@ GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
 
 注意:
 
-- ホスト側ファイルは `chmod 600`・運営者のみ読み取り可にする。
+- コンテナの UID 1000 が読める所有者・権限にする。たとえば所有者 UID 1000 の
+  `0600`、またはグループ GID 1000 の `0640` を使い、親ディレクトリの探索権限も確認する。
+  ホストの運営者だけが読める `0600` のままでは、コンテナから読めない場合がある。
+  `docker compose exec control test -r /run/secrets/teams-bot-targets.json` で確認する。
   AI 実行 workspace（`/workspaces`）やリポジトリ内には置かない。
 - `TEAMS_BOT_TARGETS_FILE` の JSON 形式は
   `plugins/teams/README.md`「Bot 参照の対応表」が正。
   Graph の team / channel ID と Bot conversation 参照の対応表であり、
   受信済みの実際の参照だけを載せる。自動生成はしない。
-- Railway にはホスト bind が無い。資格情報ファイルが必要な場合は
-  同内容の volume をサービスに添付して同パスに配置するか、値型の
-  環境変数で直接設定する（`TEAMS_BOT_TARGETS_FILE` の JSON は
-  volume 配置のみ。未配置なら Teams 送信は実行時失敗する）。
+- Railway にはホスト bind が無い。control の既存 `/data` volume に
+  `/data/integrations/teams-bot-targets.json` を UID 1000 が読める権限で配置し、
+  `TEAMS_BOT_TARGETS_FILE` にそのパスを指定する。他サービスとは共有されない。
+  通常の資格情報は値型の環境変数でも設定できる。Teams の対応表が未配置なら
+  Bot による送信は実行時に失敗する。
 
 ## 7. Railway
 
@@ -285,7 +289,7 @@ Compose の明示的な `target: app` / `target: ai` は従来どおり使える
 
 repo build の `ai` には Claude / Codex CLI が入る。Muse は認可された Linux binary を
 BuildKit secret で渡す既存の手順が別途必要で、Railway service variable から binary や認証を
-image に埋め込まない。Muse を使う worker は「4.」で作った private registry の image を
+image に埋め込まない。Muse を使う worker は「5. AI CLI プロビジョニング」で作った private registry の image を
 source にする運用も可能。その場合も上表の worker 設定・以下の専用 volume / 個別ログインを使う。
 Muse binary が無ければ Muse は未構成のままであり、選択時に実行エラーになる。
 
@@ -299,6 +303,8 @@ Muse binary が無ければ Muse は未構成のままであり、選択時に�
 | `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
 | `RAILS_ENV` | 3 サービスに `production` |
+| `EVENT_LOG_TEAMS_CHANNEL` | 3 サービスに同じ `channel:<team>/<channel>`。空なら通知しない |
+| `TEAMS_BOT_TARGETS_FILE` | control の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |
 | `AICONSHELL_EXECUTION_ROOT` | control / execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
 | ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は 3 サービスに同じ値 |
 | 連携資格情報 | control / web のみ。execution には設定しない |
@@ -355,7 +361,7 @@ image 内の `chown` は、後から mount される Railway volume の所有権
    `railway ssh --service control -- test -w /data/workspaces` が成功することを確認する。
    execution でもサービス名を変えて同じ確認を行う。
 4. UID 1000 の remote shell 内で、その worker が使う provider に個別ログインする。
-   「4.」の公式 subscription login 手順を使い、Muse の対話シェルでは
+   「5. AI CLI プロビジョニング」の公式 subscription login 手順を使い、Muse の対話シェルでは
    `export XDG_CONFIG_HOME="$AICONSHELL_MUSE_HOME"` を先に実行する。
    通常の token refresh はそのサービスの volume だけに保存される。
 5. web の SQL migration 成功後、対象 worker の通常 Start Command / On Failure policy に戻す。

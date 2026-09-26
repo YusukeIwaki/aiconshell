@@ -283,7 +283,9 @@ check(failures, "Dockerfile defaults to app, ai carries git and bakes muse inten
   assert(stages.include?("ai"), "missing ai stage")
   assert(dockerfile.include?("AICONSHELL_EXECUTION_ROOT=/tmp/aiconshell-build-root ./bin/rails assets:precompile"),
     "assets:precompile must set a dummy AICONSHELL_EXECUTION_ROOT (production boot validates it)")
-  assert(stages.last == "app", "default (last) stage must be app, got #{stages.last.inspect}")
+  assert(stages.last == "runtime" && dockerfile.include?("ARG RUNTIME_TARGET=app") &&
+    dockerfile.include?('FROM ${RUNTIME_TARGET} AS runtime'),
+    "runtime must default to app and accept an explicit ai target for Railway workers")
   assert(dockerfile.include?("USER 1000:1000"), "runtime must drop to non-root")
   assert(dockerfile.include?("type=secret,id=muse_cli,required=false"),
     "muse CLI must enter only via an optional build secret")

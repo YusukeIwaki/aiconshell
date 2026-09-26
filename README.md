@@ -16,6 +16,7 @@ AI エンジニア基盤。外部サービス（GitHub / Jira / Teams）のイ�
 
 ```sh
 cp .env.example .env   # 初回のみ。COMPOSE_PROJECT_NAME は checkout 毎に変更
+# .env の ADMIN_USERNAME / ADMIN_PASSWORD を設定する
 docker compose up --build
 ./bin/smoke            # 別ターミナルで確認（web・DB・ClickHouse・worker）
 ```
@@ -30,12 +31,15 @@ docker compose up --build
 ## 開発ループ（ローカル実行）
 
 ```sh
-cp .env.example .env   # 初回のみ。DATABASE_URL / TEST_DATABASE_URL を設定
+cp .env.example .env   # 初回のみ。DB / ClickHouse の URL をホスト側のポートへ変更
 bin/setup --skip-server  # bundle + development/test 両 DB の db:prepare
 bin/dev                  # web（Puma, port 3000）
 bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記注意）
 ```
 
+- ホスト上で AI を実行する場合は `AICONSHELL_EXECUTION_ROOT` をリポジトリ外の
+  書き込み可能な絶対パスにし、AI のホーム・実行ファイルのパスもホスト用に設定する。
+  Compose の `/private/*` volume はホストの CLI からは参照できない。
 - `.env` は compose が読むほか、ローカル実行では dotenv-rails 経由で
   development/test に読まれる（`.env` 自体は git 管理外）。
 - `bin/jobs` の既定 fork モードは Linux Docker 用。macOS の fork worker
@@ -52,7 +56,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 | `DATABASE_URL` | development・production の単一 DB（Solid Queue 同居） | dev のみ localhost 既定。production は必須 |
 | `TEST_DATABASE_URL` | integration suite 用（`*_test` 必須） | `DATABASE_URL`、無ければ localhost の `_test` |
 | `SECRET_KEY_BASE` | Rails secret | compose は開発用ダミー。共有環境では必須 |
-| `ADMIN_USERNAME/ADMIN_PASSWORD` | 管理画面の Basic 認証 | 未設定の production は fail closed |
+| `ADMIN_USERNAME/ADMIN_PASSWORD` | 管理画面の Basic 認証 | 未設定では fail closed |
 | `AICONSHELL_EXECUTION_ROOT` | AI 作業領域ルート（production 必須） | compose は `/workspaces` volume |
 | `AICONSHELL_ALLOWED_SCOPES` | 取り込み/送信対象の `plugin:scope` 一覧 | 空（何も対象にしない） |
 | `AICONSHELL_LEASE_SECONDS` / `AICONSHELL_AI_TIMEOUT_SECONDS` | 実行 lease / AI 実行上限（lease > timeout + 10 が必須） | `1800` / `600` |
@@ -97,7 +101,7 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
   Ruby ポート（Zeitwerk 対象外）。
 - `smartest/` — `unit/`（`observability/` 含む）・`plugins/`・`ai/`（DB なし）、
   `integration/`（`observability/` 含む、実 DB）。
-- `compose.yml`・`Dockerfile`・`railway.toml`・`bin/smoke`・
+- `compose.yml`・`Dockerfile`・`railway*.toml`・`bin/smoke`・
   `bin/setup-clickhouse`・`bin/check-compose` — 運用配線（issue #8）。
 
 ## 検証範囲
