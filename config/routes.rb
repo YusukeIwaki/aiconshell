@@ -9,6 +9,9 @@ Rails.application.routes.draw do
   # get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
   # get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
 
-  # Static foundation landing page (no domain). /admin arrives later.
+  # Static foundation landing page (no domain).
   root "home#index"
+
+  # Admin console (issue #7). Route details live in config/routes/admin.rb.
+  draw(:admin)
 end
