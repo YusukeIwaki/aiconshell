@@ -10,17 +10,21 @@ require "tmpdir"
 
 # Self-contained fixtures for the bounded issue-9 acceptance slice.
 #
-# Everything external is fake at the boundary only: a scripted HTTP transport
+# Only the outside world is fake at the boundary: a scripted HTTP transport
 # (no network) and a temporary executable `claude` stand-in (no subscription
 # login, no model call). All application code under test is real: the plugin
 # Registry with the real Github adapter, the real Ai::Runner with the real
-# ProcessRunner subprocess spawn, and the real Interaction / Coordination /
+# ProcessRunner subprocess spawn, the real Interaction / Coordination /
 # Execution services against real PostgreSQL tables and the real Solid Queue
-# tables. The event sink stays fake because the final EventLog boot wiring is
-# still pending in another lane.
+# tables, and the real WorkflowEvents/EventLog boot wiring
+# (config/initializers/event_log.rb -> EventLogging::OutboxAdapter ->
+# EventDelivery rows). The event sink here is a recording wrapper that
+# forwards every emit to that real path; it never mirrors calls in a
+# collector instead of persisting them.
 module AcceptanceHelper
   GH_API = "https://api.github.com"
   SCOPE = "o/r"
+  FAKE_INSTALLATION_TOKEN = "fake-installation-token"
 
   ENV_KEYS = %w[
     PATH CLAUDE_CONFIG_DIR
@@ -85,6 +89,51 @@ module AcceptanceHelper
     end
   end
 
+  # Recording wrapper around the REAL WorkflowEvents facade. Every emit is
+  # recorded (for kind assertions) and forwarded to the real EventLog path,
+  # and the real return value is kept: WorkflowEvents.emit returns the
+  # persisted envelope on success and nil when the emit was dropped, so a
+  # nil entry proves the real path rejected that emission instead of
+  # silently passing.
+  class RecordingEventSink
+    attr_reader :events, :forwarded
+
+    def initialize(target: WorkflowEvents)
+      @target = target
+      @events = []
+      @forwarded = []
+    end
+
+    def emit(layer:, kind:, message:, task_id: nil, correlation_id: nil, data: {})
+      @events << { layer: layer.to_s, kind: kind.to_s, message: message.to_s,
+                   task_id: task_id, correlation_id: correlation_id,
+                   data: data.is_a?(Hash) ? data : {} }
+      result = @target.emit(layer: layer, kind: kind, message: message,
+                            task_id: task_id, correlation_id: correlation_id,
+                            data: data)
+      @forwarded << result
+      result
+    end
+
+    def kinds
+      @events.map { |event| event[:kind] }
+    end
+  end
+
+  # Fails fast unless the Rails boot wiring is the real EventLog outbox.
+  # This deliberately does NOT reconfigure anything: if another suite file
+  # leaked a fake outbox into the global config, that isolation bug must
+  # fail loudly here instead of being papered over.
+  def ensure_real_eventlog_wiring!
+    raise "WorkflowEvents facade is not observable" unless WorkflowEvents.observability?
+
+    outbox = Aiconshell::Observability.config.outbox
+    return true if outbox.is_a?(EventLogging::OutboxAdapter)
+
+    raise "real EventLog boot wiring missing: outbox is #{outbox.class} " \
+      "(expected EventLogging::OutboxAdapter from config/initializers/event_log.rb)"
+  end
+
   Context = Struct.new(:root, :execution_root, :bin, :claude_home, :evidence_path,
                        :transport, :plugin_env, :registry, :ai_runner, :sink,
                        keyword_init: true)
@@ -121,7 +170,7 @@ module AcceptanceHelper
       yield Context.new(root: root, execution_root: execution_root, bin: built[:bin],
                         claude_home: built[:claude_home], evidence_path: built[:evidence],
                         transport: transport, plugin_env: plugin_env, registry: registry,
-                        ai_runner: Aiconshell::Ai::Runner.new, sink: WorkflowFakes::FakeEventSink.new)
+                        ai_runner: Aiconshell::Ai::Runner.new, sink: RecordingEventSink.new)
     end
   ensure
     saved.each { |key, value| value.nil? ? ENV.delete(key) : ENV.store(key, value) }
