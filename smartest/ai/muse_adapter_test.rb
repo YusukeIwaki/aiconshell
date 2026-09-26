@@ -47,10 +47,26 @@ test("muse disables writes, shell and web tools outside execution") do
     expect(argv).to include("--disable-write")
     expect(argv).to include("--disable-shell")
     expect(argv).to include("--disable-web-tools")
+    expect(argv[argv.index("--approval-mode") + 1]).to eq("never")
+    expect(argv).to include("--no-foreign-personal-context")
   end
   argv = muse_invocation(layer: "execution")[:argv]
   expect(argv.include?("--disable-write")).to eq(false)
   expect(argv.include?("--disable-shell")).to eq(false)
+end
+
+test("muse never waits on prompts and never disables the sandbox") do
+  %w[interaction coordination execution].each do |layer|
+    argv = muse_invocation(layer: layer)[:argv]
+    expect(argv).to include("--user-input-auto-resolve")
+    expect(argv[argv.index("--approval-mode") + 1]).to eq("never")
+    expect(argv).to include("--no-foreign-personal-context")
+    expect(argv.include?("--yolo")).to eq(false)
+    expect(argv.include?("--disable-approval")).to eq(false)
+    expect(argv.include?("--disable-sandbox")).to eq(false)
+    expect(argv.include?("--trust-workspace")).to eq(false)
+    expect(argv.include?("--allow-workspace-switch")).to eq(false)
+  end
 end
 
 test("muse rejects unknown effort levels") do
@@ -82,7 +98,8 @@ test("muse treats failed terminals as execution failures") do
     raise "expected ExecutionFailed"
   rescue Ai::ExecutionFailed => error
     expect(error.kind).to eq(:auth)
-    expect(error.excerpt.include?("unauthorized")).to eq(true)
+    expect(error.message).to eq('AI provider "muse" failed (exit=0, kind=auth)')
+    expect(error.respond_to?(:excerpt)).to eq(false)
   end
 end
 

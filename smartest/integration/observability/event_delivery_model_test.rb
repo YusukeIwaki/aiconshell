@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "integration/observability_helper"
 
 def create_delivery!(overrides = {})
   envelope = EventLogTestSupport.build_envelope(
@@ -15,7 +15,7 @@ def create_delivery!(overrides = {})
   )
 end
 
-test("validates presence and event_id uniqueness") do |clean_event_deliveries:|
+test("validates presence and event_id uniqueness") do |db:|
   create_delivery!
 
   duplicate = EventDelivery.new(event_id: EventDelivery.first.event_id)
@@ -24,8 +24,8 @@ test("validates presence and event_id uniqueness") do |clean_event_deliveries:|
   expect(EventDelivery.new.valid?).to eq(false)
 end
 
-test("pending scopes separate destinations and honor retry time") do |clean_event_deliveries:, fixed_clock:|
-  now = fixed_clock.now
+test("pending scopes separate destinations and honor retry time") do |db:|
+  now = Time.current
   ready = create_delivery!(teams_channel: "ops")
   no_teams = create_delivery!
   waiting = create_delivery!(teams_channel: "ops")
@@ -38,24 +38,28 @@ test("pending scopes separate destinations and honor retry time") do |clean_even
   expect(EventDelivery.teams_pending(now + 7200).map(&:id).sort).to eq([ready.id, waiting.id].sort)
 end
 
-test("prunable keeps fresh and pending rows") do |clean_event_deliveries:, fixed_clock:|
-  now = fixed_clock.now
+test("prunable keeps fresh and pending rows") do |db:|
+  now = Time.current
   old_done = create_delivery!(teams_channel: "ops")
   old_done.update!(clickhouse_delivered_at: now - 30 * 86_400, teams_delivered_at: now - 30 * 86_400,
                    created_at: now - 30 * 86_400)
   old_skipped = create_delivery!(teams_channel: "ops")
   old_skipped.update!(clickhouse_delivered_at: now - 30 * 86_400, teams_skipped_at: now - 30 * 86_400,
                       created_at: now - 30 * 86_400)
+  old_ch_skipped = create_delivery!(teams_channel: "ops")
+  old_ch_skipped.update!(clickhouse_skipped_at: now - 30 * 86_400, teams_delivered_at: now - 30 * 86_400,
+                         created_at: now - 30 * 86_400)
   old_pending = create_delivery!(teams_channel: "ops")
   old_pending.update!(clickhouse_delivered_at: now - 30 * 86_400, created_at: now - 30 * 86_400)
   fresh = create_delivery!(teams_channel: "ops")
   fresh.update!(clickhouse_delivered_at: now, teams_delivered_at: now)
 
   expect(EventDelivery.prunable(now - 7 * 86_400).map(&:id).sort)
-    .to eq([old_done.id, old_skipped.id].sort)
+    .to eq([old_done.id, old_skipped.id, old_ch_skipped.id].sort)
   expect(old_pending.teams_terminal?).to eq(false)
   expect(old_skipped.teams_terminal?).to eq(true)
   expect(fresh.clickhouse_terminal?).to eq(true)
+  expect(old_ch_skipped.clickhouse_terminal?).to eq(true)
   expect(fresh.teams_requested?).to eq(true)
   expect(create_delivery!.teams_requested?).to eq(false)
 end

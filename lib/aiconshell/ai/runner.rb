@@ -11,8 +11,9 @@ module Aiconshell
     # the schema-validated answer as a JSON-compatible Hash.
     #
     # The process runner is injected (fake in tests, ProcessRunner in
-    # production). Prompts, raw stdout and auth material never appear in
-    # errors, logs or return envelopes beyond redacted excerpts.
+    # production). Prompts, provider raw stdout/stderr and auth material
+    # never appear in errors, logs or return envelopes: failures carry
+    # only provider, kind and exit status.
     class Runner
       def initialize(registry: Registry.default, process_runner: ProcessRunner.new, config: Config.default)
         @registry = registry
@@ -92,8 +93,12 @@ module Aiconshell
         raise ArgumentError, "schema must describe an object, got type #{type.inspect}"
       end
 
-      # The application body and private auth locations must never serve as
-      # the AI workspace: it has to be a dedicated, isolated directory.
+      # Private auth locations must never serve as the AI workspace: it
+      # has to be a dedicated directory. Paths are canonicalized
+      # (symlinks resolved) before comparison so a symlink pointing at
+      # an auth dir cannot bypass the check. This is a path guard only:
+      # it does not sandbox the CLI (see docs/ai-providers.md), and it
+      # does not scan for symlinks nested *inside* the workspace.
       def validate_workspace!(workspace)
         unless workspace.is_a?(String) && Pathname.new(workspace).absolute?
           raise ArgumentError, "workspace must be an absolute path"
@@ -101,24 +106,29 @@ module Aiconshell
         unless Dir.exist?(workspace)
           raise ArgumentError, "workspace does not exist: #{workspace.inspect}"
         end
-        raise ArgumentError, "workspace must not be the filesystem root" if File.expand_path(workspace) == "/"
+        canonical = canonical_path(workspace)
+        raise ArgumentError, "workspace must not be the filesystem root" if canonical == "/"
 
         Config::PROVIDERS.each do |provider|
-          home = @config.home_for(provider)
+          home = @config.auth_dir_for(provider)
           next if home.nil? || home.empty?
 
-          if overlap?(workspace, home)
+          if overlap?(canonical, canonical_path(home))
             raise ArgumentError, "workspace must not overlap the #{provider} auth location"
           end
         end
       end
 
-      def overlap?(workspace, home)
-        expanded_workspace = File.expand_path(workspace)
-        expanded_home = File.expand_path(home)
-        expanded_workspace == expanded_home ||
-          expanded_workspace.start_with?("#{expanded_home}/") ||
-          expanded_home.start_with?("#{expanded_workspace}/")
+      def overlap?(canonical_workspace, canonical_home)
+        canonical_workspace == canonical_home ||
+          canonical_workspace.start_with?("#{canonical_home}/") ||
+          canonical_home.start_with?("#{canonical_workspace}/")
+      end
+
+      def canonical_path(path)
+        File.realpath(path)
+      rescue SystemCallError
+        File.expand_path(path)
       end
 
       def prepare_files(adapter, dir, schema, prompt, instructions)
@@ -154,9 +164,7 @@ module Aiconshell
         )
       rescue SystemCallError, IOError => error
         raise ExecutionFailed.new(
-          provider, exit_status: nil,
-          kind: Redactor.failure_kind(error.message),
-          excerpt: Redactor.excerpt(error.message, max_chars: @config.error_excerpt_chars)
+          provider, exit_status: nil, kind: Redactor.failure_kind(error.message)
         )
       end
     end

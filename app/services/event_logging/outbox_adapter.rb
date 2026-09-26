@@ -9,24 +9,32 @@ module EventLogging
   class OutboxAdapter
     include Aiconshell::Observability::Outbox
 
+    # Best-effort enqueue: the INSERT runs in its own savepoint so a
+    # PostgreSQL write error (unique conflict, check violation, ...) rolls
+    # back only the savepoint. A rescued error must never poison the
+    # caller's surrounding business transaction.
     def enqueue(envelope, teams_channel: nil)
-      record = begin
-        EventDelivery.create!(
-          event_id: envelope.fetch("event_id"),
-          envelope:,
-          layer: envelope["layer"],
-          kind: envelope["kind"],
-          task_id: envelope["task_id"],
-          correlation_id: envelope["correlation_id"],
-          occurred_at: envelope["occurred_at"],
-          teams_channel:
-        )
+      record = nil
+      begin
+        EventDelivery.transaction(requires_new: true) do
+          record = EventDelivery.create!(
+            event_id: envelope.fetch("event_id"),
+            envelope:,
+            layer: envelope["layer"],
+            kind: envelope["kind"],
+            task_id: envelope["task_id"],
+            correlation_id: envelope["correlation_id"],
+            occurred_at: envelope["occurred_at"],
+            teams_channel:
+          )
+        end
       rescue ActiveRecord::RecordNotUnique
-        EventDelivery.find_by!(event_id: envelope.fetch("event_id"))
+        # Savepoint already rolled back; the outer transaction is clean.
+        record = EventDelivery.find_by!(event_id: envelope.fetch("event_id"))
       rescue ActiveRecord::RecordInvalid => e
         raise unless e.record.errors[:event_id].include?("has already been taken")
 
-        EventDelivery.find_by!(event_id: envelope.fetch("event_id"))
+        record = EventDelivery.find_by!(event_id: envelope.fetch("event_id"))
       end
       to_record(record)
     end

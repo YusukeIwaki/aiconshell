@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "test_helper"
+require "event_log_fixtures"
 
 Observability = Aiconshell::Observability
 
@@ -55,6 +56,14 @@ test("emit! raises ValidationError for strict callers") do |memory_outbox:|
 
   expect(-> { Observability.emit!(layer: "bogus", kind: "x", message: "m") })
     .to raise_error(Aiconshell::Observability::ValidationError)
+end
+
+test("emit contains a simultaneous outbox and diagnostic logger failure") do
+  broken_logger = Object.new
+  def broken_logger.warn(*) = raise(IOError, "log device unavailable")
+  Observability.configure { |config| config.logger = broken_logger }
+
+  expect(Observability.emit(layer: "invalid", kind: "x", message: "m")).to be_nil
 end
 
 test("search delegates to the configured backend") do

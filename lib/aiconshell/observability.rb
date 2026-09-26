@@ -54,10 +54,12 @@ module Aiconshell
         emit!(layer:, kind:, message:, task_id:, correlation_id:, data:,
               event_id:, occurred_at:, teams_channel:)
       rescue StandardError => e
-        config.logger.warn(
-          "observability emit dropped (layer=#{layer.inspect} kind=#{kind.inspect}): " \
-          "#{Redaction.sanitize_error(e)}"
-        )
+        begin
+          config.logger.warn("observability emit dropped: #{Redaction.sanitize_error(e)}")
+        rescue StandardError
+          # A broken log destination must not turn best-effort telemetry
+          # into a failure of the surrounding business operation.
+        end
         nil
       end
 

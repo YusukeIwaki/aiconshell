@@ -1,23 +1,12 @@
 # frozen_string_literal: true
 
-# Standalone helper for the issue-5 EventLog suite. Deliberately NOT named
-# test_helper.rb: the Rails foundation lane owns the global helpers, while
-# this file keeps the pre-Rails suite runnable with `smartest` alone.
+# Unit-safe EventLog test support: fakes, builders, and service-connection
+# helpers. No Smartest dependency, no global fixtures, no I/O at load, so
+# both smartest/unit and smartest/integration tests can require it.
+# (Unit fixtures live in event_log_fixtures.rb; Rails fixtures in
+# integration/observability_helper.rb.)
 
-# ActiveSupport 8.1 calls JSON.parse with options removed in json 3.x; the
-# foundation Gemfile must lock json 2.x. Pin it for standalone (non-bundler)
-# runs so the AR-backed tests exercise the real stack. Under `bundle exec`
-# the lockfile wins and a conflicting pin is ignored (the suite then fails
-# honestly if the lock itself is broken).
-begin
-  gem "json", "< 3"
-rescue Gem::LoadError
-  nil
-end
-
-require "smartest/autorun"
-
-REPO_ROOT = File.expand_path("..", __dir__)
+REPO_ROOT = File.expand_path("..", __dir__) unless defined?(REPO_ROOT)
 $LOAD_PATH.unshift File.join(REPO_ROOT, "lib") unless $LOAD_PATH.include?(File.join(REPO_ROOT, "lib"))
 
 require "logger"
@@ -184,14 +173,18 @@ module EventLogTestSupport
     end
 
     def execute!(sql)
+      execute_with_params!(sql, {})
+    end
+
+    def execute_with_params!(sql, params)
       require "net/http"
       require "uri"
       uri = URI.parse(base_url)
-      uri.query = URI.encode_www_form("database" => database)
+      uri.query = URI.encode_www_form({ "database" => database }.merge(params))
       request = Net::HTTP::Post.new(uri.request_uri)
       request.basic_auth(username, password)
       request.body = sql
-      response = Net::HTTP.start(uri.host, uri.port, open_timeout: 5, read_timeout: 20) do |http|
+      response = Net::HTTP.start(uri.host, uri.port, open_timeout: 5, read_timeout: 60) do |http|
         http.request(request)
       end
       return response.body.to_s if response.code.to_i == 200
@@ -221,34 +214,6 @@ module EventLogTestSupport
     end
   end
 
-  # Runs the REAL Rails migration + model files against the test database
-  # with standalone ActiveRecord (no Rails app needed).
-  module ActiveRecordSetup
-    module_function
-
-    def ensure_migrated!
-      PgConfig.ensure_test_database!
-      require "active_record"
-      ActiveRecord::Migration.verbose = false
-      ActiveRecord::Base.establish_connection(adapter: "postgresql", **PgConfig.params)
-      connection = ActiveRecord::Base.connection
-      if ENV["RECREATE_EVENT_DELIVERIES"] == "1" && connection.table_exists?("event_deliveries")
-        connection.drop_table("event_deliveries")
-      end
-      unless connection.table_exists?("event_deliveries")
-        require File.join(REPO_ROOT, "db/migrate/20260926000005_create_event_deliveries.rb")
-        CreateEventDeliveries.migrate(:up)
-      end
-      unless defined?(::ApplicationRecord)
-        Object.const_set(:ApplicationRecord, Class.new(ActiveRecord::Base) do
-          self.abstract_class = true
-        end)
-      end
-      require File.join(REPO_ROOT, "app/models/event_delivery.rb")
-      connection
-    end
-  end
-
   module_function
 
   def build_envelope(**overrides)
@@ -258,99 +223,4 @@ module EventLogTestSupport
           correlation_id: "corr-123", data: { "priority" => 10 } }.merge(overrides)
     )
   end
-end
-
-class EventLogFixtures < Smartest::Fixture
-  fixture :fixed_clock do
-    EventLogTestSupport::FixedClock.new
-  end
-
-  fixture :memory_outbox do |fixed_clock:|
-    Aiconshell::Observability::MemoryOutbox.new(clock: fixed_clock)
-  end
-
-  fixture :log_output do
-    StringIO.new
-  end
-
-  fixture :test_logger do |log_output:|
-    Logger.new(log_output)
-  end
-end
-
-class EventLogServiceFixtures < Smartest::Fixture
-  # Only connection-level failures skip; anything else (bad DDL, auth
-  # misconfiguration, assertion bugs) must fail loudly.
-  CONNECTION_ERRORS = [IOError, SocketError, SystemCallError, Timeout::Error].freeze
-
-  fixture :pg_connection do
-    begin
-      require "pg"
-      EventLogTestSupport::PgConfig.ensure_test_database!
-      conn = EventLogTestSupport::PgConfig.connect
-    rescue *CONNECTION_ERRORS, PG::ConnectionBad => e
-      raise Smartest::Skipped, "postgres unreachable: #{e.message}"
-    end
-    on_teardown { conn.close rescue nil }
-    conn
-  end
-
-  fixture :real_clickhouse do
-    begin
-      EventLogTestSupport::ClickHouseConfig.ensure_test_database!
-    rescue *CONNECTION_ERRORS => e
-      raise Smartest::Skipped, "clickhouse unreachable: #{e.message}"
-    end
-    EventLogTestSupport::ClickHouseConfig.adapter
-  end
-end
-
-class EventLogArFixtures < Smartest::Fixture
-  suite_fixture :ar_connection do
-    begin
-      require "pg"
-      conn = EventLogTestSupport::ActiveRecordSetup.ensure_migrated!
-    rescue *EventLogServiceFixtures::CONNECTION_ERRORS, PG::ConnectionBad => e
-      raise Smartest::Skipped, "postgres unreachable: #{e.message}"
-    end
-    on_teardown { ActiveRecord::Base.remove_connection rescue nil }
-    conn
-  end
-
-  fixture :clean_event_deliveries do |ar_connection:|
-    ar_connection.execute("TRUNCATE event_deliveries RESTART IDENTITY")
-    on_teardown do
-      ActiveRecord::Base.connection.execute("TRUNCATE event_deliveries RESTART IDENTITY")
-    rescue StandardError
-      nil
-    end
-    ar_connection
-  end
-end
-
-class EventLogClickHouseFixtures < Smartest::Fixture
-  fixture :ch_event_log do |real_clickhouse:|
-    EventLogTestSupport::ClickHouseConfig.rebuild_event_log_from_shipped_sql!
-    on_teardown do
-      EventLogTestSupport::ClickHouseConfig.execute!("DROP TABLE IF EXISTS event_log")
-    rescue StandardError
-      nil
-    end
-    real_clickhouse
-  end
-end
-
-around_suite do |suite|
-  use_fixture EventLogFixtures
-  use_fixture EventLogServiceFixtures
-  use_fixture EventLogArFixtures
-  use_fixture EventLogClickHouseFixtures
-  # NOTE: Smartest only treats around_test as global when registered from
-  # inside around_suite; a top-level call would scope it to this file.
-  around_test do |test|
-    Aiconshell::Observability.reset!
-    test.run
-    Aiconshell::Observability.reset!
-  end
-  suite.run
 end
