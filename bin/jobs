@@ -1,0 +1,20 @@
+#!/usr/bin/env ruby
+
+# Solid Queue supervisor launcher. Dispatchers and workers share the single
+# PostgreSQL database selected by DATABASE_URL (see config/queue.yml).
+#
+# Supervisor modes (`bin/jobs --help`, SolidQueue::Cli --mode):
+# - fork (default): dispatchers/workers run as forked processes. Primary
+#   supported runtime is Linux Docker (see Dockerfile; issue #8 owns the
+#   operations image and the full worker smoke).
+# - async: dispatchers/workers run as threads in this process, no fork().
+#   Use `bin/jobs --mode=async` for local macOS development: forked workers
+#   are not reliable there (pg native extension + ObjC runtime fork safety),
+#   which is outside the issue #2 foundation scope. No
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY override is set here; do not
+#   reintroduce one without a proven, reviewed need.
+
+require_relative "../config/environment"
+require "solid_queue/cli"
+
+SolidQueue::Cli.start(ARGV)
