@@ -1,0 +1,19 @@
+<% content_for(:title, "タスク依頼の作成") %>
+<h1>タスク依頼の作成</h1>
+<p>やりたい内容を文章で送ると、タスクとして整理されます。</p>
+
+<div class="admin-card">
+  <%= form_with url: admin_task_requests_path, method: :post, scope: :task_request do |form| %>
+    <%= hidden_field_tag :idempotency_key, @idempotency_key %>
+    <div class="admin-form-grid">
+      <%= form.label :title, "タイトル（1〜500文字）" %>
+      <%= form.text_field :title, value: @title, maxlength: 500, required: true %>
+      <%= form.label :description, "内容（1〜8000文字）" %>
+      <%= form.text_area :description, value: @description, maxlength: 8000, required: true, rows: 8 %>
+    </div>
+    <div class="admin-actions">
+      <%= form.submit "依頼を送る", class: "admin-btn" %>
+      <%= link_to "← タスクボードに戻る", admin_tasks_path %>
+    </div>
+  <% end %>
+</div>

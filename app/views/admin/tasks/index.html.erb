@@ -1,6 +1,7 @@
 <% content_for(:title, "タスクボード") %>
 <h1>タスクボード</h1>
 <p>状態ごとのタスク一覧です（優先度順、1ページ50件）。タスクの状態変更は整理層だけが行います。</p>
+<p><%= link_to "タスク依頼を作成する", new_admin_task_request_path %></p>
 
 <div class="admin-card">
   <%= form_with url: admin_tasks_path, method: :get do |form| %>

@@ -219,6 +219,7 @@ services:
       RAILS_DEVELOPMENT_HOSTS: ${RAILS_DEVELOPMENT_HOSTS:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
     command: ["./bin/rails", "server", "-b", "0.0.0.0", "-p", "3000"]

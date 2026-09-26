@@ -11,4 +11,5 @@ namespace :admin do
   resources :layer_policies, only: %i[index edit update], param: :layer
   resources :plugins, only: %i[index]
   resources :event_logs, only: %i[index]
+  resources :task_requests, only: %i[new create show]
 end

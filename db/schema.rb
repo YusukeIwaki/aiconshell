@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_000901) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_010000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -282,6 +282,20 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_000901) do
     t.check_constraint "author_type::text = 'human'::text", name: "task_feedbacks_human_only"
   end
 
+  create_table "task_requests", force: :cascade do |t|
+    t.string "request_id", null: false
+    t.string "idempotency_namespace", null: false
+    t.string "idempotency_key", null: false
+    t.string "title", null: false
+    t.text "description", null: false
+    t.bigint "external_event_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["external_event_id"], name: "index_task_requests_on_external_event_id", unique: true
+    t.index ["idempotency_namespace", "idempotency_key"], name: "index_task_requests_on_namespace_and_key", unique: true
+    t.index ["request_id"], name: "index_task_requests_on_request_id", unique: true
+  end
+
   create_table "task_runs", force: :cascade do |t|
     t.bigint "task_id", null: false
     t.string "provider", null: false
@@ -341,6 +355,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_000901) do
   add_foreign_key "solid_queue_recurring_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_scheduled_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "task_feedbacks", "tasks"
+  add_foreign_key "task_requests", "external_events"
   add_foreign_key "task_runs", "tasks"
   add_foreign_key "tasks", "task_runs", column: "current_run_id", on_delete: :nullify
 end
