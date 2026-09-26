@@ -3,8 +3,8 @@
 #
 # Jobs:
 #   unit            Every no-DB Smartest suite via `bin/test unit`
-#                   (smartest/unit, smartest/plugins, smartest/ai,
-#                   smartest/observability). No DB, no network, no AI, no creds.
+#                   (smartest/unit incl. unit/observability, smartest/plugins,
+#                   smartest/ai). No DB, no network, no AI, no creds.
 #   integration     The whole smartest/integration tree via
 #                   `bin/test integration` against real PostgreSQL AND real
 #                   ClickHouse services. bin/test pings ClickHouse first and
@@ -41,7 +41,7 @@ jobs:
         with:
           ruby-version: ${{ env.RUBY_VERSION }}
           bundler-cache: true
-      - name: No-DB suites (unit/plugins/ai/observability)
+      - name: No-DB suites (unit incl. observability, plugins, ai)
         run: bin/test unit
 
   integration:
@@ -81,9 +81,9 @@ jobs:
       TEST_CLICKHOUSE_DATABASE: aiconshell_test
       TEST_CLICKHOUSE_USER: aiconshell
       TEST_CLICKHOUSE_PASSWORD: aiconshell_ci
-      # Transitional aliases for observability tests moved from the
-      # standalone smartest/observability layout: same CI postgres as the
-      # foundation suite. Harmless once the move adopts TEST_DATABASE_URL.
+      # Aliases for the standalone observability PG helper
+      # (smartest/event_log_support.rb PgConfig): same CI postgres target
+      # as TEST_DATABASE_URL above.
       TEST_PG_HOST: localhost
       TEST_PG_PORT: 5432
       TEST_PG_DBNAME: aiconshell_test

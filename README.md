@@ -62,7 +62,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 ## テスト
 
 ```sh
-bin/test unit                  # DB なし全 suite（unit/plugins/ai/observability）
+bin/test unit                  # DB なし全 suite（unit/plugins/ai）
 bin/test integration           # 結合（実 PostgreSQL + 実 ClickHouse）
 bin/rails zeitwerk:check       # autoload 検査
 ruby bin/check-compose         # compose・queue・CI の静的検査
@@ -95,8 +95,8 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
   worker 分割設定（`config/queue.yml` は開発用一括）。
 - `lib/aiconshell/{plugins,ai,observability}/` — 明示 require の pure
   Ruby ポート（Zeitwerk 対象外）。
-- `smartest/` — `unit/`・`plugins/`・`ai/`・`observability/`（DB なし）、
-  `integration/`（実 DB）。
+- `smartest/` — `unit/`（`observability/` 含む）・`plugins/`・`ai/`（DB なし）、
+  `integration/`（`observability/` 含む、実 DB）。
 - `compose.yml`・`Dockerfile`・`railway.toml`・`bin/smoke`・
   `bin/setup-clickhouse`・`bin/check-compose` — 運用配線（issue #8）。
 
@@ -106,6 +106,8 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 
 - 自動確認: `docker compose config`、上記テスト群、`./bin/smoke`、
   `app`/`ai` イメージビルド、pinned CLI の Linux `--version`、
-  ClickHouse 機構確認（probe スキーマ適用）。
+  定期実行 6 件の登録・消費、管理画面の認証挙動、EventLog の実
+  ClickHouse 配送、ClickHouse 停止中の起動継続と復帰後配送、
+  本番同等 `/up` の redirect 除外（詳細は `docs/deployment.md` §10）。
 - 運営者作業（要アカウント）: Railway 実デプロイ、ngrok 実公開、各 CLI
   のログイン（`muse` バイナリ入手含む）、実サービスへの投稿・取得。

@@ -56,6 +56,14 @@ x-clickhouse-client: &clickhouse-client
   CLICKHOUSE_USER: ${CLICKHOUSE_USER:-aiconshell}
   CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-aiconshell_dev}
 
+# EventLog emission default (lib/aiconshell/observability.rb). Read on every
+# Rails boot (config/initializers/event_log.rb) and captured on each outbox
+# row at emit time, so EVERY Rails process (web/control/execution/migrate)
+# receives it. Blank (default) keeps history searchable without Teams
+# notifications; channel:<teamId>/<channelId> enables the Teams sink.
+x-event-log: &event-log
+  EVENT_LOG_TEAMS_CHANNEL: ${EVENT_LOG_TEAMS_CHANNEL:-}
+
 # Plugin credentials + optional endpoint overrides (lib/aiconshell/plugins).
 # Web needs them for admin diagnostics; control needs them for polling,
 # outbound delivery, and the EventLog Teams sink (which reuses the Teams
@@ -81,6 +89,13 @@ x-integration-credentials: &integration-credentials
   TEAMS_BOT_APP_PASSWORD_FILE: ${TEAMS_BOT_APP_PASSWORD_FILE:-}
   TEAMS_SERVICE_URL: ${TEAMS_SERVICE_URL:-}
   TEAMS_GRAPH_URL: ${TEAMS_GRAPH_URL:-}
+  # Path ONLY (inside the container) to the private JSON mapping Graph
+  # channel/message references to Bot conversation references (see
+  # plugins/teams/README.md "Bot 参照の対応表"). The operator bind-mounts
+  # the host file read-only (see docs/deployment.md); the value is never
+  # committed and never baked into the image. Same read-only-mount pattern
+  # applies to the other *_FILE credential paths above.
+  TEAMS_BOT_TARGETS_FILE: ${TEAMS_BOT_TARGETS_FILE:-}
 
 # Self-actor filtering for polling/outbound (control queue only). Web never
 # reads these, so they stay off web.
@@ -162,7 +177,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow]
+      <<: [*app-database, *workflow, *event-log]
       AICONSHELL_RUN_DB_SETUP: "1"
     command: ["true"]
 
@@ -196,7 +211,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *clickhouse-client, *integration-credentials]
+      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials]
       PORT: "3000"
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -226,7 +241,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *clickhouse-client, *integration-credentials, *control-only, *ai-auth]
+      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *control-only, *ai-auth]
     volumes:
       - claude_auth:/private/claude
       - codex_auth:/private/codex
@@ -235,10 +250,11 @@ services:
     command: ["./bin/jobs", "--config-file=config/queue_control.yml"]
 
   # Execution plane: AI CLI subprocess runs on queue `execution` only.
-  # Receives the database, workflow settings, AI auth homes, and the
-  # workspaces volume — and NOTHING ELSE: no GitHub/Jira/Teams/ClickHouse
-  # credentials (enforced by bin/check-compose and documented in
-  # docs/deployment.md).
+  # Receives the database, workflow settings, the EventLog channel default
+  # (a non-credential `channel:<team>/<channel>` name, blank by default),
+  # AI auth homes, and the workspaces volume — and NOTHING ELSE: no
+  # GitHub/Jira/Teams/ClickHouse credentials (enforced by bin/check-compose
+  # and documented in docs/deployment.md).
   execution:
     build:
       context: .
@@ -251,7 +267,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *ai-auth]
+      <<: [*app-database, *workflow, *event-log, *ai-auth]
     volumes:
       - claude_auth:/private/claude
       - codex_auth:/private/codex

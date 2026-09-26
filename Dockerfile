@@ -72,8 +72,12 @@ COPY . .
 # Precompile bootsnap code for faster boot times.
 RUN bundle exec bootsnap precompile app/ lib/
 
-# Precompile assets for production without requiring a real secret.
-RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
+# Precompile assets for production without requiring real secrets. The
+# build-time Rails boot runs WorkflowSettings.validate!, which requires
+# AICONSHELL_EXECUTION_ROOT in production, so point it at a dummy path
+# that is never used at runtime (validate! only reads the string; the real
+# root comes from the runtime environment and its persisted volume).
+RUN SECRET_KEY_BASE_DUMMY=1 AICONSHELL_EXECUTION_ROOT=/tmp/aiconshell-build-root ./bin/rails assets:precompile
 
 # Optional CLI-enabled worker image. Built only with `--target ai`.
 FROM base AS ai

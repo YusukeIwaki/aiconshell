@@ -5,8 +5,10 @@
 #   bin/test [unit|integration|all] [-- extra smartest args...]
 #
 # - unit:        every no-DB suite: smartest/unit, smartest/plugins,
-#                smartest/ai, smartest/observability. No database, no
-#                network, no AI calls, no credentials.
+#                smartest/ai. No database, no network, no AI calls, no
+#                credentials. EventLog unit tests live under
+#                smartest/unit/observability (there is no legacy top-level
+#                smartest/observability directory).
 # - integration: smartest/integration (the whole tree, recursively) against
 #                real PostgreSQL (TEST_DATABASE_URL, must end with _test;
 #                prepare once with `RAILS_ENV=test bin/rails db:prepare`)
@@ -33,8 +35,10 @@ APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_ROOT"
 
 # Suite roots. unit runs NO_DB_SUITES; integration runs DB_SUITES.
-# Directories expand recursively (<dir>/**/*_test.rb).
-NO_DB_SUITES="smartest/unit smartest/plugins smartest/ai smartest/observability"
+# Directories expand recursively (<dir>/**/*_test.rb), so
+# smartest/unit/observability and smartest/integration/observability are
+# covered by the unit and integration roots respectively.
+NO_DB_SUITES="smartest/unit smartest/plugins smartest/ai"
 DB_SUITES="smartest/integration"
 
 suite="${1:-all}"

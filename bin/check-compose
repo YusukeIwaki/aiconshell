@@ -8,10 +8,13 @@
 # Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
 # separated control/execution queues, no integration credentials on the
 # execution worker, explicit workflow settings on every Rails process,
+# the EventLog channel default on every emitting Rails process, Teams
+# targets path on web/control only, recurring schedules on control only,
 # ClickHouse-independent startup (SQL migrate vs clickhouse-init split),
 # AI auth only on the workers, persisted workspaces outside app source,
-# a single migration process, loopback-bound ports, no Docker socket mounts,
-# and .env.example coverage of every compose variable.
+# a single migration process, production /up health exclusion, loopback-bound
+# ports, no Docker socket mounts, and .env.example coverage of every compose
+# variable.
 # Runs in CI (ops job) and locally before `docker compose up`.
 require "yaml"
 
@@ -111,7 +114,7 @@ check(failures, "execution worker receives no integration credentials") do
 end
 
 check(failures, "control has integration credentials plus self-actor ids; web has credentials but no self-actor ids") do
-  %w[GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL].each do |var|
+  %w[GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE].each do |var|
     assert(env_of.call("web").key?(var), "web is missing #{var} (admin diagnostics)")
     assert(env_of.call("control").key?(var), "control is missing #{var}")
   end
@@ -119,6 +122,17 @@ check(failures, "control has integration credentials plus self-actor ids; web ha
     assert(env_of.call("control").key?(var), "control is missing #{var} (poll/outbound filtering)")
     assert(!env_of.call("web").key?(var), "web must not carry #{var} (control-only)")
   end
+end
+
+check(failures, "every emitting Rails process receives EVENT_LOG_TEAMS_CHANNEL (blank default)") do
+  app_services.each do |name|
+    env = env_of.call(name)
+    assert(env.key?("EVENT_LOG_TEAMS_CHANNEL"),
+      "#{name} is missing EVENT_LOG_TEAMS_CHANNEL (captured on outbox rows at emit time)")
+  end
+  example = File.read(File.join(ROOT, ".env.example"))
+  assert(example.match?(/^EVENT_LOG_TEAMS_CHANNEL=$/m),
+    ".env.example must default EVENT_LOG_TEAMS_CHANNEL to blank")
 end
 
 check(failures, "AI auth goes only to control/execution (corrected muse mapping, no MUSE_CONFIG_DIR)") do
@@ -161,6 +175,52 @@ check(failures, "queue configs bind workers to a single queue each") do
   execution_queues = Array(execution_q.dig("workers", 0, "queues")).map(&:to_s)
   assert(control_queues == ["control"], "queue_control workers: #{control_queues.inspect}")
   assert(execution_queues == ["execution"], "queue_execution workers: #{execution_queues.inspect}")
+end
+
+check(failures, "recurring schedules wire all control jobs in development and production") do
+  expected = {
+    "integration_poll_schedule" => { "class" => "IntegrationPollScheduleJob", "schedule" => "every 5 minutes" },
+    "coordination_triage" => { "class" => "CoordinationTriageJob", "schedule" => "every minute" },
+    "lease_recovery" => { "class" => "LeaseRecoveryJob", "schedule" => "every minute" },
+    "workflow_maintenance" => { "class" => "WorkflowMaintenanceJob", "schedule" => "every minute" },
+    "event_log_delivery" => { "class" => "EventLogDeliveryJob", "schedule" => "every minute" },
+    "clear_solid_queue_finished_jobs" => { "command" => true, "schedule" => "every hour at minute 12" }
+  }
+  recurring = YAML.load_file(File.join(ROOT, "config/recurring.yml"), aliases: true)
+  assert(!recurring.key?("test"), "test must not auto-schedule recurring tasks")
+  %w[development production].each do |env|
+    tasks = recurring[env]
+    assert(tasks.is_a?(Hash), "#{env} section must be a mapping")
+    missing = expected.keys - tasks.keys.map(&:to_s)
+    extra = tasks.keys.map(&:to_s) - expected.keys
+    assert(missing.empty?, "#{env} is missing recurring tasks: #{missing.join(", ")}")
+    assert(extra.empty?, "#{env} has unexpected recurring tasks: #{extra.join(", ")}")
+    expected.each do |key, spec|
+      task = tasks[key] || tasks[key.to_sym]
+      assert(task["schedule"].to_s == spec["schedule"], "#{env}.#{key} schedule: #{task["schedule"].inspect}")
+      assert(task["queue"].to_s == "control", "#{env}.#{key} must target queue control")
+      if spec["command"]
+        assert(!task["command"].to_s.empty?, "#{env}.#{key} needs its cleanup command")
+      else
+        assert(task["class"].to_s == spec["class"], "#{env}.#{key} class: #{task["class"].inspect}")
+        assert(task["args"].nil?, "#{env}.#{key} must not pass args (job-side defaults)")
+        underscore = spec["class"].gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+          .gsub(/([a-z\d])([A-Z])/, '\1_\2').downcase
+        job_file = File.join(ROOT, "app/jobs/#{underscore}.rb")
+        assert(File.file?(job_file), "missing #{job_file} for #{env}.#{key}")
+        assert(File.read(job_file).include?("queue_as :control"),
+          "#{job_file} must declare queue_as :control")
+      end
+    end
+  end
+end
+
+check(failures, "production keeps force_ssl but excludes /up from the redirect") do
+  production = File.read(File.join(ROOT, "config/environments/production.rb"))
+  assert(production.match?(/^\s*config\.force_ssl = true\s*$/),
+    "production must keep force_ssl (HTTPS for admin)")
+  assert(production.match?(/config\.ssl_options = \{ redirect: \{ exclude:.*request\.path == "\/up"/m),
+    "production must exclude /up from the SSL redirect (Railway healthcheck)")
 end
 
 check(failures, "exactly one SQL migration setup process (migrate service)") do
@@ -221,6 +281,8 @@ check(failures, "Dockerfile defaults to app, ai carries git and bakes muse inten
   dockerfile = File.read(File.join(ROOT, "Dockerfile"))
   stages = dockerfile.scan(/^FROM \S+ AS (\S+)/).flatten
   assert(stages.include?("ai"), "missing ai stage")
+  assert(dockerfile.include?("AICONSHELL_EXECUTION_ROOT=/tmp/aiconshell-build-root ./bin/rails assets:precompile"),
+    "assets:precompile must set a dummy AICONSHELL_EXECUTION_ROOT (production boot validates it)")
   assert(stages.last == "app", "default (last) stage must be app, got #{stages.last.inspect}")
   assert(dockerfile.include?("USER 1000:1000"), "runtime must drop to non-root")
   assert(dockerfile.include?("type=secret,id=muse_cli,required=false"),

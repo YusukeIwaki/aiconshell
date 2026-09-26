@@ -2,9 +2,9 @@
 #
 # Apply the EventLog ClickHouse schema (db/clickhouse/*.sql) over HTTP.
 #
-# Used by the compose `migrate` service, the Railway predeploy step, and CI.
-# Idempotent: the schema statements use IF NOT EXISTS and are safe to re-run.
-# Never prints credentials.
+# Used by the compose `clickhouse-init` service, the Railway one-off step,
+# and CI. Idempotent: the schema statements use IF NOT EXISTS and are safe
+# to re-run. Never prints credentials.
 #
 #   CLICKHOUSE_URL=http://127.0.0.1:8123 ./bin/setup-clickhouse
 #
