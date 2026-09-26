@@ -107,6 +107,40 @@ test("search backend failure renders a status, hiding details") do |http:|
   end
 end
 
+test("text-only search succeeds through the real ClickHouse adapter") do |http:|
+  AdminTestSupport.as_admin(http) do
+    AdminTestSupport.with_real_clickhouse_search(AdminTestSupport.sample_events) do |requests|
+      http.get "/admin/event_logs", { search: { query: "優先度" } }
+
+      expect(http.last_response.status).to eq(200)
+      expect(requests.length).to eq(1)
+      expect(requests.first[:body].include?("task_id =")).to eq(false)
+      expect(requests.first[:body].include?("occurred_at >=")).to eq(false)
+      expect(http.last_response.body.include?("優先度を更新しました")).to eq(true)
+    end
+  end
+end
+
+test("task and date filters reach the real ClickHouse adapter typed") do |http:|
+  AdminTestSupport.as_admin(http) do
+    AdminTestSupport.with_real_clickhouse_search([]) do |requests|
+      http.get "/admin/event_logs", { search: {
+        task_id: "7",
+        since: "2026-09-01T00:00:00Z",
+        until: "2026-09-27T00:00:00Z"
+      } }
+
+      expect(http.last_response.status).to eq(200)
+      expect(requests.length).to eq(1)
+      uri = requests.first[:uri]
+      params = URI.decode_www_form(uri.query.to_s).to_h
+      expect(params["param_flt_task"]).to eq("7")
+      expect(params["param_flt_since"].include?("2026-09-01")).to eq(true)
+      expect(params["param_flt_until"].include?("2026-09-27")).to eq(true)
+    end
+  end
+end
+
 test("unconfigured search renders an informative status") do |http:|
   AdminTestSupport.as_admin(http) do
     Admin::EventLogSearch.backend = nil

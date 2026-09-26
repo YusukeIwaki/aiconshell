@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 # Shared helpers for the admin request suite (issue 7). No Rails models
-# are defined here; workflow models come from issue 6 (local temp shims
-# replicate that contract until the merge).
+# are defined here; workflow models and ports come from the merged lanes.
 module AdminTestSupport
+  require "json" unless defined?(JSON)
   HOST = "app.test"
   USERNAME = "test-admin"
   PASSWORD = "test-password-for-admin-suite"
@@ -119,6 +119,45 @@ module AdminTestSupport
     def search(**_kwargs)
       raise StandardError, "ClickHouse connection refused SEKRIT-DETAIL-123"
     end
+  end
+
+  # Runs the block with the REAL ClickHouseAdapter wired as the search
+  # backend, but with an injected fake transport (no network). Yields the
+  # list of captured transport requests. Restores the default (nil)
+  # backend afterwards.
+  def self.with_real_clickhouse_search(rows)
+    unless defined?(Aiconshell::Observability::ClickHouseAdapter)
+      require "aiconshell/observability"
+    end
+    requests = []
+    transport = lambda do |method:, uri:, body:|
+      requests << { method:, uri:, body: }
+      payload = JSON.generate({ "data" => rows.map { |row| clickhouse_row(row) } })
+      Aiconshell::Observability::ClickHouseAdapter::Response.new(200, payload)
+    end
+    adapter = Aiconshell::Observability::ClickHouseAdapter.new(
+      base_url: "http://127.0.0.1:9", database: "admin_test", transport:
+    )
+    Aiconshell::Observability.configure { |config| config.search_backend = adapter }
+    Admin::EventLogSearch.reset!
+    yield requests
+  ensure
+    Aiconshell::Observability.reset!
+    Admin::EventLogSearch.reset!
+  end
+
+  def self.clickhouse_row(row)
+    {
+      "event_id" => row["event_id"],
+      "layer" => row["layer"],
+      "kind" => row["kind"],
+      "message" => row["message"],
+      "data_json" => JSON.generate(row["data"] || {}),
+      "task_id" => row["task_id"],
+      "correlation_id" => row["correlation_id"],
+      "occurred_at" => row["occurred_at"],
+      "version" => row["version"] || 1
+    }
   end
 
   def self.sample_catalog

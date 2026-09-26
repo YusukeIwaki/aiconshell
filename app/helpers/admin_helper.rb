@@ -18,12 +18,24 @@ module AdminHelper
     "execution" => "実行層"
   }.freeze
 
+  OUTBOUND_STATUS_LABELS = {
+    "pending" => "送信待ち",
+    "sending" => "送信中",
+    "sent" => "送信済み",
+    "failed" => "失敗",
+    "uncertain" => "未確定"
+  }.freeze
+
   def task_status_label(status)
     TASK_STATUS_LABELS.fetch(status.to_s, status.to_s)
   end
 
   def layer_label(layer)
     LAYER_LABELS.fetch(layer.to_s, layer.to_s)
+  end
+
+  def outbound_status_label(status)
+    OUTBOUND_STATUS_LABELS.fetch(status.to_s, status.to_s)
   end
 
   def admin_nav_items

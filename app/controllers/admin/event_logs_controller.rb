@@ -92,7 +92,10 @@ module Admin
     end
 
     def normalize_task_id!(form)
-      return nil if form[:task_id].blank?
+      if form[:task_id].blank?
+        form[:task_id] = nil
+        return nil
+      end
 
       unless form[:task_id] =~ /\A\d{1,10}\z/
         form[:task_id] = nil
@@ -104,7 +107,10 @@ module Admin
 
     def normalize_times!(form)
       %i[since until_time].each do |key|
-        next if form[key].blank?
+        if form[key].blank?
+          form[key] = nil
+          next
+        end
 
         begin
           form[key] = Time.iso8601(form[key]).utc.iso8601

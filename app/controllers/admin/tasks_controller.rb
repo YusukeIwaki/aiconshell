@@ -20,9 +20,10 @@ module Admin
 
     def show
       @task = Task.find(params[:id])
-      @feedbacks = @task.feedbacks.order(created_at: :asc)
-      @runs = @task.runs.order(created_at: :desc).limit(50)
-      @feedback = @task.feedbacks.new
+      @feedbacks = @task.task_feedbacks.order(created_at: :asc)
+      @runs = @task.task_runs.order(created_at: :desc).limit(50)
+      @outbound_actions = @task.outbound_actions.order(created_at: :desc).limit(50)
+      @feedback = @task.task_feedbacks.new
     rescue ActiveRecord::RecordNotFound
       redirect_to admin_tasks_path, alert: "タスクが見つかりませんでした。"
     end

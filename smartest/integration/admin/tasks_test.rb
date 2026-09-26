@@ -34,8 +34,8 @@ end
 test("task detail shows feedback and run history") do |http:|
   task = Task.create!(title: "詳細タスク", status: "running", priority: 3,
                       description: "やること")
-  task.feedbacks.create!(body: "もっと急いで", author: "運用者")
-  task.runs.create!(provider: "codex", model: "m", effort: "high", status: "succeeded")
+  task.task_feedbacks.create!(body: "もっと急いで", author: "運用者", author_type: "human")
+  task.task_runs.create!(provider: "codex", model: "m", effort: "high", status: "succeeded")
 
   AdminTestSupport.as_admin(http) do
     http.get "/admin/tasks/#{task.id}"
@@ -52,7 +52,7 @@ end
 test("task detail escapes feedback and descriptions") do |http:|
   task = Task.create!(title: "X", status: "inbox",
                       description: %(<img src=x onerror=alert(1)>))
-  task.feedbacks.create!(body: %(<b>太字</b><script>alert(2)</script>), author: "a")
+  task.task_feedbacks.create!(body: %(<b>太字</b><script>alert(2)</script>), author: "a", author_type: "human")
 
   AdminTestSupport.as_admin(http) do
     http.get "/admin/tasks/#{task.id}"
@@ -74,6 +74,28 @@ test("task detail exposes no worker run button") do |http:|
     expect(body.include?("run-now")).to eq(false)
     expect(body.include?("今すぐ実行")).to eq(false)
     expect(body.include?("ワーカー実行")).to eq(false)
+  end
+end
+
+test("task detail shows run error codes and outbound actions without resend") do |http:|
+  task = Task.create!(title: "OUT", status: "running")
+  task.task_runs.create!(provider: "muse", status: "failed",
+                         error_code: "provider_not_configured", error: "CLI がありません")
+  task.outbound_actions.create!(plugin: "github", operation: "reply",
+                                idempotency_key: "idem-1", status: "uncertain",
+                                error_code: "ambiguous_send", error: "結果不明")
+
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/tasks/#{task.id}"
+
+    expect(http.last_response.status).to eq(200)
+    body = http.last_response.body
+    expect(body.include?("provider_not_configured")).to eq(true)
+    expect(body.include?("未確定")).to eq(true)
+    expect(body.include?("uncertain")).to eq(true)
+    expect(body.include?("ambiguous_send")).to eq(true)
+    expect(body.include?("再送する")).to eq(false)
+    expect(body.include?("outbound")).to eq(false)
   end
 end
 

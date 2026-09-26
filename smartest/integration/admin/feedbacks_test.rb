@@ -15,6 +15,7 @@ test("feedback post stores information for Coordination") do |http:|
     expect(feedback.task_id).to eq(task.id)
     expect(feedback.body).to eq("来週までに")
     expect(feedback.author).to eq("運用者")
+    expect(feedback.author_type).to eq("human")
     expect(task.reload.status).to eq("inbox")
     expect(task.priority).to eq(2)
   end
@@ -30,6 +31,7 @@ test("feedback ignores smuggled state/priority/run payloads") do |http:|
         task_feedback: {
           body: "本文", author: "a",
           status: "done", priority: 999, task_id: other.id,
+          author_type: "system", suggested_priority: 999,
           processed_at: Time.utc(2026, 1, 1).iso8601
         },
         status: "done", priority: 999
@@ -38,6 +40,9 @@ test("feedback ignores smuggled state/priority/run payloads") do |http:|
     expect(http.last_response.status).to eq(302)
     feedback = TaskFeedback.last
     expect(feedback.task_id).to eq(task.id)
+    expect(feedback.author_type).to eq("human")
+    expect(feedback.suggested_priority).to eq(nil)
+    expect(feedback.processed_at).to eq(nil)
     expect(task.reload.status).to eq("inbox")
     expect(task.priority).to eq(2)
     expect(other.reload.status).to eq("ready")

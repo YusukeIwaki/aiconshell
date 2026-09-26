@@ -3,14 +3,14 @@
 日本語 server-rendered 管理画面。ERB + 自前 CSS のみ（外部フォント・CDN・JS 不使用）。
 
 - タスクボード (`/admin/tasks`)：状態別ボード
-- タスク詳細 (`/admin/tasks/:id`)：概要、フィードバック一覧・投稿、実行履歴
+- タスク詳細 (`/admin/tasks/:id`)：概要、フィードバック一覧・投稿、実行履歴、送信アクション
 - 層別 AI ポリシー (`/admin/layer_policies`)：provider/model/effort/指示 + 設定診断
 - プラグイン (`/admin/plugins`)：対応操作・必要 env 名・設定済み表示（値なし）
 - EventLog 検索 (`/admin/event_logs`)：層・種別・タスク・期間・キーワード
 
 ## 所有ファイル（このレーン）
 
-- `config/routes/admin.rb`（`draw(:admin)` で読み込む。`config/routes.rb` 自体は触らない）
+- `config/routes.rb` の `draw(:admin)` 1行 + `config/routes/admin.rb`（詳細定義）
 - `app/controllers/admin/*.rb`（`BaseController` + 5 画面 + 3 表示アダプタ）
 - `app/views/layouts/admin.html.erb`、`app/views/admin/**/*.erb`
 - `app/assets/stylesheets/admin.css`
@@ -19,23 +19,26 @@
 - `smartest/integration/admin/*_test.rb` + `support/admin_test_support.rb`
 - `docs/admin.md`（本書）
 
-## 統合に必要な他レーンの公開契約
+## 依存する公開契約（実レーン統合済み）
 
-管理画面は次の契約だけに依存する。いずれも `docs/architecture.md` の通り。
+管理画面は次の実契約に依存する。検証は実モデル・実ライブラリを相手に行う。
 
-- Issue #6（workflow）：`Task`（`title/description/status/priority/source_plugin/source_resource_id/next_action_at`、
-  `feedbacks` / `runs` 関連）、`TaskFeedback`（`task/body/author/processed_at`）、
-  `TaskRun`（`provider/model/effort/instructions/status/lease_token/lease_expires_at/result/error/started_at/finished_at`）、
-  `LayerPolicy`（`layer` 一意、`provider/model/effort/instructions/enabled`）。
-  フィードバックは `TaskFeedback` 行の作成のみで行い、タスク状態・優先度・run への直接更新はしない。
-- Issue #4（AI）：`Aiconshell::Ai::Registry.default` の `providers`（常に claude/codex/muse）、
-  `configured?(provider)`、`diagnose(provider)`。未ロード時は「診断不可」表示に縮退する。
-- Issue #3（plugins）：`Aiconshell::Plugins::Registry.default.catalog`
- （`id/operations/required_env/configured`、env は名前のみ）。未ロード・失敗時は行内通知に縮退する。
-- Issue #5（EventLog）：`EventLogging::Search.search`（なければ `Aiconshell::Observability.search`）。
+- workflow モデル：`Task`（`task_feedbacks` / `task_runs` / `outbound_actions` 関連）、
+  `TaskFeedback`（`body/author/author_type/suggested_priority/processed_at`）、
+  `TaskRun`（`provider/model/effort/instructions/status/error_code/error/...`）、
+  `LayerPolicy`（`layer` 一意、provider 必須）、
+  `OutboundAction`（`plugin/operation/status/error_code/attempts/...`）。
+  フィードバック投稿は人間限定（`author_type` を `"human"` に固定）で
+  `TaskFeedback` 行の作成のみ行い、タスク状態・優先度・run への直接更新はしない。
+  送信アクションは状態・エラーコードの表示のみで、再送操作は持たない。
+- AI ポート：`Aiconshell::Ai::Registry.default` の `providers`（常に claude/codex/muse）、
+  `configured?(provider)`、`diagnose(provider)`。診断は Web プロセス上の確認であり、
+  ワーカーでの利用可否を保証しない旨を画面に明示する。未ロード時は「診断不可」に縮退する。
+- plugins ポート：`Aiconshell::Plugins::Registry.default.catalog`
+ （`id/operations/required_env/configured`、env は名前のみ）。失敗時は行内通知に縮退する。
+- EventLog ポート：`EventLogging::Search.search`（実体は `Aiconshell::Observability.search`）。
   未設定・障害時は行内ステータスに縮退し、500 にしない。
-- Issue #2（foundation）：`config/routes.rb` の `draw` ブロック内に `draw(:admin)` の1行追加、
-  `ADMIN_USERNAME` / `ADMIN_PASSWORD` の運用設定（未設定は fail closed）。
+- foundation：`ADMIN_USERNAME` / `ADMIN_PASSWORD` の運用設定（未設定は fail closed）。
 
 表示アダプタ（`Admin::AiStatus` / `Admin::PluginStatus` / `Admin::EventLogSearch`）は
 上記への委譲とテスト用注入点のみを持ち、業務判断は一切行わない。
@@ -46,7 +49,8 @@
   CSRF は Rails 既定のまま（無効化しない）。
 - provider は claude/codex/muse を常に選択・保存可。未設定は診断バッジのみで保存成功し、
   未知 ID は 422 で拒否する。worker 直接実行ボタンは持たない。
-- 検索パラメータは層 allowlist・ bounded text・数値 task_id・厳密な時刻 parse・上限 clamp。
+- 検索パラメータは層 allowlist・bounded text・数値 task_id・厳密な時刻 parse・上限 clamp。
+  空の task_id・期間は `nil` に正規化して ClickHouseAdapter に渡す（文字列のまま渡さない）。
   sort/order パラメータは受け付けない。
 - 未信頼の本文・イベント・カタログ文言はすべて ERB 既定で escape して表示する。
   秘密値・資格情報は画面・エラーに出さない。
