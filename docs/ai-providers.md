@@ -168,9 +168,8 @@ result files, TERM→KILL with grandchild cleanup even after parent exit,
 spawn-failure FD cleanup, no shell interpolation). Login flows and billed
 AI executions are never triggered from tests.
 
-## Runtime dependencies (for the Rails lane)
+## Runtime dependencies
 
-This lane does not touch the `Gemfile` (owned by issue #2). The Ai port
-needs `json_schemer` (~> 2.5) at runtime and `smartest` (~> 0.6) for tests.
+The Ai port uses `json_schemer` (~> 2.5) at runtime and `smartest` (~> 0.6) for tests.
 Everything else is Ruby stdlib (`json`, `tmpdir`, `open3`-free spawn,
 `pathname`, `fileutils`).
