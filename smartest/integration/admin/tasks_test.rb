@@ -108,3 +108,111 @@ test("unknown task redirects to board") do |http:|
     expect(http.last_response.body.include?("タスクボード")).to eq(true)
   end
 end
+
+test("task detail exposes escaped work plan and structured result fields only") do |http:|
+  work_plan = "Confirm the fix\n<img src=x onerror=alert('plan')>"
+  outcome = "<script>alert('outcome')</script>"
+  summary = "The regression is fixed\n<script>alert('summary')</script>"
+  task = Task.create!(title: "レビュー対象", status: "waiting_review", work_plan: work_plan)
+  run = task.task_runs.create!(provider: "codex", status: "succeeded",
+                              instructions: "PRIVATE-PROMPT-MARKER",
+                              result: { "outcome" => outcome, "summary" => summary,
+                                        "stdout" => "PRIVATE-STDOUT-MARKER", "prompt" => "PRIVATE-RESULT-PROMPT" })
+
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/tasks/#{task.id}"
+    expect(http.last_response.status).to eq(200)
+    document = Nokogiri::HTML(http.last_response.body)
+    result = document.at_css("#run-result-#{run.id}")
+    expect(result.text.include?(outcome)).to eq(true)
+    expect(result.at_css(".admin-verbatim").text).to eq(summary)
+    plan = document.at_xpath("//tr[th[text()='作業計画']]/td/div")
+    expect(plan.text).to eq(work_plan)
+    expect(result.css("script, img").empty?).to eq(true)
+    expect(plan.css("script, img").empty?).to eq(true)
+    %w[PRIVATE-PROMPT-MARKER PRIVATE-STDOUT-MARKER PRIVATE-RESULT-PROMPT].each do |private_text|
+      expect(http.last_response.body.include?(private_text)).to eq(false)
+    end
+  end
+end
+
+test("task detail handles absent or malformed result fields without exposing arbitrary output") do |http:|
+  task = Task.create!(title: "結果待ち", status: "waiting_review")
+  nil_result = task.task_runs.create!(provider: "codex", status: "failed")
+  malformed = task.task_runs.create!(provider: "codex", status: "failed",
+                                    result: { "summary" => { "stdout" => "DO-NOT-RENDER" } })
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/tasks/#{task.id}"
+    expect(http.last_response.status).to eq(200)
+    document = Nokogiri::HTML(http.last_response.body)
+    [nil_result, malformed].each do |run|
+      expect(document.at_css("#run-result-#{run.id}").text.include?("構造化された実行結果はまだありません")).to eq(true)
+    end
+    expect(http.last_response.body.include?("DO-NOT-RENDER")).to eq(false)
+  end
+end
+
+test("board pagination reaches tasks beyond the former 200 row limit with stable ties") do |http:|
+  timestamp = Time.utc(2026, 1, 1)
+  ids = Task.insert_all!(205.times.map do |index|
+    { title: "履歴タスク #{index}", status: "done", priority: 4, created_at: timestamp, updated_at: timestamp }
+  end).rows.flatten
+
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/tasks", status: "done"
+    visited = []
+    5.times do |page|
+      expect(http.last_response.status).to eq(200)
+      document = Nokogiri::HTML(http.last_response.body)
+      links = document.css(".admin-task-card a")
+      expect(links.size).to eq(page == 4 ? 5 : 50)
+      visited.concat(links.map { |link| link["href"].split("/").last.to_i })
+      expect(document.at_css("[aria-current=page]").text).to eq("#{page + 1} / 5ページ")
+      next_page = document.at_css("a[rel=next]")
+      if page < 4
+        expect(next_page["href"].include?("status=done")).to eq(true)
+        http.get next_page["href"]
+      else
+        expect(next_page).to eq(nil)
+        expect(document.at_css("a[rel=prev]").nil?).to eq(false)
+      end
+    end
+    expect(visited).to eq(ids.reverse)
+    expect(visited.uniq.size).to eq(205)
+  end
+end
+
+test("board status filter excludes other states and keeps its selection") do |http:|
+  selected = Task.create!(title: "人間の確認を待つ", status: "waiting_human")
+  hidden = Task.create!(title: "すでに完了", status: "done", priority: 100)
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/tasks", status: "waiting_human"
+    document = Nokogiri::HTML(http.last_response.body)
+    expect(document.css(".admin-task-card a").map(&:text)).to eq([selected.title])
+    expect(http.last_response.body.include?(hidden.title)).to eq(false)
+    expect(document.at_css("select[name=status] option[selected]")["value"]).to eq("waiting_human")
+    expect(document.css(".admin-column").size).to eq(1)
+  end
+end
+
+test("board rejects malformed filters and page numbers safely and clamps pages beyond the end") do |http:|
+  timestamp = Time.utc(2026, 1, 1)
+  ids = Task.insert_all!(51.times.map do |index|
+    { title: "安全なページ #{index}", status: "inbox", priority: 0, created_at: timestamp, updated_at: timestamp }
+  end).rows.flatten
+  AdminTestSupport.as_admin(http) do
+    ["0", "-1", "abc", "1.5", "999999999999999999", ["2"], { "nested" => "2" }].each do |page|
+      http.get "/admin/tasks", page: page, status: "<script>invalid</script>"
+      expect(http.last_response.status).to eq(200)
+      document = Nokogiri::HTML(http.last_response.body)
+      expect(document.at_css("[aria-current=page]").text).to eq("1 / 2ページ")
+      expect(document.css(".admin-task-card a").map { |link| link["href"].split("/").last.to_i }).to eq(ids.reverse.first(50))
+      expect(http.last_response.body.include?("<script>invalid</script>")).to eq(false)
+    end
+    http.get "/admin/tasks", page: "999", status: ["inbox"]
+    document = Nokogiri::HTML(http.last_response.body)
+    expect(http.last_response.status).to eq(200)
+    expect(document.at_css("[aria-current=page]").text).to eq("2 / 2ページ")
+    expect(document.css(".admin-task-card a").map { |link| link["href"].split("/").last.to_i }).to eq([ids.first])
+  end
+end

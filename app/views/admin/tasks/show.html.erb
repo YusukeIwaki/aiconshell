@@ -8,6 +8,7 @@
       <tr><th>状態</th><td><span class="admin-badge admin-badge-idle"><%= task_status_label(@task.status) %></span>（<%= @task.status %>）</td></tr>
       <tr><th>優先度</th><td><%= @task.priority %></td></tr>
       <tr><th>説明</th><td><div class="admin-verbatim"><%= @task.description %></div></td></tr>
+      <tr><th>作業計画</th><td><div class="admin-verbatim"><%= @task.work_plan.presence || "未設定" %></div></td></tr>
       <tr><th>参照元</th><td><%= @task.source_plugin %> <%= @task.source_resource_id %></td></tr>
       <tr><th>次回予定</th><td><%= @task.next_action_at %></td></tr>
       <tr><th>更新日時</th><td><%= @task.updated_at %></td></tr>
@@ -69,6 +70,22 @@
           <td><%= run.finished_at %></td>
           <td><%= run.error_code %></td>
           <td><%= run.error %></td>
+        </tr>
+        <tr id="run-result-<%= run.id %>">
+          <td colspan="9">
+            <% result = run.result.is_a?(Hash) ? run.result : {} %>
+            <% if result["outcome"].is_a?(String) || result["summary"].is_a?(String) %>
+              <% if result["outcome"].is_a?(String) %>
+                <p><strong>結果（outcome）:</strong> <%= result["outcome"] %></p>
+              <% end %>
+              <% if result["summary"].is_a?(String) %>
+                <strong>実行内容の要約</strong>
+                <div class="admin-verbatim"><%= result["summary"] %></div>
+              <% end %>
+            <% else %>
+              <p>構造化された実行結果はまだありません。</p>
+            <% end %>
+          </td>
         </tr>
       <% end %>
     </table>
