@@ -13,8 +13,8 @@ class Task < ApplicationRecord
     "waiting_human" => %w[ready running cancelled],
     "waiting_review" => %w[ready running done failed cancelled],
     "failed" => %w[ready cancelled],
-    "done" => [],
-    "cancelled" => []
+    "done" => %w[inbox],
+    "cancelled" => %w[inbox]
   }.freeze
 
   OPEN_STATUSES = %w[inbox ready running waiting_human waiting_review failed].freeze
@@ -22,6 +22,8 @@ class Task < ApplicationRecord
   has_many :task_feedbacks, class_name: "TaskFeedback", dependent: :destroy
   has_many :task_runs, class_name: "TaskRun", dependent: :destroy
   has_many :outbound_actions, dependent: :nullify
+  has_many :external_events, dependent: :nullify
+  belongs_to :current_run, class_name: "TaskRun", optional: true
 
   validates :title, presence: true, length: { maximum: 500 }
   validates :status, inclusion: { in: STATUSES }

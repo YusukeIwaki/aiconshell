@@ -1,99 +1,69 @@
 # frozen_string_literal: true
 
-require "securerandom"
+require "json_schemer"
 
 module Coordination
-  # Applies structured worker results to tasks. Every completion is fenced by
-  # the run lease token: stale or duplicated completions are rejected and
-  # never overwrite newer state. Unknown tasks, runs, and transitions fail
-  # closed. Runs inside short row-locked transactions; no network/AI here.
   class CompletionService
     Result = Struct.new(:ok, :code, keyword_init: true)
-
     OUTCOMES = %w[done waiting_review waiting_human failed].freeze
+    RESULT_SCHEMA = {
+      "type" => "object", "additionalProperties" => false,
+      "properties" => {
+        "outcome" => { "type" => "string", "enum" => OUTCOMES },
+        "summary" => { "type" => "string", "minLength" => 1, "maxLength" => 8000 },
+        "reply_body" => { "type" => "string", "maxLength" => 4000 }
+      },
+      "required" => %w[outcome summary]
+    }.freeze
 
     def initialize(event_sink: WorkflowEvents, clock: Time)
       @event_sink = event_sink
       @clock = clock
     end
 
-    # @param result Hash with "outcome", "summary", optional "reply_body"
     def complete(run_id:, lease_token:, result:)
-      now = current_time
-      outcome = result.is_a?(Hash) ? (result["outcome"] || result[:outcome]).to_s : ""
-      unless OUTCOMES.include?(outcome)
-        return Result.new(ok: false, code: :unknown_outcome)
-      end
+      value = result.is_a?(Hash) ? result.deep_stringify_keys : result
+      return Result.new(ok: false, code: :invalid_result) unless JSONSchemer.schema(RESULT_SCHEMA).valid?(value)
 
-      TaskRun.transaction do
-        run = TaskRun.lock.find_by(id: run_id)
-        return Result.new(ok: false, code: :unknown_run) if run.nil?
-        return Result.new(ok: false, code: :stale_completion) unless run.lease_token == lease_token
-        return Result.new(ok: false, code: :stale_completion) if run.terminal?
+      TaskRun.with_task_lock(run_id) do |run, task|
+        next Result.new(ok: false, code: :unknown_run) unless run && task
+        now = current_time
+        next Result.new(ok: false, code: :stale_completion) unless run.live_lease?(task, lease_token, now)
 
-        run.task.with_lock do
-          task = run.task
-          unless task.transition_allowed?(outcome) || task.status == outcome
-            run.update!(status: "failed", error: "transition #{task.status}->#{outcome} rejected",
-                        error_code: "transition_rejected", finished_at: now)
-            return Result.new(ok: false, code: :transition_rejected)
-          end
-
-          run.update!(status: outcome == "failed" ? "failed" : "succeeded",
-                      result: result.is_a?(Hash) ? result : { "summary" => result.to_s },
-                      error: nil, error_code: nil, finished_at: now)
-          task.transition_to!(outcome) if task.status != outcome
-          task.update!(last_error: nil, next_action_at: nil)
-          create_reply(task, result) if reply_requested?(result)
-          @event_sink.emit(layer: "coordination", kind: "run.completed",
-                           message: "Run #{run.id} completed as #{outcome}",
-                           task_id: task.id, data: { run_id: run.id, outcome: outcome })
-          Result.new(ok: true, code: :ok)
-        end
+        outcome = value.fetch("outcome")
+        run.update!(status: outcome == "failed" ? "failed" : "succeeded", result: value,
+                    error: nil, error_code: nil, finished_at: now)
+        task.transition_to!(outcome, current_run_id: nil, last_error: nil, next_action_at: nil)
+        create_reply(task, run, value["reply_body"])
+        @event_sink.emit(layer: "coordination", kind: "run.completed", message: "Execution completed",
+                         task_id: task.id, data: { run_id: run.id, outcome: outcome })
+        Result.new(ok: true, code: :ok)
       end
     end
 
-    # Records a structured execution failure (including unconfigured
-    # providers) against the run and parks the task as failed/visible.
     def fail_run(run_id:, lease_token:, error_code:, error:)
-      now = current_time
-      TaskRun.transaction do
-        run = TaskRun.lock.find_by(id: run_id)
-        return Result.new(ok: false, code: :unknown_run) if run.nil?
-        return Result.new(ok: false, code: :stale_completion) unless run.lease_token == lease_token
-        return Result.new(ok: false, code: :stale_completion) if run.terminal?
+      TaskRun.with_task_lock(run_id) do |run, task|
+        next Result.new(ok: false, code: :unknown_run) unless run && task
+        now = current_time
+        next Result.new(ok: false, code: :stale_completion) unless run.live_lease?(task, lease_token, now)
 
-        run.task.with_lock do
-          task = run.task
-          run.update!(status: "failed", error: error.to_s[0, 2000],
-                      error_code: error_code.to_s, finished_at: now)
-          if task.transition_allowed?("failed")
-            task.transition_to!("failed")
-          end
-          task.update!(last_error: error.to_s[0, 2000], next_action_at: now + 3600)
-          @event_sink.emit(layer: "coordination", kind: "run.failed",
-                           message: "Run #{run.id} failed (#{error_code})",
-                           task_id: task.id, data: { run_id: run.id, error_code: error_code.to_s })
-          Result.new(ok: true, code: :ok)
-        end
+        run.update!(status: "failed", error: error.to_s[0, 2000], error_code: error_code.to_s, finished_at: now)
+        task.transition_to!("failed", current_run_id: nil, last_error: error.to_s[0, 2000], next_action_at: now + 3600)
+        @event_sink.emit(layer: "coordination", kind: "run.failed", message: "Execution failed",
+                         task_id: task.id, data: { run_id: run.id, error_code: error_code.to_s })
+        Result.new(ok: true, code: :ok)
       end
     end
 
     private
 
-    def reply_requested?(result)
-      body = result["reply_body"] || result[:reply_body]
-      body.is_a?(String) && !body.strip.empty?
-    end
+    def create_reply(task, run, body)
+      return if body.to_s.strip.empty? || task.source_plugin.blank? || task.source_resource_id.blank?
 
-    def create_reply(task, result)
-      body = (result["reply_body"] || result[:reply_body]).to_s
       OutboundAction.create!(
         plugin: task.source_plugin, operation: "reply",
-        input: { "resource_id" => task.source_resource_id, "body" => body[0, 4000],
-                 "scope" => task.source_resource_id },
-        idempotency_key: "completion-#{task.id}-#{SecureRandom.uuid}",
-        status: "pending", task: task
+        input: { "resource_id" => task.source_resource_id, "body" => body },
+        idempotency_key: "completion-#{run.id}", status: "pending", task: task
       )
     end
 

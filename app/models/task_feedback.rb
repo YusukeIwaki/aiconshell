@@ -6,7 +6,7 @@ class TaskFeedback < ApplicationRecord
   belongs_to :task
 
   validates :body, presence: true
-  validates :author_type, inclusion: { in: %w[human bot system] }
+  validates :author_type, inclusion: { in: %w[human] }
   validates :suggested_priority, numericality: { only_integer: true, allow_nil: true }
 
   scope :unprocessed, -> { where(processed_at: nil) }
