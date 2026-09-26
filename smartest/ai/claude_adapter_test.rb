@@ -20,16 +20,23 @@ test("claude builds a print-mode argv array with inline JSON schema") do
   expect(argv[0..3]).to eq(["/bin/claude", "-p", "--output-format", "json"])
   index = argv.index("--json-schema")
   expect(JSON.parse(argv[index + 1])).to eq(AiTestSupport::SCHEMA)
-  expect(argv.last).to eq("summarize")
-  expect(invocation[:stdin_data]).to be_nil
+  expect(invocation[:stdin_data]).to eq("summarize")
+  expect(argv.any? { |element| element.include?("summarize") }).to eq(false)
   expect(argv.all?(String)).to eq(true)
 end
 
-test("claude keeps hostile prompt text as one argv element without interpolation") do
+test("claude delivers hostile prompt text over stdin, never argv") do
   prompt = "do $(rm -rf /) `evil` ; --model hacked"
-  argv = claude_invocation(prompt: prompt)[:argv]
-  expect(argv.last).to eq(prompt)
-  expect(argv.count(prompt)).to eq(1)
+  invocation = claude_invocation(prompt: prompt)
+  expect(invocation[:stdin_data]).to eq(prompt)
+  expect(invocation[:argv].count(prompt)).to eq(0)
+end
+
+test("claude delivers dash-leading prompts over stdin without flag confusion") do
+  prompt = "-p --model hacked --output-format text"
+  invocation = claude_invocation(prompt: prompt)
+  expect(invocation[:stdin_data]).to eq(prompt)
+  expect(invocation[:argv].any? { |element| element.include?("hacked") }).to eq(false)
 end
 
 test("claude disables all tools for interaction and coordination layers") do
@@ -40,10 +47,14 @@ test("claude disables all tools for interaction and coordination layers") do
     expect(argv).to include("--permission-mode")
     expect(argv[argv.index("--permission-mode") + 1]).to eq("plan")
     expect(argv).to include("--permission-prompts")
+    expect(argv).to include("--strict-mcp-config")
+    expect(argv).to include("--disable-slash-commands")
+    # Strict with no --mcp-config means no MCP server can load.
+    expect(argv.include?("--mcp-config")).to eq(false)
   end
 end
 
-test("claude confines the execution layer to workspace file tools") do
+test("claude grants the execution layer workspace file tools") do
   argv = claude_invocation(layer: "execution", workspace: "/tmp/ws")[:argv]
   expect(argv[argv.index("--tools") + 1]).to eq("Read,Edit,Write,Glob,Grep,Bash")
   expect(argv[argv.index("--permission-mode") + 1]).to eq("acceptEdits")
@@ -76,7 +87,7 @@ test("claude treats success without structured_output as invalid") do
   end.to raise_error(Ai::InvalidOutput)
 end
 
-test("claude maps error subtypes to ExecutionFailed with redacted excerpt") do
+test("claude maps error subtypes to ExecutionFailed with kind only") do
   stdout = AiTestSupport.claude_error_stdout(errors: ["rate limit reached, try again later"])
   begin
     Ai::ClaudeAdapter.parse_output(stdout: stdout, stderr: "", exit_status: 0, files: {}, config: Ai::Config.new)
@@ -96,7 +107,8 @@ test("claude classifies auth failures on non-zero exit") do
     raise "expected ExecutionFailed"
   rescue Ai::ExecutionFailed => error
     expect(error.kind).to eq(:auth)
-    expect(error.excerpt.include?("Not logged in")).to eq(true)
+    expect(error.message).to eq('AI provider "claude" failed (exit=1, kind=auth)')
+    expect(error.respond_to?(:excerpt)).to eq(false)
   end
 end
 

@@ -39,6 +39,10 @@ module Aiconshell
                  "-C", workspace,
                  "--output-schema", files.fetch(:schema_file),
                  "--output-last-message", files.fetch(:output_file)]
+          # Read-only layers ignore inherited user config and user/project
+          # execpolicy rules. Never --approve-for-me (it re-reviews through
+          # a workspace-write sandbox) nor the dangerously-bypass flags.
+          argv += ["--ignore-user-config", "--ignore-rules"] unless execution_layer?(layer)
           argv += ["-m", model] if model
           # Effort is allow-listed above, so embedding it in the TOML
           # key=value override cannot break out of the quoted string.
@@ -49,12 +53,18 @@ module Aiconshell
 
         def parse_output(stdout:, stderr:, exit_status:, files:, config:)
           check_exit!(stdout: stdout, stderr: stderr, exit_status: exit_status, config: config)
-          content = read_output_file!(files[:output_file], "codex last message")
+          content = read_output_file!(
+            files[:output_file], "codex last message", max_bytes: config.max_output_bytes
+          )
           parse_json_object!(content, "codex last message")
         end
 
         private
 
+        # Codex documents --sandbox as the policy for model-generated
+        # *shell commands*. It is CLI policy, not OS confinement: the
+        # container / trusted-worker boundary is the real isolation (see
+        # docs/ai-providers.md).
         def sandbox_mode(layer)
           execution_layer?(layer) ? "workspace-write" : "read-only"
         end

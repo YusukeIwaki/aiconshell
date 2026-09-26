@@ -4,7 +4,7 @@ module Aiconshell
   module Ai
     # Muse Code subscription CLI adapter.
     #
-    # Verified against `muse exec --help` (Muse Code 1.3.0) plus offline
+    # Verified against `muse exec --help` (Muse Code 1.4.0) plus offline
     # `--provider echo` probes (no login, no billed calls):
     #   muse exec --json --output-schema <file> --prompt-file <file> \
     #     --workspace <dir> --model <id> --reasoning-effort <effort>
@@ -40,7 +40,19 @@ module Aiconshell
                  "--workspace", workspace,
                  "--model", model || config.muse_default_model,
                  "--reasoning-effort", effort || config.muse_default_effort]
-          argv += ["--disable-write", "--disable-shell", "--disable-web-tools"] unless execution_layer?(layer)
+          # Headless runs must never wait on a prompt: auto-cancel instead.
+          # Approval and the sandbox stay ON (their defaults); --yolo,
+          # --disable-approval, --disable-sandbox and --trust-workspace are
+          # never passed, and --allow-workspace-switch is never passed so
+          # the workspace stays pinned.
+          argv << "--user-input-auto-resolve"
+          unless execution_layer?(layer)
+            # Read-only layers have nothing legitimate to approve (writes,
+            # shell and web tools are hard-disabled), so approval prompts
+            # are switched off and foreign personal rules/skills excluded.
+            argv += ["--disable-write", "--disable-shell", "--disable-web-tools",
+                    "--approval-mode", "never", "--no-foreign-personal-context"]
+          end
           argv << "--no-session-log"
           { argv: argv, stdin_data: nil }
         end
@@ -56,9 +68,7 @@ module Aiconshell
             reason = payload["reason"].to_s
             reason = stderr.to_s if reason.strip.empty?
             raise ExecutionFailed.new(
-              id, exit_status: exit_status,
-              kind: Redactor.failure_kind(reason),
-              excerpt: Redactor.excerpt(reason, max_chars: config.error_excerpt_chars)
+              id, exit_status: exit_status, kind: Redactor.failure_kind(reason)
             )
           end
 

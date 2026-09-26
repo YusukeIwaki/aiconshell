@@ -31,7 +31,8 @@ test("runner executes claude and returns the validated answer") do
     expect(call[:cwd]).to eq(workspace)
     expect(call[:timeout]).to eq(30)
     expect(call[:argv][0].end_with?("/bin/claude")).to eq(true)
-    expect(call[:argv].last).to eq("say hi")
+    expect(call[:stdin_data]).to eq("say hi")
+    expect(call[:argv].any? { |element| element.include?("say hi") }).to eq(false)
   end
 end
 
@@ -123,7 +124,7 @@ test("runner maps timeouts and failures without leaking stdout") do
       raise "expected ExecutionFailed"
     rescue Ai::ExecutionFailed => error
       expect(error.exit_status).to eq(3)
-      expect(error.excerpt.length <= 520).to eq(true)
+      expect(error.message).to eq('AI provider "claude" failed (exit=3, kind=generic)')
     end
   end
 end
@@ -177,6 +178,12 @@ test("runner refuses workspaces that overlap auth locations or do not exist") do
     nested = File.join(config.codex_home, "nested")
     FileUtils.mkdir_p(nested)
     expect { runner.call(**base.merge(workspace: nested)) }.to raise_error(ArgumentError)
+    link = File.join(root, "evil-ws")
+    File.symlink(config.codex_home, link)
+    expect { runner.call(**base.merge(workspace: link)) }.to raise_error(ArgumentError)
+    parent_link = File.join(root, "evil-parent")
+    File.symlink(File.join(root, "homes"), parent_link)
+    expect { runner.call(**base.merge(workspace: parent_link)) }.to raise_error(ArgumentError)
   end
 end
 

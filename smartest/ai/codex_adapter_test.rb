@@ -41,6 +41,10 @@ test("codex sandboxes non-execution layers read-only") do
   %w[interaction coordination].each do |layer|
     argv = codex_invocation(layer: layer)[:argv]
     expect(argv[argv.index("--sandbox") + 1]).to eq("read-only")
+    expect(argv).to include("--ignore-user-config")
+    expect(argv).to include("--ignore-rules")
+    expect(argv.include?("--approve-for-me")).to eq(false)
+    expect(argv.include?("--dangerously-bypass-approvals-and-sandbox")).to eq(false)
   end
   argv = codex_invocation(layer: "execution")[:argv]
   expect(argv[argv.index("--sandbox") + 1]).to eq("workspace-write")
@@ -87,6 +91,20 @@ test("codex treats missing, empty or invalid message files as invalid output") d
     expect do
       Ai::CodexAdapter.parse_output(stdout: "", stderr: "", exit_status: 0, files: { output_file: broken }, config: config)
     end.to raise_error(Ai::InvalidOutput)
+  end
+end
+
+test("codex rejects oversized message files without loading them fully") do
+  config = Ai::Config.new(max_output_bytes: 100)
+  AiTestSupport.with_tmpdir do |root|
+    huge = File.join(root, "huge.txt")
+    File.write(huge, %({"answer": "#{"y" * 10_000}"}))
+    begin
+      Ai::CodexAdapter.parse_output(stdout: "", stderr: "", exit_status: 0, files: { output_file: huge }, config: config)
+      raise "expected InvalidOutput"
+    rescue Ai::InvalidOutput => error
+      expect(error.message).to eq('AI provider "codex" returned invalid output: codex last message exceeded 100 bytes')
+    end
   end
 end
 
