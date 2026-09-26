@@ -59,6 +59,8 @@ test("muse never waits on prompts and never disables the sandbox") do
   %w[interaction coordination execution].each do |layer|
     argv = muse_invocation(layer: layer)[:argv]
     expect(argv).to include("--user-input-auto-resolve")
+    expect(argv[argv.index("--approval-mode") + 1]).to eq("never")
+    expect(argv).to include("--no-foreign-personal-context")
     expect(argv.include?("--yolo")).to eq(false)
     expect(argv.include?("--disable-approval")).to eq(false)
     expect(argv.include?("--disable-sandbox")).to eq(false)

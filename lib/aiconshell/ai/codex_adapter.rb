@@ -39,14 +39,16 @@ module Aiconshell
                  "-C", workspace,
                  "--output-schema", files.fetch(:schema_file),
                  "--output-last-message", files.fetch(:output_file)]
-          # Read-only layers ignore inherited user config and user/project
+          # All layers ignore inherited user config and user/project
           # execpolicy rules. Never --approve-for-me (it re-reviews through
           # a workspace-write sandbox) nor the dangerously-bypass flags.
-          argv += ["--ignore-user-config", "--ignore-rules"] unless execution_layer?(layer)
+          argv += ["--ignore-user-config", "--ignore-rules"]
           argv += ["-m", model] if model
           # Effort is allow-listed above, so embedding it in the TOML
           # key=value override cannot break out of the quoted string.
           argv += ["-c", "model_reasoning_effort=\"#{effort}\""] if effort
+          # Enforce subscription login even if a mounted auth cache came from API login.
+          argv += ["-c", 'forced_login_method="chatgpt"']
           argv << "-"
           { argv: argv, stdin_data: prompt_document(prompt: prompt, instructions: instructions) }
         end

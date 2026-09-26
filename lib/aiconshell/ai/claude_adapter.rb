@@ -34,6 +34,7 @@ module Aiconshell
           argv += ["--model", model] if model
           argv += ["--effort", effort] if effort
           argv += ["--system-prompt", instructions] if instructions && !instructions.strip.empty?
+          argv += ["--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"]
           argv += layer_flags(workspace, layer)
           argv += ["--permission-prompts", "none", "--no-session-persistence"]
           { argv: argv, stdin_data: prompt }
@@ -63,18 +64,18 @@ module Aiconshell
         # --strict-mcp-config (no --mcp-config is ever passed, so no MCP
         # server loads) and --disable-slash-commands (no skills). This is
         # CLI policy, not OS confinement: see docs/ai-providers.md.
-        # Execution keeps file tools plus Bash; acceptEdits auto-approves
+        # Execution allows file tools plus Bash for unattended work; acceptEdits auto-approves
         # workspace edits while anything that would prompt is denied
         # (--permission-prompts none). --add-dir *grants* tool access to
         # the workspace; it does not confine Bash/Read to it.
         def layer_flags(workspace, layer)
           if execution_layer?(layer)
             ["--tools", "Read,Edit,Write,Glob,Grep,Bash",
+             "--allowedTools", "Read,Edit,Write,Glob,Grep,Bash",
              "--permission-mode", "acceptEdits",
              "--add-dir", workspace]
           else
-            ["--tools", "", "--permission-mode", "plan",
-             "--strict-mcp-config", "--disable-slash-commands"]
+            ["--tools", "", "--permission-mode", "plan"]
           end
         end
 

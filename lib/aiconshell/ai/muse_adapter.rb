@@ -40,18 +40,13 @@ module Aiconshell
                  "--workspace", workspace,
                  "--model", model || config.muse_default_model,
                  "--reasoning-effort", effort || config.muse_default_effort]
-          # Headless runs must never wait on a prompt: auto-cancel instead.
-          # Approval and the sandbox stay ON (their defaults); --yolo,
-          # --disable-approval, --disable-sandbox and --trust-workspace are
-          # never passed, and --allow-workspace-switch is never passed so
-          # the workspace stays pinned.
-          argv << "--user-input-auto-resolve"
+          # User-input cancellation and tool approval are separate settings.
+          # Both must be noninteractive, including execution. The sandbox
+          # remains enabled and foreign personal capabilities are excluded.
+          argv += ["--user-input-auto-resolve", "--approval-mode", "never",
+                   "--no-foreign-personal-context"]
           unless execution_layer?(layer)
-            # Read-only layers have nothing legitimate to approve (writes,
-            # shell and web tools are hard-disabled), so approval prompts
-            # are switched off and foreign personal rules/skills excluded.
-            argv += ["--disable-write", "--disable-shell", "--disable-web-tools",
-                    "--approval-mode", "never", "--no-foreign-personal-context"]
+            argv += ["--disable-write", "--disable-shell", "--disable-web-tools"]
           end
           argv << "--no-session-log"
           { argv: argv, stdin_data: nil }

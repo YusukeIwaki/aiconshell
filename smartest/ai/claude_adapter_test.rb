@@ -121,3 +121,15 @@ test("claude rejects truncated and non-JSON stdout") do
     Ai::ClaudeAdapter.parse_output(stdout: "[1,2]", stderr: "", exit_status: 0, files: {}, config: config)
   end.to raise_error(Ai::InvalidOutput)
 end
+
+
+test("claude excludes inherited settings and connectors in all layers") do
+  %w[interaction coordination execution].each do |layer|
+    argv = claude_invocation(layer: layer)[:argv]
+    expect(argv[argv.index("--setting-sources") + 1]).to eq("")
+    expect(argv).to include("--strict-mcp-config")
+    expect(argv).to include("--disable-slash-commands")
+  end
+  argv = claude_invocation(layer: "execution")[:argv]
+  expect(argv[argv.index("--allowedTools") + 1]).to eq("Read,Edit,Write,Glob,Grep,Bash")
+end

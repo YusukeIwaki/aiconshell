@@ -32,26 +32,27 @@ runtime failure (`ExecutionFailed` with `kind` `:auth` or `:usage_limit`).
 
 Layer CLI policy (not OS confinement — see Boundary below):
 
-- `interaction` / `coordination` (read-only intent): Claude runs with
-  `--tools ""`, plan mode, `--strict-mcp-config` (no `--mcp-config` is
-  passed, so no MCP server loads) and `--disable-slash-commands` (no
-  skills); Codex with `--sandbox read-only`, `--ignore-user-config` and
-  `--ignore-rules`; Muse with `--disable-write --disable-shell
-  --disable-web-tools --approval-mode never --no-foreign-personal-context`.
-- `execution`: Claude keeps workspace file tools with `acceptEdits`;
-  Codex uses `--sandbox workspace-write`; Muse runs without the disable
-  flags. All layers deny anything that would prompt (Claude
-  `--permission-prompts none`; Codex `exec` is non-interactive by design
-  and the bypass flags are never passed; Muse
-  `--user-input-auto-resolve` with approval and sandbox left ON).
+- Every layer suppresses inherited connector/settings configuration: Claude uses
+  `--setting-sources "" --strict-mcp-config --disable-slash-commands`; Codex uses
+  `--ignore-user-config --ignore-rules`; Muse excludes foreign personal context.
+- Codex additionally sets `forced_login_method="chatgpt"`, so a mounted API-login
+  cache cannot select API-key billing. See the [official configuration reference](https://developers.openai.com/ja-JP/docs/config-file/config-reference).
+- `interaction` / `coordination`: Claude has no tools, Codex uses its read-only
+  sandbox, and Muse disables writes, shell, and web tools.
+- `execution`: Claude explicitly allows Read/Edit/Write/Glob/Grep/Bash, Codex
+  uses its workspace-write sandbox, and Muse retains its default sandbox.
+- All layers run without approval prompts: Claude uses `--permission-prompts none`,
+  Codex `exec` is noninteractive, and Muse uses both `--approval-mode never` and
+  `--user-input-auto-resolve`. The latter only cancels model questions; it is not
+  a substitute for the separate tool-approval mode.
 
 Boundary: CLI flags are policy requests to a subprocess, not a sandbox.
 `cwd`/`--add-dir`/`-C`/`--workspace` choose working roots — `--add-dir`
 *grants* tool access to a directory, it does not confine Bash/Read to the
 workspace — and Codex documents `--sandbox` as the policy for
 model-generated shell commands only. The real isolation boundary is the
-container / trusted-worker deployment: run CLIs in the execution worker
-with a dedicated workspace directory, provider volumes mounted only there,
+container / trusted-worker deployment: run CLIs in the control and execution
+workers with dedicated workspace directories and private provider volumes,
 and no secrets in the child environment. The Ruby path guard rejects
 workspaces that overlap provider auth locations (symlinks resolved) and
 relative paths, but it does not sandbox the CLI and does not scan for
@@ -99,7 +100,7 @@ persist only the resulting credential directories:
 
 | Provider | Login | Credential home (presence-checked) | Child env override |
 | --- | --- | --- | --- |
-| Claude Code | interactive `claude` login or `claude setup-token` | `~/.claude` (`CLAUDE_CONFIG_DIR`, `AICONSHELL_CLAUDE_HOME`) | `CLAUDE_CONFIG_DIR` |
+| Claude Code | interactive `claude` subscription login | `~/.claude` (`CLAUDE_CONFIG_DIR`, `AICONSHELL_CLAUDE_HOME`) | `CLAUDE_CONFIG_DIR` |
 | Codex | `codex login` | `~/.codex` (`CODEX_HOME`, `AICONSHELL_CODEX_HOME`) | `CODEX_HOME` |
 | Muse Code | `muse login` | `<xdg>/muse` (`AICONSHELL_MUSE_HOME`, else `XDG_CONFIG_HOME`, else `~/.config`) | `XDG_CONFIG_HOME` + `MUSE_AUTH_PATH=<xdg>/muse/auth.json` |
 
@@ -117,8 +118,9 @@ Token refresh is left to the CLIs themselves: keep the credential homes on
 persistent volumes so refresh writes survive restarts. The Rails lane must
 mount one private volume per provider (e.g. `/private/ai/claude`,
 `/private/ai/codex`, `/private/ai/muse-xdg`) and point the `AICONSHELL_*`
-overrides at them. The volumes must not be readable from the web/control
-containers — only execution workers need them.
+overrides at them. The volumes are mounted in control and execution workers, since all three
+layers can use AI. Web does not need them; its presence diagnostic is local to
+the Web process and does not establish worker readiness.
 
 Muse layout note: `AICONSHELL_MUSE_HOME` is the XDG config home itself (the
 directory *containing* `muse/`), not the `muse/` directory. The volume must
@@ -136,20 +138,12 @@ never copied into the repo.
 
 ## Railway and Compose
 
-Railway has no preinstalled AI CLIs; install pinned versions in the
-execution-worker image (example shape, pin to the versions above):
-
-```dockerfile
-# Claude Code (npm), Codex (npm), Muse (vendor channel)
-RUN npm install -g @anthropic-ai/claude-code@2.1.280 @openai/codex@0.155.1 \
- && curl -fsSL https://vendor.example.com/muse-1.4.0 -o /usr/local/bin/muse \
- && chmod +x /usr/local/bin/muse
-```
-
-Then attach the three private volumes and set the home overrides plus
-`AICONSHELL_AI_HOME` (neutral child `HOME`). Compose mirrors the same
-split: `web` / `control-worker` / `execution-worker` / `postgres` /
-`clickhouse`, with provider volumes mounted only into `execution-worker`.
+Use the repository's optional Docker `ai` target for **both control and execution**
+workers. It installs pinned Claude/Codex versions. Muse requires an authorized
+Linux executable supplied at build time; do not copy a macOS binary or auth cache
+into the image. See [deployment.md](deployment.md) for the tested build, volume,
+and login commands. Keep subscription credential volumes writable for refresh.
+No real subscription login or billed model call is part of the automated tests.
 
 ## Failure modes
 

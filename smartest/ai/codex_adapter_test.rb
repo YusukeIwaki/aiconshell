@@ -123,3 +123,13 @@ test("codex classifies usage-limit and auth failures from stderr") do
     expect(error.kind).to eq(:auth)
   end
 end
+
+
+test("codex uses subscription authentication without inherited tools in every layer") do
+  %w[interaction coordination execution].each do |layer|
+    argv = codex_invocation(layer: layer)[:argv]
+    expect(argv).to include('forced_login_method="chatgpt"')
+    expect(argv).to include("--ignore-user-config")
+    expect(argv).to include("--ignore-rules")
+  end
+end
