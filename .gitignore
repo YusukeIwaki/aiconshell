@@ -35,6 +35,9 @@ pickle-email-*.html
 /.env*
 !/.env.example
 
+# Ignore the local compose override (operator credential mounts, ports).
+/compose.override.yml
+
 # Ignore compiled assets.
 /public/assets
 /app/assets/builds/*

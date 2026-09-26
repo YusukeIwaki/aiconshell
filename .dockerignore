@@ -2,6 +2,7 @@
 
 # Ignore git directory.
 /.git/
+.gitignore
 /.gitignore
 
 # Ignore bundler config.
@@ -42,3 +43,27 @@
 # Ignore Docker-related files
 /.dockerignore
 /Dockerfile*
+
+# Ignore compose / deploy configs (ops wiring, not app code).
+/compose*.yml
+/compose*.yaml
+/railway*.toml
+/railway*.json
+
+# Ignore CI, docs, and tests: they must not bloat the runtime image.
+/.github/
+*.md
+**/*.md
+/smartest/
+/coverage/
+
+# Ignore operator-supplied AI CLI material and local auth caches. The Muse
+# binary enters the `ai` image only via `--secret id=muse_cli` (the build
+# then copies it into /usr/local/bin/muse intentionally; only the secret
+# mount itself leaves no layer behind). Subscription auth arrives only via
+# mounted volumes, never via the build context.
+/vendor/muse-cli/
+/.claude/
+/.codex/
+/.muse/
+.ngrok/

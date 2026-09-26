@@ -1,0 +1,19 @@
+# Solid Queue supervisor config for the CONTROL worker (compose `control`
+# service, Railway control service).
+#
+# Runs dispatchers, the recurring scheduler, and workers bound to the
+# `control` queue only: interaction polling, coordination dispatch, outbound
+# delivery, and EventLog outbox draining. Never executes `execution` jobs.
+#
+# Flat (no per-env keys): SolidQueue::Configuration#config_from uses the whole
+# file when no Rails.env key matches, so one file serves every environment.
+# The default config/queue.yml (all queues) stays for `bin/jobs` without args
+# in local development.
+dispatchers:
+  - polling_interval: 1
+    batch_size: 500
+workers:
+  - queues: control
+    threads: 3
+    processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+    polling_interval: 1

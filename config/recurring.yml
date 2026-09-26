@@ -1,15 +1,52 @@
-# examples:
-#   periodic_cleanup:
-#     class: CleanSoftDeletedRecordsJob
-#     queue: background
-#     args: [ 1000, { batch_size: 500 } ]
-#     schedule: every hour
-#   periodic_cleanup_with_command:
-#     command: "SoftDeletedRecord.due.delete_all"
-#     priority: 2
-#     schedule: at 5am every day
+# Solid Queue recurring tasks (see docs/deployment.md "Recurring jobs").
+#
+# Only the control worker runs the scheduler: it starts with
+# `--config-file=config/queue_control.yml` and no `--skip-recurring`, while
+# the execution worker passes `--skip-recurring` (see compose.yml and
+# docs/deployment.md). Every task below targets queue `control`, which the
+# control worker owns. The hourly cleanup needs the explicit queue as well:
+# without it the cleanup command would land on
+# SolidQueue::RecurringJob's default `solid_queue_recurring` queue, which
+# no worker listens on.
+#
+# Development and production share one schedule (single anchor below). Test
+# intentionally has no section: suites enqueue jobs explicitly and must
+# never auto-schedule.
+#
+# Name/schedule contract (checked by `ruby bin/check-compose`):
+# - IntegrationPollScheduleJob takes no arguments and runs every 5 minutes.
+# - CoordinationTriageJob, LeaseRecoveryJob, WorkflowMaintenanceJob, and
+#   EventLogDeliveryJob run every minute with job-side defaults.
+# - The finished-jobs cleanup keeps its historical hourly slot.
 
-production:
+shared: &shared
+  integration_poll_schedule:
+    class: IntegrationPollScheduleJob
+    queue: control
+    schedule: every 5 minutes
+  coordination_triage:
+    class: CoordinationTriageJob
+    queue: control
+    schedule: every minute
+  lease_recovery:
+    class: LeaseRecoveryJob
+    queue: control
+    schedule: every minute
+  workflow_maintenance:
+    class: WorkflowMaintenanceJob
+    queue: control
+    schedule: every minute
+  event_log_delivery:
+    class: EventLogDeliveryJob
+    queue: control
+    schedule: every minute
   clear_solid_queue_finished_jobs:
     command: "SolidQueue::Job.clear_finished_in_batches(sleep_between_batches: 0.3)"
+    queue: control
     schedule: every hour at minute 12
+
+development:
+  <<: *shared
+
+production:
+  <<: *shared

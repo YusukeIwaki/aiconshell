@@ -1,0 +1,535 @@
+# デプロイ・運用手順
+
+ローカル Compose と Railway で同じ分割（web / control worker / execution
+worker / PostgreSQL / ClickHouse）を使うための手順書。全体設計は
+[docs/architecture.md](architecture.md) を参照。
+
+## 1. 構成
+
+| サービス | 役割 | キュー | 環境変数 |
+| --- | --- | --- | --- |
+| `web` | 管理画面 | — | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報 |
+| `control` | ポーリング・振分・配信・定期実行・coordination AI | `control` のみ | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報・自アクタ・AI auth |
+| `execution` | AI CLI 実行（隔離 workspace） | `execution` のみ | DB・ワークフロー設定・EventLog 既定チャネル・AI auth のみ |
+| `migrate` | SQL マイグレーション専用（使い捨て） | — | DB・ワークフロー設定・EventLog 既定チャネル |
+| `clickhouse-init` | ClickHouse スキーマ適用（使い捨て・独立） | — | ClickHouse のみ |
+| `db` | PostgreSQL 17（Solid Queue 同居） | — | — |
+| `clickhouse` | EventLog 検索（26.8 系） | — | — |
+| `ngrok` | 任意トンネル（profile 加入時のみ） | — | トークンのみ |
+
+境界の要点:
+
+- Web と両 worker は**同一 `DATABASE_URL`**（1 DB・キュー分離）。
+  キュー分離は `config/queue_control.yml` /
+  `config/queue_execution.yml` + `--config-file` で行う（Solid Queue の CLI
+  に `--queues` は無い）。定期実行スケジューラは control のみ
+  （execution は `--skip-recurring`）。実際の `queue_as` 宣言と一致:
+  control 系 job（poll / triage / outbound / lease 回復 / EventLog 配信 /
+  maintenance）は `:control`、実行 job は `:execution`。
+- `execution` に GitHub / Jira / Teams / ClickHouse の資格情報を渡さない。
+  `bin/check-compose` が compose 上で検証し、AI 層
+  （`lib/aiconshell/ai/child_env.rb`）が子プロセスにも継承させない。
+  `EVENT_LOG_TEAMS_CHANNEL`（既定チャネル名。空が既定）は資格情報では
+  ないため全 Rails プロセスに渡す。`TEAMS_BOT_TARGETS_FILE` はパス指定
+  のみ web・control に渡し、実ファイルは運営者が read-only マウントする
+  （「6. 資格情報ファイルのマウント」参照）。
+- マイグレーションは `migrate` サービスの1プロセスのみ
+  （`AICONSHELL_RUN_DB_SETUP=1`）。web/worker の起動時は実行しない。
+- EventLog は結果整合性: ClickHouse 障害は起動を止めない。web/worker は
+  ClickHouse に依存せず、`clickhouse-init` が独立にスキーマ適用する。
+  適用までの配信は PostgreSQL の outbox に滞留し、リトライされる。
+- AI の資格情報・バイナリ欠如は web 起動を止めない（未設定 provider は
+  選択可・実行時失敗が契約）。
+- 管理画面の provider 診断バッジは web コンテナ内のローカル表示専用
+  （「12. Provider 診断は web ローカル」参照）。worker 側の真実は
+  `docker compose exec control|execution` で確認する。
+- Docker ソケットはどのコンテナにもマウントしない。
+
+## 2. 定期実行
+
+`config/recurring.yml` が development・production 共通のスケジュールを持つ
+（test は自動実行しない）。スケジューラは control worker のみが動かし、
+execution worker は `--skip-recurring` で起動するため二重登録しない。
+全タスクがキュー `control` 宛てで、control worker が消費する。
+
+| タスク | ジョブ | スケジュール |
+| --- | --- | --- |
+| `integration_poll_schedule` | `IntegrationPollScheduleJob`（引数なし） | 5 分毎 |
+| `coordination_triage` | `CoordinationTriageJob` | 毎分 |
+| `lease_recovery` | `LeaseRecoveryJob` | 毎分 |
+| `workflow_maintenance` | `WorkflowMaintenanceJob` | 毎分 |
+| `event_log_delivery` | `EventLogDeliveryJob` | 毎分 |
+| `clear_solid_queue_finished_jobs` | 完了済みジョブ掃除（コマンド） | 毎時 12 分 |
+
+注意:
+
+- 掃除コマンドにも `queue: control` を明示している。付けないと
+  Solid Queue 既定の `solid_queue_recurring` キューに積まれ、
+  どの worker も拾わない。
+- ジョブ側の `queue_as :control` 宣言と一致すること、
+  スケジュール文字列・引数なしを `ruby bin/check-compose` が静的に検査する。
+- 稼働中スタックでは `./bin/smoke` が `solid_queue_recurring_tasks` の
+  6 件登録を確認する（スケジューラ実体の証跡）。
+- test 環境にスケジュールは無い。suite はジョブを明示的に enqueue する。
+
+## 3. ローカル起動（Compose）
+
+前提: Docker（Compose v2）、Ruby 3.4.9
+（`RBENV_VERSION=3.4.9 rbenv exec ...`）。
+
+```sh
+cp .env.example .env   # 初回のみ。COMPOSE_PROJECT_NAME は checkout 毎に変更
+docker compose up --build
+./bin/smoke            # 別ターミナル、または -d 起動後に実行
+```
+
+- ポートは既定で loopback 束縛: web 3000、PostgreSQL 5432、ClickHouse
+  8123。`WEB_PORT` / `POSTGRES_PORT` / `CLICKHOUSE_PORT`（+ `*_BIND`）で
+  変更できる。既定の開発用資格情報のまま `0.0.0.0` 束縛にしないこと。
+- コードはイメージ内蔵（ソースの bind mount なし）。pull 後の更新は
+  `docker compose up --build` で取り込む。自動ホットリロードは無い:
+  速い反復はローカル実行（README「開発ループ」参照）で行う。
+- `docker compose down -v` は DB・ClickHouse・AI auth・workspaces を含む
+  全 volume を消す。AI の再ログインが必要になる点に注意。
+- 本番同等（`RAILS_ENV=production`）の `/up` 挙動は出荷前に確認済み
+  （「10. 検証」参照）。`/up` は redirect なく 200 を返し、
+  Railway のヘルスチェックがそのまま動く。
+
+## 4. テスト
+
+```sh
+bin/test unit                        # DB なし全 suite（unit/plugins/ai）
+RAILS_ENV=test bin/rails db:prepare  # 初回のみ（統合用 DB 作成）
+bin/test integration                 # 実 PostgreSQL + 実 ClickHouse（TEST_*_URL）
+bin/rails zeitwerk:check             # autoload 検査
+ruby bin/check-compose               # compose/queue/recurring/Dockerfile/CI の静的検査
+./bin/smoke                          # 起動中スタックの live 確認
+./bin/setup-clickhouse               # ClickHouse スキーマ適用（単体実行可）
+```
+
+`bin/test` は全 `smartest/**/*_test.rb` がいずれか1つの suite root
+（unit 系は `smartest/unit`・`smartest/plugins`・`smartest/ai`、
+結合は `smartest/integration`）に属することを検査し、属さない
+ファイルがあれば一覧して失敗する（新しい suite が runner 未登録の
+まま着陸しない）。EventLog の suite は `smartest/unit/observability`
+と `smartest/integration/observability` にあり、各 root の再帰展開で
+必ず実行される。
+
+`TEST_CLICKHOUSE_URL` を明示したら、integration は先に `/ping` で到達
+確認し、応答がなければ即失敗する（ClickHouse 系テストの沈黙 skip を
+許さない）。CI の integration job は必ず ClickHouse サービス付きで
+実行する。
+
+## 5. AI CLI プロビジョニング
+
+`Dockerfile` の `ai` ターゲットが CLI 付き worker イメージを作る。
+既定（`app`）には CLI を含めない。
+
+| CLI | 導入元 | 既定バージョン（ARG で上書き可） |
+| --- | --- | --- |
+| Node.js | 公式 tarball（x64/arm64） | `NODE_VERSION=24.21.0`（LTS） |
+| `claude` | npm `@anthropic-ai/claude-code` | `CLAUDE_CODE_VERSION=2.1.283` |
+| `codex` | npm `@openai/codex` | `CODEX_VERSION=0.157.1` |
+| `git` | apt（AI の工程コマンド用） | ディストリビューション版 |
+| `muse` | 運営者支給の Linux バイナリ（要認証配布） | ビルドシークレットで注入 |
+
+```sh
+# 基本イメージ
+docker build -t aiconshell:app .
+# CLI 付き（muse 抜きでもビルド可。その場合 muse は実行時失敗扱い）
+docker build --target ai -t aiconshell:ai .
+# muse を含める場合（ホストの macOS バイナリや資格情報は使わない。
+# 正規の Linux バイナリをリポジトリ外に置き、シークレットで渡す。
+# シークレット有無の切り替え時は --no-cache が必須: BuildKit は
+# secret マウント層をキャッシュするため、付けないと古い層が残る）
+docker build --target ai --no-cache -t aiconshell:ai \
+  --secret id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse .
+```
+
+`muse` の取り扱いを正確に述べる: ビルド時の `install` はバイナリを
+`/usr/local/bin/muse` に**意図的にコピーし、ai イメージの一部にする**。
+ビルド後に消えるのはシークレットのマウント（`/run/secrets/muse_cli`
+はレイヤに残らない）だけであり、認証資格情報は常にイメージ外
+（マウント volume）に置く。資格情報をリポジトリやイメージに混入
+させないこと。
+
+worker に CLI イメージを使わせるには `.env` で切り替える（control も
+coordination AI を実行するため、両方とも `ai` が要る）:
+
+```sh
+CONTROL_TARGET=ai
+EXECUTION_TARGET=ai
+```
+
+認証ホーム（AI 層 `Config` と同一契約）:
+
+| provider | コンテナ内 env | マウント先 volume |
+| --- | --- | --- |
+| claude | `CLAUDE_CONFIG_DIR=/private/claude` | `claude_auth` |
+| codex | `CODEX_HOME=/private/codex` | `codex_auth` |
+| muse | `AICONSHELL_MUSE_HOME=/private/muse`（XDG home） | `muse_auth` |
+
+muse は XDG 基準: `AICONSHELL_MUSE_HOME` は `muse` ディレクトリを**含む**
+ディレクトリを指し、認証は `/private/muse/muse/auth.json` に置かれる。
+`MUSE_CONFIG_DIR` という変数は存在しない（native CLI は解釈しない）。
+実行子プロセスには `XDG_CONFIG_HOME` + `MUSE_AUTH_PATH` だけが渡る
+（`ChildEnv` の契約）。
+
+volume は uid 1000（`rails`）で書けるよう image 側で用意済み。通常の
+CLI トークン更新が volume に永続化される。サブスクリプションのログイン
+自体は運営者作業（worker コンテナに入り、各 CLI の公式ログインフローで
+認証する。CI・テストでは一切行わない）:
+
+```sh
+docker compose run --rm -it execution bash
+# claude / codex は compose の env がそのまま効く
+claude login   # または公式フロー
+codex login    # または公式フロー
+# muse だけは対話シェルで XDG を明示する（アプリ経由の実行では不要）
+export XDG_CONFIG_HOME=$AICONSHELL_MUSE_HOME
+muse login     # または公式フロー
+```
+
+実行 workspace（`AICONSHELL_EXECUTION_ROOT=/workspaces`）は control・
+execution 両方に `ai_workspaces` volume としてマウントされる。アプリ
+ソース外の永続領域で、uid 1000 所有。triage の `policy-coordination`
+と実行 run の作業ディレクトリがここに作られる。
+
+## 6. 資格情報ファイルのマウント
+
+`GITHUB_PRIVATE_KEY_FILE`・`JIRA_API_TOKEN_FILE`・
+`TEAMS_CLIENT_SECRET_FILE`・`TEAMS_BOT_APP_PASSWORD_FILE`・
+`TEAMS_BOT_TARGETS_FILE` はコンテナ内パスだけを環境変数で渡す。
+実ファイルの内容は compose・Railway・イメージ・Git のいずれにも
+入れない。プラグインは値（`GITHUB_PRIVATE_KEY` 等）とファイルの
+どちらか片方があれば動き、両方空なら「未設定」として実行時失敗する。
+
+Compose ではホストの private ファイルを対象サービスへ read-only で
+bind マウントする（`execution` には絶対に付けない）。
+`compose.override.yml`（git 管理外）の例:
+
+```yaml
+services:
+  web:
+    volumes:
+      - type: bind
+        source: /srv/secrets/aiconshell/teams-bot-targets.json
+        target: /run/secrets/teams-bot-targets.json
+        read_only: true
+  control:
+    volumes:
+      - type: bind
+        source: /srv/secrets/aiconshell/teams-bot-targets.json
+        target: /run/secrets/teams-bot-targets.json
+        read_only: true
+      - type: bind
+        source: /srv/secrets/aiconshell/github-app.pem
+        target: /run/secrets/github-app.pem
+        read_only: true
+```
+
+```sh
+# .env（git 管理外。パスだけ。内容は書かない）
+TEAMS_BOT_TARGETS_FILE=/run/secrets/teams-bot-targets.json
+GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
+```
+
+注意:
+
+- コンテナの UID 1000 が読める所有者・権限にする。たとえば所有者 UID 1000 の
+  `0600`、またはグループ GID 1000 の `0640` を使い、親ディレクトリの探索権限も確認する。
+  ホストの運営者だけが読める `0600` のままでは、コンテナから読めない場合がある。
+  `docker compose exec control test -r /run/secrets/teams-bot-targets.json` で確認する。
+  AI 実行 workspace（`/workspaces`）やリポジトリ内には置かない。
+- `TEAMS_BOT_TARGETS_FILE` の JSON 形式は
+  `plugins/teams/README.md`「Bot 参照の対応表」が正。
+  Graph の team / channel ID と Bot conversation 参照の対応表であり、
+  受信済みの実際の参照だけを載せる。自動生成はしない。
+- Railway にはホスト bind が無い。control の既存 `/data` volume に
+  `/data/integrations/teams-bot-targets.json` を UID 1000 が読める権限で配置し、
+  `TEAMS_BOT_TARGETS_FILE` にそのパスを指定する。他サービスとは共有されない。
+  通常の資格情報は値型の環境変数でも設定できる。Teams の対応表が未配置なら
+  Bot による送信は実行時に失敗する。
+
+## 7. Railway
+
+実デプロイ・有料リソース作成・ログインは運営者作業。同一 project / environment に
+同じ repository を使う web・control・execution と、PostgreSQL・ClickHouse を配置する。
+DB / ClickHouse は private networking で接続し、公開ポートを作らない。
+
+### サービスごとの設定とビルド
+
+**2026-09-27 確認:** Railway は Config-as-Code を非推奨としており、新規サービスは
+TOML / JSON に opt-in できない。既存利用サービスの対応期限は 2026-12-01。
+新規サービスは下表を dashboard の Build / Deploy 設定に指定する。
+このリポジトリの TOML は既存サービス用の互換設定であり、新規サービスを自動構築しない。
+継続的な構成管理には Railway の Infrastructure as Code への移行が必要。
+[公式 Config-as-Code と移行案内](https://docs.railway.com/config-as-code)
+
+| サービス | 既存サービスの Config File Path | Start Command | Pre-deploy Command | Healthcheck Path |
+| --- | --- | --- | --- | --- |
+| web | `/railway.toml` | `./bin/thrust ./bin/rails server` | `./bin/rails db:prepare` | `/up`（timeout 300 秒） |
+| control | `/railway.control.toml` | `./bin/jobs --config-file=config/queue_control.yml` | なし | なし |
+| execution | `/railway.execution.toml` | `./bin/jobs --config-file=config/queue_execution.yml --skip-recurring` | なし | なし |
+
+全サービスの Builder は Dockerfile、Dockerfile Path は `Dockerfile`、Root Directory は
+repository のルート。通常の Restart Policy は On Failure、最大 retry は 10。
+既存 Config-as-Code サービスは Settings で **サービスごとに上表の絶対 repository path を選択**する。
+設定ファイル内の値は dashboard より優先されるため、web の TOML のまま worker の
+Start Command を dashboard で上書きしても切り替わらない。
+worker の dashboard に残っている Healthcheck Path と Pre-deploy Command も削除し、
+deployment details で実際の起動コマンド・設定元を確認する。
+[設定の優先順位](https://docs.railway.com/config-as-code/reference)
+
+Service Variables の `RUNTIME_TARGET` は web に `app`、control / execution に `ai` を設定する。
+Dockerfile の最後の `runtime` stage がこの build argument で既存の `app` / `ai` stage を選ぶ。
+Railway は Dockerfile に宣言した `ARG` に service variable を渡す。
+Compose の明示的な `target: app` / `target: ai` は従来どおり使える。
+[Railway の Docker build variables](https://docs.railway.com/builds/dockerfiles#using-variables-at-build-time)
+
+repo build の `ai` には Claude / Codex CLI が入る。Muse は認可された Linux binary を
+BuildKit secret で渡す既存の手順が別途必要で、Railway service variable から binary や認証を
+image に埋め込まない。Muse を使う worker は「5. AI CLI プロビジョニング」で作った private registry の image を
+source にする運用も可能。その場合も上表の worker 設定・以下の専用 volume / 個別ログインを使う。
+Muse binary が無ければ Muse は未構成のままであり、選択時に実行エラーになる。
+
+### 環境変数と独立した volume
+
+| 変数 | 設定先と値の例 |
+| --- | --- |
+| `DATABASE_URL` | 3 サービスに `${{Postgres.DATABASE_URL}}` |
+| `CLICKHOUSE_URL` | web / control に `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
+| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
+| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
+| `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
+| `RAILS_ENV` | 3 サービスに `production` |
+| `EVENT_LOG_TEAMS_CHANNEL` | 3 サービスに同じ `channel:<team>/<channel>`。空なら通知しない |
+| `TEAMS_BOT_TARGETS_FILE` | control の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |
+| `AICONSHELL_EXECUTION_ROOT` | control / execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
+| ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は 3 サービスに同じ値 |
+| 連携資格情報 | control / web のみ。execution には設定しない |
+| 自アクタ ID | control に `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID` |
+| `CLAUDE_CONFIG_DIR` | control / execution に `/data/auth/claude` |
+| `CODEX_HOME` | control / execution に `/data/auth/codex` |
+| `AICONSHELL_MUSE_HOME` | control / execution に `/data/auth/muse` |
+| `AICONSHELL_AI_HOME` | control / execution に `/tmp/aiconshell-ai-home`（子プロセスの一時 HOME） |
+| `AICONSHELL_CLAUDE_BIN` / `AICONSHELL_CODEX_BIN` / `AICONSHELL_MUSE_BIN` | control / execution に `/usr/local/bin/claude` / `/usr/local/bin/codex` / `/usr/local/bin/muse` |
+
+control と execution の**それぞれに別の volume を 1 個だけ作り、両方とも `/data` に mount**する。
+各 volume 内に `auth/claude`・`auth/codex`・`auth/muse`・`workspaces` を置く。
+同じ path でも別サービスの別 filesystem であり、認証・token refresh・workspace は同期されない。
+各 worker で個別にログインし、一方のログインで他方も認証済みになるとは扱わない。
+web には AI 用 volume を付けない。
+
+Railway の volume は 1 サービス 1 個で、volume を持つサービスは複数 replica にできない。
+control / execution は各 1 instance にし、volume を使う再デプロイには停止時間がある。
+image 内の `chown` は、後から mount される Railway volume の所有権を変更しない。
+[公式 volume 制約・権限](https://docs.railway.com/volumes/reference#caveats)
+
+### 初回だけ volume の所有者を設定する
+
+新しい空の worker volume に対し、control と execution を 1 サービスずつ初期化する。
+まだ通常の Rails worker と AI ログインを起動しない。
+
+1. 対象サービスに `/data` volume を mount し、`RAILWAY_RUN_UID=0` を一時設定する。
+   `AICONSHELL_RUN_DB_SETUP` は未設定または `0` にする。Start Command は `/bin/sleep infinity`、
+   Pre-deploy Command / Healthcheck Path は空、Restart Policy は Never にする。
+   既存 Config-as-Code サービスでは `/railway.volume-init.toml` を選択して同じ設定を使う。
+   この変更を deploy し、Rails / jobs を起動しない待機コンテナにする。
+2. 運営者のローカル端末から対象の remote shell に接続する（project / environment を事前に link）。
+
+   ```sh
+   railway ssh --service control
+   # execution の初期化時は railway ssh --service execution
+   ```
+
+   **接続先コンテナ内**で次を実行する。`id -u` が 0 でなければ続行しない。
+
+   ```sh
+   test "$(id -u)" = 0 || exit 1
+   test -d /data || exit 1
+   install -d -o 1000 -g 1000 -m 0700 \
+     /data/auth /data/auth/claude /data/auth/codex /data/auth/muse /data/workspaces
+   chown 1000:1000 /data
+   chmod 0700 /data
+   stat -c '%u:%g %a %n' /data /data/auth /data/auth/claude /data/auth/codex /data/auth/muse /data/workspaces
+   exit
+   ```
+
+3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻す。
+   まず待機コマンドのまま再 deploy し、`railway ssh --service control -- id -u` が `1000`、
+   `railway ssh --service control -- test -w /data/workspaces` が成功することを確認する。
+   execution でもサービス名を変えて同じ確認を行う。
+4. UID 1000 の remote shell 内で、その worker が使う provider に個別ログインする。
+   「5. AI CLI プロビジョニング」の公式 subscription login 手順を使い、Muse の対話シェルでは
+   `export XDG_CONFIG_HOME="$AICONSHELL_MUSE_HOME"` を先に実行する。
+   通常の token refresh はそのサービスの volume だけに保存される。
+5. web の SQL migration 成功後、対象 worker の通常 Start Command / On Failure policy に戻す。
+   既存 Config-as-Code サービスでは `/railway.control.toml` または `/railway.execution.toml` を
+   再選択して deploy する。`RAILWAY_RUN_UID=0` と volume-init 設定を通常運用に残さない。
+
+volume は build / pre-deploy での権限初期化には使わず、mount 済みの待機コンテナで設定する。
+root を要するのはこの初回の filesystem 設定だけで、通常の Rails / CLI は非 root で動かす。
+
+### SQL と ClickHouse の初期化
+
+web の Pre-deploy Command は `./bin/rails db:prepare` のみ。必要な workflow env は
+pre-deploy にも渡す。worker は SQL migration 成功後に起動する。
+ClickHouse スキーマは logging availability とアプリ起動を分離し、control が稼働してから
+運営者のローカル端末で以下を実行する。コマンド本体は remote container 内で動く。
+
+```sh
+railway ssh --service control -- /rails/bin/setup-clickhouse
+```
+
+`railway run` は service variables を取得して**ローカルで**実行する CLI なので、
+private DNS の ClickHouse 初期化には使わない。SSH 接続には Railway に登録済みの SSH key が必要。
+初期化成功まで EventLog delivery は PostgreSQL に残って再試行する。
+`PORT` は Railway の注入値を使い、web の公開ドメインだけを有効化する。
+[railway ssh](https://docs.railway.com/cli/ssh)・[railway run](https://docs.railway.com/cli/run)
+
+この手順の local 検証は TOML / Docker target / volume 権限に限定する。
+Railway 実環境での deploy・private DNS 到達・SSH・subscription login は運営者による別確認とする。
+
+## 8. ngrok（明示 opt-in）
+
+通常は不要（外部取得はポーリングのため）。一時的な公開デモに使う場合は
+既定の `RAILS_ENV=development` で次の手順を行う。公開前に `.env` の
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` と十分に長い `SECRET_KEY_BASE` を設定する。
+
+```sh
+# .env に NGROK_AUTHTOKEN を設定してから起動
+docker compose --profile tunnel up -d ngrok
+# 管理 UI: http://127.0.0.1:4040（NGROK_PORT で変更可）
+```
+
+起動ログ・管理 UI で公開 URL を確認し、**そのホスト名だけ**を `.env` に
+追加する。たとえば URL が `https://your-assigned-name.ngrok-free.app` の場合:
+
+```dotenv
+RAILS_DEVELOPMENT_HOSTS=your-assigned-name.ngrok-free.app
+```
+
+```sh
+# Rails は起動時に読むため、restart ではなく環境を反映する recreate を使う
+docker compose up -d --no-deps --force-recreate web
+```
+
+ホスト許可前は Rails が公開 URL のリクエストを `403 Blocked hosts` で
+拒否する。Rails 8 組み込みの `RAILS_DEVELOPMENT_HOSTS` はカンマ区切りの
+ホスト名を既定の development 許可リストに追加する。Compose は web に
+だけ渡し、`https://`・パス・先頭の `.`・ワイルドカードは指定しない。
+複数ホストが必要なら各ホストを列挙する。この変数は production の設定には
+使われない。
+
+Host 認可と CSRF 検証は有効なままにし、ngrok の `--host-header` 等で
+公開ホストを内部名へ書き換えない。ブラウザから届く公開ホストと HTTPS の
+情報を維持する。公開 URL は使う相手にだけ共有し、ホスト名が変わったら
+許可リストを更新して web を再作成する。
+
+利用終了後は `docker compose --profile tunnel stop ngrok` で停止し、
+`.env` の `RAILS_DEVELOPMENT_HOSTS` を空に戻して上記の web 再作成を行う。
+トークンは `.env`（git 管理外）のみへ保存し、CI・イメージに混入しない。
+
+実トンネルなしでも、許可したホストを指定してローカルの Host 認可を
+確認できる（`WEB_PORT` を変更した場合は URL も変更）:
+
+```sh
+curl -i -H 'Host: your-assigned-name.ngrok-free.app' http://127.0.0.1:3000/up
+# 許可済みなら 200。別ホストでは 403 を維持する。
+curl -i -H 'Host: unlisted.example.invalid' http://127.0.0.1:3000/up
+```
+
+## 9. CI
+
+`.github/workflows/ci.yml`（テスト専用。GitHub Actions を実行基盤・
+スケジューラには使わない）:
+
+| job | 内容 |
+| --- | --- |
+| `unit` | `bin/test unit`（DB なし全 suite: unit/plugins/ai） |
+| `integration` | 実 PostgreSQL + 実 ClickHouse サービス上で `bin/test integration`（`TEST_DATABASE_URL` + `TEST_CLICKHOUSE_*`。ClickHouse 到達の事前確認あり） |
+| `zeitwerk` | `bin/rails zeitwerk:check` |
+| `ops` | `docker compose config`、`ruby bin/check-compose`、`app`/`ai` ビルド、pinned CLI の `--version` 確認（claude/codex/git）+ シークレット無し `muse` 不在の確認 |
+| `clickhouse-smoke` | 実 ClickHouse サービス + `./bin/setup-clickhouse` の機構確認（使い捨てスキーマ。出荷 `event_log` スキーマ自体は integration が出荷 SQL から再構築して検証） |
+
+CI は live provider・実アカウント・資格情報を一切使わない。サブスクリ
+プションのログインは検証しない（運営者作業であり、CI では不可）。
+AI イメージのビルドもログインなし（`muse` はシークレット無しで不在
+となり、provider 実行時失敗の契約どおり）。
+
+## 10. 検証
+
+### 10.1 統合受け入れで確認する範囲
+
+- `docker compose config`、`ruby bin/check-compose` が通る。
+- `docker compose up --build` 後、`./bin/smoke` が全件 ok
+  （web `/up`、PostgreSQL、両 worker 起動、`DATABASE_URL` 一致、両
+  supervisor の共有 DB 登録、6 件の recurring 登録、
+  ClickHouse 到達時は `event_log` 存在）。
+- `bin/test unit` / `bin/test integration` /
+  `bin/rails zeitwerk:check` が通る（全 `smartest/**/*_test.rb` が
+  いずれかの suite で実行され、沈黙 skip なし）。
+- `docker build .`（既定 `app`）と `docker build --target ai .` が成功し、
+  `claude --version` / `codex --version` / `git --version` が Linux 上で
+  動く（`muse` はシークレット無しでは不在）。
+- 管理画面が Basic 認証で 200、未認証で 401 を返す
+  （`/admin`・`/admin/event_logs`・`/admin/plugins`・
+  `/admin/layer_policies`）。
+- Rails 経由で emit した EventLog が定期配信で実 ClickHouse に届き、
+  `Observability.search` で読める。
+- ClickHouse 停止状態でも web/worker が起動・応答し続ける
+  （`clickhouse-init` のみ待機/失敗し、`./bin/smoke` は警告付きで継続）。
+  停止中の emit は outbox に滞留し、復帰後の定期配信で届く。
+- 本番同等（`RAILS_ENV=production`）の HTTP 挙動:
+  `/up` は redirect なく 200（`config/environments/production.rb` の
+  除外設定。Railway ヘルスチェックはこのまま動く）。
+  背後は TLS 終端プロキシ前提（`assume_ssl`）のため、アプリ到達時は
+  全パスが HTTPS 扱いで、`/admin` 系は HSTS 付きで配信される。
+
+### 10.2 運営者アカウントが必要な範囲（自動検証しない）
+
+- Railway への実デプロイ・実ドメイン公開。
+- ngrok の実公開・外部 Webhook 受信。
+- 各 CLI のサブスクリプションログイン・トークン更新。
+  （`muse` Linux バイナリの入手を含む）
+- 実 GitHub / Jira / Teams への投稿・取得。
+
+## 11. トラブルシュート
+
+- ポート衝突: `.env` の `WEB_PORT` / `POSTGRES_PORT` /
+  `CLICKHOUSE_PORT` を空きポートに変えて `docker compose up` し直す。
+- ClickHouse の初回起動は遅い（数十秒）。`clickhouse-init` はヘルス
+  チェック通過を待つ。web/worker は待たずに起動し、EventLog 配信は
+  ClickHouse 復帰まで outbox に滞留する。
+- ClickHouse 障害時: アプリは起動継続する。復帰後に
+  `docker compose up clickhouse-init` でスキーマ適用を再実行（冪等）。
+- `migrate` 失敗時: `docker compose logs migrate` を見て直し、
+  `docker compose up migrate` で再実行（冪等）。
+- AI トークン期限切れ: 該当 volume を消さず「5.」の手順で再ログインする
+  （volume を消すと再ログイン必須）。
+- 他 worktree との volume 衝突: `COMPOSE_PROJECT_NAME` が checkout 毎に
+  異なることを確認する。
+
+## 12. Provider 診断は web ローカル
+
+管理画面の provider 診断（設定済み/未設定バッジ）は、web プロセス自身
+の視点で CLI バイナリと auth ホームの有無を見るだけの読み取り専用表示
+である。web は `app` イメージ（CLI なし）で動き、AI auth volume も
+マウントしないため、worker が `ai` イメージで正常でも web 上は未設定
+に見える。これを「worker が未設定」と読んではいけない。
+
+worker 側の真実は worker コンテナで直接確認する:
+
+```sh
+# 制御面・実行面の CLI と auth 配置（要 ai イメージ + ログイン済み volume）
+docker compose exec control ls -la /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/muse
+docker compose exec execution ls -la /private/claude /private/codex /private/muse
+docker compose exec execution printenv AICONSHELL_MUSE_HOME
+# Rails 経由の診断（web ではなく worker で実行すること）
+docker compose exec execution ./bin/rails runner 'require "aiconshell/ai"; puts Aiconshell::Ai::Registry.default.catalog.inspect'
+```
+
+管理画面のバッジ自体に「web ローカル」の明記は無い（設定済み /
+未設定の表示のみ）。web 上の未設定を見て worker 側を判断せず、
+必ず worker コンテナで直接確認すること。
