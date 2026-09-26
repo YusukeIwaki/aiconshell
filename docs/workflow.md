@@ -1,152 +1,147 @@
 # Workflow: Interaction / Coordination / Execution (issue #6)
 
-The executable vertical slice: humans can never instruct a worker directly.
-Every layer boundary below is enforced in Ruby and covered by Smartest tests
-(`smartest/unit/workflow`, `smartest/integration/workflow`).
+Human messages and external events are data. Coordination alone decides task
+state, priority, execution requests, and outbound intent. Controllers create
+human `TaskFeedback` or configure `LayerPolicy`; they do not invoke a worker.
 
 ```
-human event -> Interaction poll -> ExternalEvent (durable inbox)
-  -> Coordination triage (coordination AI) -> Task inbox/ready
-  -> Coordination dispatch -> TaskRun pending + ExecutionRunJob (:execution)
-  -> Execution lease + bounded AI -> CompletionService (coordination)
-  -> Task done/waiting_* (+ OutboundAction) -> Interaction delivery
+plugin polling -> ExternalEvent -> coordination triage -> Task + TaskRun
+  -> execution lease + bounded AI -> coordination completion
+  -> OutboundAction -> interaction delivery
 ```
 
-## Models
+## Persisted contracts
 
-| Model | Owner writes | Notes |
-| --- | --- | --- |
-| `ExternalEvent` | Interaction | `plugin+event_id+fingerprint` unique; edits land as new rows |
-| `IntegrationCursor` | Interaction | per plugin/scope cursor + short poll lease + visible error |
-| `Task` | Coordination only | `inbox/ready/running/waiting_human/waiting_review/done/failed/cancelled`, `lock_version` |
-| `TaskFeedback` | anyone creates, Coordination consumes | `body/author/suggested_priority`, never mutates Task directly |
-| `TaskRun` | Coordination creates, Execution leases | provider snapshot, `lease_token` fencing, result/error |
-| `LayerPolicy` | admin UI | one row per layer, `enabled` flag, no secrets |
-| `OutboundAction` | Coordination creates, Interaction sends | idempotency key, attempts, external id |
+- `ExternalEvent` is unique on plugin/event ID/fingerprint. Edits are distinct
+  rows. Ingestion records its `task_id`; one open task per nonempty source is
+  enforced by PostgreSQL. Source creation uses a transaction advisory lock,
+  then a locked task lookup. A new event after a completed source creates a
+  new inbox task.
+- `TaskFeedback` accepts human authors only, at both model and database levels.
+  System events remain source context and never impersonate human feedback.
+  Missing text is normalized from descriptions, change items, or structured
+  payloads. Invalid inbox rows are quarantined with a safe `last_error` and
+  `processed_at`, so they cannot starve later events.
+- `TaskRun` stores provider/model/effort/instructions and `work_snapshot` at
+  dispatch. Those fields are read-only thereafter. The snapshot contains the
+  task description, work plan, human clarification, recent source events,
+  and previous structured result. Recovery copies the original request.
+- PostgreSQL permits only one pending/leased/running run per task.
+  `Task.current_run_id` identifies the request authorized to affect its state.
+  Duplicate dispatch returns the same current active run.
+- Task transitions use `Task::TRANSITIONS`. A `running` request must dispatch
+  execution; triage cannot manufacture a running task without a run. Changing
+  a running task to another state cancels its active run and clears the pointer.
+  Terminal tasks with pending human feedback remain triageable. Coordination
+  may explicitly reopen them to `inbox` only with that feedback and when no
+  other open task owns the source. Reopening does not revive old runs.
 
-Task transitions are a closed allowlist (`Task::TRANSITIONS`); unknown
-transitions raise `ActiveRecord::RecordInvalid` and AI rulings requesting
-them are rejected per ruling, never applied partially.
+## Triage and feedback
 
-## Layer rules
+Triage first ingests events and then calls the enabled coordination policy.
+There is no production priority fallback. Explicit demo mode can advance inbox
+items to ready using suggested priorities.
 
-- **Interaction** (`app/services/interaction/`): polls allowlisted scopes
-  into the inbox, delivers outbound actions. Polling validates scopes
-  against `AICONSHELL_ALLOWED_SCOPES`, never trusts caller/AI destinations
-  alone. Bot/system events are persisted pre-processed so self-events start
-  no loops. When the interaction `LayerPolicy` is enabled, reply bodies are
-  drafted through that policy before sending; otherwise the
-  coordination-provided body is sent as-is. An enabled policy naming an
-  unconfigured provider fails the action structurally (`error_code`), with
-  no silent fallback.
-- **Coordination** (`app/services/coordination/`): the only layer that
-  creates tasks, changes `status`/`priority`/`next_action_at`, persists
-  runs, and decides dispatch/completion. Triage ingests deterministically
-  (new source -> inbox Task; known source -> TaskFeedback on the open
-  task), then calls the coordination AI with a strict ruling schema.
-  Unknown task ids, operations, and transitions are rejected. Without an
-  enabled policy, ingest still runs but tasks stay in `inbox`; the
-  deterministic priority fallback runs in explicit demo mode
-  (`AICONSHELL_DEMO_MODE=1`) only.
-- **Execution** (`app/services/execution/`): leases one persisted run,
-  runs the bounded AI call in an isolated workspace, returns the
-  structured result to `Coordination::CompletionService`. It never updates
-  `Task` rows and never calls plugins (static boundary test). Workers
-  receive normalized task data only.
+Each AI call receives a task version and exact feedback snapshot, including
+previous execution results. Rulings are JSON Schema validated, then checked
+against task identity, the current policy, task version, allowed transitions,
+and trusted reply destination. Duplicate rulings are rejected. A stale ruling
+cannot overwrite a completion that happened during the AI call.
 
-Controllers (admin lane) accept `TaskFeedback` and configure
-`LayerPolicy`; they never enqueue or invoke `ExecutionRunJob`. Only
-`Coordination::DispatchService` / `RecoveryService` enqueue it.
+Only a successfully applied ruling acknowledges its snapshotted feedback IDs,
+in the same transaction. Feedback for rejected or omitted tasks, and feedback
+arriving during the AI call, remains pending. Descriptions, work plans, and
+clarifications are persisted with the execution request so a resumed worker can
+use the human answer. Replies can only target the task's existing source; AI
+text cannot select a different plugin or resource.
 
-## Durability and fencing guarantees
+## Execution and recovery
 
-- Cursor commits only after **all** valid events of a poll are persisted.
-  Invalid rows are skipped visibly (`last_error`, `poll.failed`) and the
-  cursor is held so the poll is retryable; valid rows are idempotent on
-  retry via the unique fingerprint constraint.
-- Overlapping polls are skipped via a short cursor lease (row lock +
-  token + expiry), checked and set without holding locks across network I/O.
-- Completions are fenced by `lease_token`: wrong token, expired-lease
-  reuse, or terminal-run replay is rejected (`stale_completion`) and can
-  never overwrite newer state. All state mutations use row locks
-  (`with_lock`) and short transactions; AI subprocess/network calls always
-  run outside the lock.
-- Lease discipline: `AICONSHELL_LEASE_SECONDS` (default 1800) must exceed
-  `AICONSHELL_AI_TIMEOUT_SECONDS` (default 600) so a healthy run never
-  loses its lease mid-call; `RunnerService#heartbeat` extends the lease
-  when operators configure a tighter window. Boot logs a warning when the
-  lease does not cover the AI timeout.
-- Expired leases recover on the control queue: the stale run parks as
-  `expired` and a fresh `pending` run dispatches while attempts remain,
-  else the task parks as `failed` with a visible error. No `running` ->
-  `ready` transition exists, so recovery never invents one.
-- Every layer AI policy is optional at boot. Saving a policy that names
-  an unconfigured provider is valid; execution records a structured
-  failure (`provider_not_configured`, `run.failed`) instead of raising
-  through the job. Missing/denied configuration never raises for endless
-  Solid Queue retries: jobs retry transient errors only (bounded
-  `retry_on`), config errors are recorded and back off (`next_action_at`).
-- Test fakes (`smartest/fixtures/workflow_fakes.rb`) are injected
-  explicitly in tests only. Production defaults resolve the real
-  `Aiconshell::Plugins::Registry` / `Aiconshell::Ai::Runner` when present
-  and record an explicit unavailable-error otherwise.
+All paths lock the task before its run. Worker claims require a pending current
+run, a running task, and an enabled execution policy. A missing or disabled
+execution policy never selects another provider. Queued work is deferred while
+the policy is disabled and the maintenance sweep can resume it after enabling.
+An enabled but unconfigured provider remains selectable and fails visibly at
+execution with a structured error.
 
-## Outbound exactly-once caveat
+Completion and heartbeat require the current task/run association, a nonempty
+matching lease token, an active run, and an unexpired lease. Stale, expired,
+cancelled, or duplicate results cannot change the task. Only `done`,
+`waiting_review`, `waiting_human`, and `failed` are accepted outcomes. Invalid
+output is a failed run; the worker reports a rejected completion instead of
+claiming success. Raw provider diagnostics are not copied into task errors.
 
-`idempotency_key` de-duplicates enqueue/claim retries inside the app, but
-GitHub/Jira/Teams writes have no end-to-end idempotency: a crash after a
-successful plugin call and before the `sent` update can resend on the
-next delivery pass. Treat outbound delivery as at-least-once and keep
-messages idempotent-worded where it matters.
+Expired current runs become `expired` and receive a fresh request while attempts
+remain and execution is enabled. Superseded/cancelled runs are never recovered.
+Exhausted or disabled recovery parks the task as failed with a visible reason.
 
-## Operator setup
+The lease must exceed the bounded AI timeout by more than ten seconds for
+process shutdown. Configuration is validated at boot and before dispatch or
+execution. Safety does not require heartbeat callbacks from a blocking adapter.
+Workspaces use canonical paths beneath the configured execution root and reject
+symlinked child directories before writing through them. Production requires an
+explicit root. Provider subprocess environment isolation belongs to the AI port;
+execution never invokes external plugins.
 
-Environment (see `config/initializers/aiconshell_workflow.rb`):
+## Polling and outbound delivery
+
+Polling claims a short cursor lease. Network paging happens outside a database
+transaction; the current token is checked under the cursor lock before events
+and the cursor are committed atomically. Duplicate fingerprint inserts are
+idempotent. Invalid output or a stale lease cannot advance the cursor.
+
+Only known bots/self actors are pre-processed to prevent echo loops; other
+system events are retained as coordination context. Set
+`AICONSHELL_SELF_ACTOR_IDS=plugin:id,...` (or `JIRA_SERVICE_ACCOUNT_ID` for Jira).
+Jira outbound writes fail with `self_actor_not_configured` without a known self
+account identity.
+
+Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
+states, plus lease, request-start, and retry timestamps. Interaction derives a
+reply's scope from its resource ID, checks the operator allowlist, and passes
+operation permission arrays to the real plugin registry. Enabled interaction
+policies may draft the body. Plugin inputs and outputs remain schema validated.
+
+A bounded retry follows a 429 Retry-After response. Transport ambiguity or a
+crash after a remote request started becomes `uncertain` and is not automatically
+resent. Interrupted local drafting can return to pending after backoff. Remote
+providers do not offer an end-to-end exactly-once guarantee; operators must
+reconcile uncertain sends before deciding whether another action is needed.
+
+## Runtime configuration
+
+Pure Ruby plugin, AI, and observability entrypoints are explicitly required at
+boot; Zeitwerk does not manage those namespaces. Missing lane libraries are
+reported at startup and produce explicit runtime failures. Test fakes are
+injected only in tests. Web, workers, and Solid Queue share PostgreSQL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AICONSHELL_EXECUTION_ROOT` | `tmp/ai_workspaces` | workspaces live under `task_<id>/run_<id>` here; required in production, never an arbitrary human/AI path |
-| `AICONSHELL_ALLOWED_SCOPES` | empty (deny all) | comma `plugin:scope` allowlist, e.g. `github:owner/repo,github:issue-1` |
-| `AICONSHELL_LEASE_SECONDS` | `1800` | execution lease; keep above the AI timeout |
-| `AICONSHELL_AI_TIMEOUT_SECONDS` | `600` | bounded AI runtime per call |
-| `AICONSHELL_POLL_LEASE_SECONDS` | `300` | overlap guard per poll |
-| `AICONSHELL_MAX_RUN_ATTEMPTS` | `3` | lease-recovery redispatch cap |
-| `AICONSHELL_MAX_ACTION_ATTEMPTS` | `5` | outbound claim cap |
-| `AICONSHELL_DEMO_MODE` | unset | `1` enables the deterministic triage fallback only |
+| `AICONSHELL_EXECUTION_ROOT` | `tmp/ai_workspaces` outside production | Canonical root for policy and task/run workspaces; required in production |
+| `AICONSHELL_ALLOWED_SCOPES` | empty | Comma-separated plugin destinations, e.g. `github:owner/repo` |
+| `AICONSHELL_SELF_ACTOR_IDS` | empty | Known self actors as `plugin:id,...` |
+| `JIRA_SERVICE_ACCOUNT_ID` | unset | Jira self actor identity required for outbound writes |
+| `AICONSHELL_LEASE_SECONDS` | `1800` | Must exceed AI timeout plus ten seconds |
+| `AICONSHELL_AI_TIMEOUT_SECONDS` | `600` | Bounded AI runtime |
+| `AICONSHELL_POLL_LEASE_SECONDS` | `300` | Poll cursor lease |
+| `AICONSHELL_MAX_RUN_ATTEMPTS` | `3` | Execution recovery attempt cap |
+| `AICONSHELL_MAX_ACTION_ATTEMPTS` | `5` | Outbound attempt cap |
+| `AICONSHELL_DEMO_MODE` | unset | `1` explicitly enables deterministic inbox triage |
 
-Recurring jobs (control queue unless noted; wire into
-`config/recurring.yml` when the foundation/operations lanes land):
+Operations must schedule polling per allowlisted scope every five minutes,
+`CoordinationTriageJob`, `LeaseRecoveryJob`, and `WorkflowMaintenanceJob`.
+The maintenance job runs every minute to recover outbound leases and enqueue
+due actions and current pending runs, repairing process/enqueue failures.
+Control and execution jobs declare separate queues and should use separate
+worker processes. AI/network calls never hold a database transaction open.
 
-```yaml
-interaction_poll:
-  class: InteractionPollJob
-  queue: control
-  args: ["github", "owner/repo"]   # one entry per allowlisted scope
-  schedule: every 5 minutes
-coordination_triage:
-  class: CoordinationTriageJob
-  queue: control
-  schedule: every 5 minutes
-lease_recovery:
-  class: LeaseRecoveryJob
-  queue: control
-  schedule: every 10 minutes
-```
+## Verification
 
-`ExecutionRunJob` runs on the `execution` queue; give execution workers
-their own Solid Queue process with access to the execution root and AI
-CLI auth, and no application DB/integration credentials beyond the
-database connection. AI subprocesses inherit a controlled env only (see
-the AI lane), never provider stdout/stderr into EventLog.
-
-## Public contract notes for other lanes
-
-- Ports used exactly as documented in `docs/architecture.md`:
-  `registry.invoke(plugin:, operation:, input:, context:)`,
-  `runner.call(provider:, prompt:, schema:, workspace:, layer:, ...)`,
-  `Observability.emit(layer:, kind:, message:, ...)`. No changes required.
-- Admin lane: build feedback/policy controllers on `TaskFeedback` and
-  `LayerPolicy`; do not add run-creation endpoints (covered by the
-  boundary test).
-- Queue config: split `control` and `execution` workers in
-  `config/queue.yml` (operations lane); jobs already declare their queue.
+Smartest workflow integration tests use PostgreSQL and injected ports. Core
+regressions cover actual concurrent dispatch, database uniqueness, exact feedback
+acknowledgements, stale triage and worker completions, cancellation, disabled
+policies, clarification snapshots, invalid outcomes, source normalization,
+terminal feedback, lease bounds, and symlink containment. Interaction regressions
+exercise real plugin registry contracts with fake transports. Runtime provider
+login, live AI execution, and real external posting are separate acceptance
+checks; these tests do not use accounts or network integrations.

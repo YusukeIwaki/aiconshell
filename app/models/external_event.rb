@@ -3,6 +3,7 @@
 # Durable inbox row for one plugin event. Uniqueness includes the fingerprint
 # so edits of the same message land as distinct rows.
 class ExternalEvent < ApplicationRecord
+  belongs_to :task, optional: true
   ACTOR_TYPES = %w[human bot system].freeze
 
   validates :plugin, :event_id, :fingerprint, :event_type, :resource_id, :occurred_at, presence: true

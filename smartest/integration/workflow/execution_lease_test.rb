@@ -4,6 +4,7 @@ require "db_helper"
 require_relative "workflow_test_helper"
 
 def seed_running_task(status: "running")
+  LayerPolicy.create!(layer: "execution", provider: "codex", enabled: true)
   Task.create!(title: "t", description: "do work", status: status, priority: 1,
                source_plugin: "github", source_resource_id: "issue-1")
 end
@@ -13,7 +14,8 @@ test("duplicate execution jobs are rejected without stealing the lease") do |db:
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
     task = seed_running_task
-    run = TaskRun.create!(task: task, provider: "codex", status: "pending")
+    run = TaskRun.create!(task: task, work_snapshot: Coordination::WorkContext.for_task(task), provider: "codex", status: "pending")
+    task.update!(current_run: run)
     ai = WorkflowFakes::FakeAiRunner.new(
       answers: { "execution" => { "outcome" => "done", "summary" => "ok" } }
     )
@@ -36,7 +38,8 @@ test("unconfigured execution provider produces a structured failure") do |db:|
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
     task = seed_running_task
-    run = TaskRun.create!(task: task, provider: "muse", status: "pending")
+    run = TaskRun.create!(task: task, work_snapshot: Coordination::WorkContext.for_task(task), provider: "muse", status: "pending")
+    task.update!(current_run: run)
     ai = WorkflowFakes::FakeAiRunner.new(
       errors: { "execution" => WorkflowFakes::FakeNotConfigured.new("subscription login missing") }
     )
@@ -58,8 +61,9 @@ test("stale completions with a wrong lease token are fenced out") do |db:|
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
     task = seed_running_task
-    run = TaskRun.create!(task: task, provider: "codex", status: "running",
+    run = TaskRun.create!(task: task, work_snapshot: Coordination::WorkContext.for_task(task), provider: "codex", status: "running",
                           lease_token: "live-token", lease_expires_at: 10.minutes.from_now)
+    task.update!(current_run: run)
     completion = Coordination::CompletionService.new(event_sink: sink)
 
     stale = completion.complete(run_id: run.id, lease_token: "old-token",
@@ -85,8 +89,9 @@ test("expired leases recover into a fresh run, then park the task when exhausted
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
     task = seed_running_task
-    run = TaskRun.create!(task: task, provider: "codex", status: "running", attempt: 1,
+    run = TaskRun.create!(task: task, work_snapshot: Coordination::WorkContext.for_task(task), provider: "codex", status: "running", attempt: 1,
                           lease_token: "expired-token", lease_expires_at: 1.minute.ago)
+    task.update!(current_run: run)
     recovery = Coordination::RecoveryService.new(event_sink: sink)
 
     expect(recovery.call).to eq(1)
@@ -114,8 +119,9 @@ test("heartbeat extends a live lease but never a terminal run") do |db:|
   with_workflow_env(scopes: "github:issue-1") do |_root|
     sink = WorkflowFakes::FakeEventSink.new
     task = seed_running_task
-    run = TaskRun.create!(task: task, provider: "codex", status: "running",
+    run = TaskRun.create!(task: task, work_snapshot: Coordination::WorkContext.for_task(task), provider: "codex", status: "running",
                           lease_token: "token", lease_expires_at: 1.minute.from_now)
+    task.update!(current_run: run)
     runner = Execution::RunnerService.new(ai_runner: WorkflowFakes::FakeAiRunner.new, event_sink: sink)
 
     expect(runner.heartbeat(run.id, "token")).to eq(true)
