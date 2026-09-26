@@ -90,6 +90,26 @@ transaction; the current token is checked under the cursor lock before events
 and the cursor are committed atomically. Duplicate fingerprint inserts are
 idempotent. Invalid output or a stale lease cannot advance the cursor.
 
+`github.issue`, `jira.issue`, `teams.message`, and `teams.reply` are semantic
+snapshots. Their adapter fingerprint is preserved as `source_fingerprint`;
+the inbox `fingerprint` chains it to the preceding persisted revision. Thus
+observed A → B → A changes create three revisions, while consecutive A
+snapshots only advance `source_updated_at`, the greatest provider `occurred_at`
+observed for that revision. Metadata timestamps in the payload do not create
+new work. Other event types retain their original fingerprint deduplication.
+
+Per-plugin/event-ID transaction advisory locks serialize snapshot writes across
+scopes, acquired in sorted order. A batch is processed in timestamp order for
+each source. Snapshots older than the persisted watermark are ignored; equal
+timestamps are first-observed-wins (batch input order breaks ties). Providers
+must supply the edit time as `occurred_at`; timestamps are compared at PostgreSQL
+microsecond precision. Conflicting changes at the same timestamp and changes
+that occur entirely between polls cannot be reconstructed. Existing rows retain
+their old fingerprint as the initial source value; changing an adapter's
+fingerprint algorithm can create one new baseline revision. All snapshot,
+watermark, and cursor changes commit together, with lease expiry rechecked after
+lock waits. No network request runs while these locks are held.
+
 Only known bots/self actors are pre-processed to prevent echo loops; other
 system events are retained as coordination context. Set
 `AICONSHELL_SELF_ACTOR_IDS=plugin:id,...` (or `JIRA_SERVICE_ACCOUNT_ID` for Jira).
