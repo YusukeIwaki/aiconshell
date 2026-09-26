@@ -73,6 +73,17 @@ module Aiconshell
 
       # Read credentials make the plugin usable for polling; write operations
       # additionally require bot credentials + service URL at call time.
+      def validate_operation_input(op, input)
+        return unless %w[reply send_message].include?(op.name)
+
+        value = input.fetch(op.name == "reply" ? "resource_id" : "scope")
+        return if CONVERSATION_PATTERN.match?(value) || CHANNEL_PATTERN.match?(value) ||
+          (op.name == "reply" && MESSAGE_PATTERN.match?(value))
+
+        raise InputInvalid.new(plugin: plugin_id, operation: op.name,
+          details: ['target must look like "conversation:<id>" or "channel:<teamId>/<channelId>"; reply also accepts a mapped "message:<teamId>/<channelId>/<rootMessageId>"'])
+      end
+
       def configured?(env)
         present?(env["TEAMS_TENANT_ID"]) &&
           present?(env["TEAMS_CLIENT_ID"]) &&

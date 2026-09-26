@@ -70,9 +70,19 @@ module Aiconshell
       LIST_ISSUES_URL_LIMIT = 512
 
       def validate_operation_input(op, input)
-        return unless op.name == "list_issues"
-
-        validated_list_cursor(input, input.fetch("scope"))
+        case op.name
+        when "list_issues"
+          validated_list_cursor(input, input.fetch("scope"))
+        when "reply"
+          unless RESOURCE_PATTERN.match?(input.fetch("resource_id"))
+            raise InputInvalid.new(plugin: plugin_id, operation: op.name,
+              details: ['resource_id must look like "issue:owner/repo#123" or "pr:owner/repo#123"'])
+          end
+        when "create_issue"
+          unless SCOPE_PATTERN.match?(input.fetch("scope"))
+            raise InputInvalid.new(plugin: plugin_id, operation: op.name, details: ['scope must look like "owner/repo"'])
+          end
+        end
       end
 
       def configured?(env)

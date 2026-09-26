@@ -63,6 +63,8 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
   このフックは `validate_input` と `invoke` の両方で呼ばれます。
   認証情報・HTTP・DB・変更可能なアプリケーション状態に依存せず、純粋な検証に限定し、
   不正入力では `InputInvalid` を送出してください。ハンドラーの処理を先取りしません。
+  組み込みの書込操作も宛先の構文をここで検証します。Teams の Bot 対応表や認証情報の
+  読み込みは実行時に行うため、preflight の成功は外部配信の成功を保証しません。
 - `required_env` と `configured?` は診断用です。実行時の認証情報確認もハンドラーで行います。
   値とファイルの選択肢がある場合は `configured?` を実装し、README に説明します。
 - 操作権限 `context["scopes"]` と投稿先の allowlist は別です。Interaction は許可された
