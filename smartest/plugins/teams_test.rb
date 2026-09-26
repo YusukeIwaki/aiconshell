@@ -313,6 +313,35 @@ test("teams returns edits at equal timestamps with a new fingerprint") do |regis
   expect(after["events"].first["occurred_at"]).to eq("2026-09-26T12:00:00Z")
 end
 
+test("teams parent fingerprint ignores own reply and reaction metadata but preserves edits and deletion") do |registry:, transport:|
+  teams_token_stubs(transport)
+  parent = teams_message("m1", created: "2026-09-26T12:00:00Z", modified: "2026-09-26T12:00:00Z")
+  replies = []
+  transport.stub_proc("GET", %r{/messages\?}) do |_request|
+    Plugins::Http::Response.new(status: 200, headers: {}, body: JSON.generate({ "value" => [parent] }))
+  end
+  transport.stub_proc("GET", %r{/replies\?}) do |_request|
+    Plugins::Http::Response.new(status: 200, headers: {}, body: JSON.generate({ "value" => replies }))
+  end
+  poll = -> { registry.invoke(plugin: "teams", operation: "latest_events", input: { "scope" => teams_poll_scope })["events"] }
+  original = poll.call.first
+  parent["lastModifiedDateTime"] = "2026-09-26T12:01:00Z"
+  parent["etag"] = "reply-or-reaction-changed"
+  parent["reactions"] = [{ "reactionType" => "like" }]
+  replies << teams_message("own-reply", created: "2026-09-26T12:01:00Z", modified: "2026-09-26T12:01:00Z", from: { "application" => { "id" => "our-bot" } })
+  after_reply = poll.call
+  unchanged = after_reply.find { |event| event["event_id"] == original["event_id"] }
+  expect(unchanged["fingerprint"]).to eq(original["fingerprint"])
+  expect(after_reply.find { |event| event["event_type"] == "teams.reply" }["actor_type"]).to eq("bot")
+  parent["body"]["content"] = "edited message"
+  edited = poll.call.find { |event| event["event_id"] == original["event_id"] }
+  expect(edited["fingerprint"]).not_to eq(unchanged["fingerprint"])
+  parent["deletedDateTime"] = "2026-09-26T12:02:00Z"
+  deleted = poll.call.find { |event| event["event_id"] == original["event_id"] }
+  expect(deleted["fingerprint"]).not_to eq(edited["fingerprint"])
+  expect(deleted["payload"]["deleted"]).to eq(true)
+end
+
 test("teams rejects unsafe same-host Graph next links") do |registry:, transport:|
   teams_token_stubs(transport)
   links = ["http://graph.microsoft.com/next", "https://graph.microsoft.com:8443/next", "https://user:secret@graph.microsoft.com/next"]

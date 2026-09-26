@@ -151,7 +151,8 @@ module Aiconshell
 
         events << {
           "event_id" => "jira:issue:#{key}",
-          "fingerprint" => fingerprint(timestamp_string(updated), summary, description_text, status),
+          # Child comments can move updated without changing the issue itself.
+          "fingerprint" => fingerprint(summary, description_text, status),
           "event_type" => "jira.issue",
           "resource_id" => "issue:#{key}",
           "actor_id" => "unknown",

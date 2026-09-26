@@ -144,7 +144,9 @@ test("per-call context overrides registry collaborators") do |transport:, clock:
           "GITHUB_PRIVATE_KEY" => TestKeys.github_private_key }
   out = bare.invoke(plugin: "github", operation: "latest_events",
                     input: { "scope" => "o/r" }, context: { "env" => env })
-  expect(out["cursor"]["since"]).to match(/2026-09-26/)
+  expect(out["cursor"]["since"]).to eq(nil)
+  expect(out["cursor"]["version"]).to eq(2)
+  expect(out["cursor"]["streams"]["issues"]["completed_at"]).to eq(clock.now.utc.iso8601)
 end
 
 def stub_github_token(transport)
@@ -154,6 +156,8 @@ end
 
 def stub_github_empty_poll(transport)
   transport.stub_json("GET", %r{\Ahttps://api\.github\.com/repos/o/r/issues\?}, body: [])
+  transport.stub_json("GET", %r{\Ahttps://api\.github\.com/repos/o/r/issues/comments\?}, body: [])
+  transport.stub_json("GET", %r{\Ahttps://api\.github\.com/repos/o/r/pulls/comments\?}, body: [])
   transport.stub_json("GET", %r{\Ahttps://api\.github\.com/repos/o/r/actions/runs\?},
                       body: { "workflow_runs" => [] })
 end

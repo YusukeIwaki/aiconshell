@@ -315,6 +315,32 @@ test("jira preserves edit fingerprints at equal timestamps") do |registry:, tran
   expect(after["fingerprint"]).not_to eq(before["fingerprint"])
 end
 
+test("jira parent fingerprint ignores own comment timestamps and preserves content and status edits") do |registry:, transport:|
+  issue = jira_issue("PROJ-1", updated: "2026-09-26T12:00:00Z")
+  comments = []
+  transport.stub_proc("POST", "#{JIRA}/rest/api/3/search/jql") do |_request|
+    Plugins::Http::Response.new(status: 200, headers: {}, body: JSON.generate({ "issues" => [issue], "isLast" => true }))
+  end
+  transport.stub_proc("GET", %r{/issue/PROJ-1/comment}) do |_request|
+    Plugins::Http::Response.new(status: 200, headers: {}, body: JSON.generate(jira_page("comments", comments)))
+  end
+  transport.stub_json("GET", %r{/issue/PROJ-1/changelog}, body: jira_page("values", []))
+  poll = -> { registry.invoke(plugin: "jira", operation: "latest_events", input: { "scope" => "PROJ" })["events"] }
+  original = poll.call.first
+  issue["fields"]["updated"] = "2026-09-26T12:01:00Z"
+  comments << jira_comment("own-reply", updated: "2026-09-26T12:01:00Z", author: "service-account")
+  after_reply = poll.call
+  parent = after_reply.find { |event| event["event_id"] == original["event_id"] }
+  expect(parent["fingerprint"]).to eq(original["fingerprint"])
+  expect(after_reply.find { |event| event["event_id"] == "jira:comment:own-reply" }["actor_id"]).to eq("service-account")
+  issue["fields"]["description"] = jira_adf_paragraph("edited content")
+  edited = poll.call.find { |event| event["event_id"] == original["event_id"] }
+  expect(edited["fingerprint"]).not_to eq(parent["fingerprint"])
+  issue["fields"]["status"]["name"] = "Done"
+  done = poll.call.find { |event| event["event_id"] == original["event_id"] }
+  expect(done["fingerprint"]).not_to eq(edited["fingerprint"])
+end
+
 test("jira emits all issues when a response contains more than fifty") do |registry:, transport:|
   issues = (1..51).map { |number| jira_issue("PROJ-#{number}", updated: "2026-09-26T12:00:00Z") }
   transport.stub_json("POST", "#{JIRA}/rest/api/3/search/jql", body: { "issues" => issues, "isLast" => true })

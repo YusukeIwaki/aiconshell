@@ -374,8 +374,11 @@ module Aiconshell
         identity = [team, channel, root, mid].compact.map { |id| uri_escape(id) }.join("/")
         event = {
           "event_id" => "teams:#{kind}:#{identity}",
-          "fingerprint" => fingerprint(timestamp_string(modified), message.dig("body", "content"),
-                                       message["etag"], message.dig("body", "contentType"), message["subject"]),
+          # Replies/reactions may change lastModifiedDateTime and etag on the
+          # parent. Only message content and deletion state identify a revision.
+          "fingerprint" => fingerprint(message.dig("body", "content"),
+                                       message.dig("body", "contentType"), message["subject"],
+                                       !message["deletedDateTime"].nil?),
           "event_type" => "teams.#{kind}",
           "resource_id" => "message:#{team}/#{channel}/#{root || mid}",
           "actor_id" => teams_actor_id(message["from"]),
@@ -387,7 +390,8 @@ module Aiconshell
             "subject" => message["subject"],
             "content" => message.dig("body", "content"),
             "content_type" => message.dig("body", "contentType"),
-            "last_modified" => timestamp_string(modified), "web_url" => message["webUrl"]
+            "last_modified" => timestamp_string(modified), "web_url" => message["webUrl"],
+            "deleted" => !message["deletedDateTime"].nil?
           }
         }
         [event, modified]
