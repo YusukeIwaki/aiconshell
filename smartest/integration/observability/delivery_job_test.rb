@@ -24,3 +24,13 @@ test("delivery job drains the spool and reports counts") do |db:, observability_
     saved_url.nil? ? ENV.delete("CLICKHOUSE_URL") : ENV.store("CLICKHOUSE_URL", saved_url)
   end
 end
+
+test("delivery job skips all sink work while another session owns the delivery lock") do |db:, observability_config:|
+  row = EventLogging::OutboxAdapter.new.enqueue(EventLogTestSupport.build_envelope, teams_channel: "ops")
+  result = EventLogging::DeliveryLock.with_lock do
+    EventLogDeliveryJob.new.perform
+  end
+
+  expect(result).to be_nil
+  expect(EventDelivery.find_by!(event_id: row["event_id"]).teams_skipped_at).to be_nil
+end

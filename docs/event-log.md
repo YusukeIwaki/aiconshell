@@ -86,7 +86,11 @@ Delivery (`Aiconshell::Observability::DeliveryService`, run by
 One delivery job runs at a time (Solid Queue `limits_concurrency`, `to:
 1`, conflicting runs block and reschedule); concurrent runs are safe for
 ClickHouse (idempotent by `event_id`) but could double-post Teams, so
-they are serialized. A crash between a Teams post and its delivered mark
+they are serialized. A dedicated PostgreSQL session advisory lock also
+guards jobs that outlive the queue semaphore duration; a contending job
+skips that tick. This reserves one extra pool connection without a long
+transaction. Session loss releases the lock and cannot fence an already
+in-flight remote request. A crash between a Teams post and its delivered mark
 can still double-post on redelivery (see below).
 
 ## ClickHouse
@@ -139,15 +143,15 @@ outage cannot recurse into the outbox.
   by `event_id` (background merges eventually; `FINAL` reads exactly).
   `search(event_id:)` re-reads one logical event idempotently.
 - Teams: at-least-once with no provider idempotency. Success followed by a
-  crash before the delivered mark double-posts; concurrent delivery runs
-  can do the same. Keep one scheduler and treat Teams as notification, not
-  record.
+  crash before the delivered mark can double-post; loss of the advisory-lock
+  connection during an in-flight request can do the same. Treat Teams as
+  notification, not the source of record.
 - Outbox: `event_id` unique; `enqueue` is idempotent.
 
 ## Failure behavior and loss conditions
 
 - `emit` performs no network I/O and rescues everything: worst case the
-  event is dropped and a sanitized warning names layer/kind. The Rails
+  event is dropped and a sanitized warning names the exception class. The Rails
   outbox INSERT runs in its own savepoint, so a rescued write error
   (unique conflict, check violation) rolls back only the savepoint and
   never aborts the caller's business transaction. `emit` inside
