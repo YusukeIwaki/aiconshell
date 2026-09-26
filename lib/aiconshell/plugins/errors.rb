@@ -127,6 +127,8 @@ module Aiconshell
     end
 
     # Low-level network failure (DNS, connection refused, TLS, ...).
+    # The cause is curated to a short single line so server response text
+    # or credentials can never leak through exception messages.
     class TransportError < Error
       attr_reader :http_method, :url
 
@@ -134,7 +136,8 @@ module Aiconshell
         @http_method = http_method.to_s.upcase
         @url = Http.sanitize_url(url)
         message = "HTTP transport failure for #{@http_method} #{@url}"
-        message += ": #{cause_message}" if cause_message && !cause_message.empty?
+        curated = cause_message.nil? ? nil : Http.curate_cause(cause_message)
+        message += ": #{curated}" if curated && !curated.empty?
         super(message)
       end
     end
@@ -150,6 +153,34 @@ module Aiconshell
         @allowed_hosts = Array(allowed_hosts).map(&:to_s)
         super("refusing to send request to unexpected host #{@host.inspect}; " \
               "allowed: #{@allowed_hosts.join(", ")}")
+      end
+    end
+
+    # A poll hit a configured page/item bound before the remote listing was
+    # exhausted. No partial cursor is returned: the caller keeps its previous
+    # cursor and retries with a narrower scope or after processing the backlog
+    # (see each adapter README, "Incomplete polls"). Carries no event data,
+    # no server text, and no credentials.
+    class IncompletePoll < Error
+      attr_reader :plugin, :operation, :reason
+
+      def initialize(plugin:, operation:, reason:)
+        @plugin = plugin.to_s
+        @operation = operation.to_s
+        @reason = reason.to_s
+        super("incomplete poll for #{@plugin}##{@operation}: #{@reason}")
+      end
+    end
+
+    # A response body exceeded the transport byte bound while streaming.
+    # Raised before the full body is buffered.
+    class ResponseTooLarge < TransportError
+      attr_reader :limit_bytes
+
+      def initialize(http_method:, url:, limit_bytes:)
+        @limit_bytes = limit_bytes
+        super(http_method: http_method, url: url,
+              cause_message: "response body exceeded #{limit_bytes} bytes")
       end
     end
   end
