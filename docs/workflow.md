@@ -128,7 +128,10 @@ injected only in tests. Web, workers, and Solid Queue share PostgreSQL.
 | `AICONSHELL_MAX_ACTION_ATTEMPTS` | `5` | Outbound attempt cap |
 | `AICONSHELL_DEMO_MODE` | unset | `1` explicitly enables deterministic inbox triage |
 
-Operations must schedule polling per allowlisted scope every five minutes,
+Operations schedules `IntegrationPollScheduleJob` every five minutes; it
+enqueues polling for configured plugins and concrete allowlisted scopes.
+Empty allowlists disable polling, while unconfigured plugins are checked
+again on later ticks. Coordination, recovery, and maintenance use
 `CoordinationTriageJob`, `LeaseRecoveryJob`, and `WorkflowMaintenanceJob`.
 The maintenance job runs every minute to recover outbound leases and enqueue
 due actions and current pending runs, repairing process/enqueue failures.

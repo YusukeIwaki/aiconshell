@@ -20,7 +20,7 @@ module Aiconshell
   # ClickHouse / Teams happens asynchronously via DeliveryService.
   module Observability
     class Config
-      attr_accessor :outbox, :search_backend, :logger, :clock
+      attr_accessor :outbox, :search_backend, :logger, :clock, :default_teams_channel
 
       def initialize
         @outbox = MemoryOutbox.new
@@ -67,6 +67,7 @@ module Aiconshell
       # no network I/O; delivery stays asynchronous.
       def emit!(layer:, kind:, message:, task_id: nil, correlation_id: nil,
                 data: {}, event_id: nil, occurred_at: nil, teams_channel: nil)
+        teams_channel = config.default_teams_channel if teams_channel.nil?
         envelope = Envelope.build(
           layer:, kind:, message:, task_id:, correlation_id:, data:,
           event_id:, occurred_at:, clock: config.clock
