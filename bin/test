@@ -4,51 +4,143 @@
 #
 #   bin/test [unit|integration|all] [-- extra smartest args...]
 #
-# - unit:        smartest/unit/**/*_test.rb, no database, no network, no AI.
-# - integration: smartest/integration/**/*_test.rb against PostgreSQL
-#                (TEST_DATABASE_URL, must end with _test); prepared with
-#                `RAILS_ENV=test bin/rails db:prepare` first.
+# - unit:        every no-DB suite: smartest/unit, smartest/plugins,
+#                smartest/ai, smartest/observability. No database, no
+#                network, no AI calls, no credentials.
+# - integration: smartest/integration (the whole tree, recursively) against
+#                real PostgreSQL (TEST_DATABASE_URL, must end with _test;
+#                prepare once with `RAILS_ENV=test bin/rails db:prepare`)
+#                plus real ClickHouse for the ClickHouse-backed tests
+#                (TEST_CLICKHOUSE_URL et al; see below).
+# - all:         unit, then integration.
 #
-# A suite directory that does not exist yet is skipped with a warning so the
-# runner stays green while lanes land progressively; once present, its tests
-# must pass. CI invokes `bin/test unit` and `bin/test integration`.
+# Every smartest/**/*_test.rb must live under exactly one of the suite
+# roots above. After running, bin/test audits coverage and FAILS listing
+# any orphan file, so a new suite can never land unrunnable. A suite root
+# that has not landed yet is reported loudly and skipped, but anything
+# present is always executed exactly once.
+#
+# ClickHouse-backed integration tests expect a reachable server: when
+# TEST_CLICKHOUSE_URL is set explicitly, bin/test pings it first and fails
+# fast if it is missing, instead of letting every ClickHouse test skip
+# silently. CI always sets it (integration job runs a ClickHouse service).
+#
+# Portable to macOS bash 3.2: no empty-array expansions under `set -u`.
 #
 set -euo pipefail
 
 APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_ROOT"
 
+# Suite roots. unit runs NO_DB_SUITES; integration runs DB_SUITES.
+# Directories expand recursively (<dir>/**/*_test.rb).
+NO_DB_SUITES="smartest/unit smartest/plugins smartest/ai smartest/observability"
+DB_SUITES="smartest/integration"
+
 suite="${1:-all}"
 if [[ "$suite" == "--" ]]; then suite="all"; else shift 2>/dev/null || true; fi
-extra=()
 if [[ "${1:-}" == "--" ]]; then shift; fi
-extra=("$@")
+# Remaining "$@" (possibly empty) is forwarded verbatim to smartest.
 
-run_suite() {
-  local name="$1" dir="$2"
-  if [[ ! -d "$dir" ]]; then
-    echo "bin/test: $name: $dir not present yet, skipping" >&2
-    return 0
+failures=0
+
+# Fail loudly if any *_test.rb is not covered by exactly one suite root.
+audit_coverage() { # mode, ran_description
+  local mode="$1" ran="$2"
+  local orphans=0 file hits root
+  while IFS= read -r file; do
+    hits=0
+    # shellcheck disable=SC2086
+    for root in $NO_DB_SUITES $DB_SUITES; do
+      if [[ "$file" == "$root"/* ]]; then hits=$((hits + 1)); fi
+    done
+    if (( hits == 0 )); then
+      echo "bin/test: FAIL - $file is not under any known suite root ($NO_DB_SUITES $DB_SUITES)" >&2
+      orphans=$((orphans + 1))
+    elif (( hits > 1 )); then
+      echo "bin/test: FAIL - $file matches $hits suite roots (would run twice)" >&2
+      orphans=$((orphans + 1))
+    fi
+  done < <(find smartest -name '*_test.rb' | sort)
+  if (( orphans > 0 )); then
+    echo "bin/test: $mode: $orphans file(s) outside suite coverage" >&2
+    failures=$((failures + 1))
+  else
+    local count
+    count="$(find smartest -name '*_test.rb' | wc -l | tr -d ' ')"
+    echo "bin/test: $mode: coverage ok ($count test file(s), each in exactly one suite; ran: $ran)" >&2
   fi
-  echo "bin/test: $name ($dir)" >&2
-  bundle exec smartest "$dir" "${extra[@]}"
+}
+
+run_unit() { # [extra smartest args...]
+  local ran="" dir
+  # shellcheck disable=SC2086
+  for dir in $NO_DB_SUITES; do
+    if [[ ! -d "$dir" ]]; then
+      echo "bin/test: unit: WARNING - $dir not present in this checkout, skipping (no files missed: coverage audit below enforces it)" >&2
+      continue
+    fi
+    echo "bin/test: unit ($dir)" >&2
+    bundle exec smartest "$dir" "$@"
+    ran="$ran $dir"
+  done
+  if [[ -z "$ran" ]]; then ran="(no suite roots present)"; fi
+  audit_coverage "unit" "$ran"
+}
+
+ping_clickhouse() { # url (credentials stripped from output)
+  local url="$1" display
+  display="$(echo "$url" | sed -E 's#(https?://)[^@]+@#\1#')"
+  echo "bin/test: integration: pinging expected ClickHouse at $display ..." >&2
+  if curl -fsSL --max-time 10 "$url/ping" > /dev/null 2>&1; then
+    echo "bin/test: integration: ClickHouse reachable" >&2
+  else
+    echo "bin/test: FAIL - TEST_CLICKHOUSE_URL is set but $display does not answer /ping; refusing to run integration with silently-skipped ClickHouse tests" >&2
+    exit 1
+  fi
+}
+
+run_integration() { # [extra smartest args...]
+  export RAILS_ENV=test
+  local dir
+  # shellcheck disable=SC2086
+  for dir in $DB_SUITES; do
+    if [[ ! -d "$dir" ]]; then
+      echo "bin/test: FAIL - required DB suite $dir is missing" >&2
+      exit 1
+    fi
+  done
+  if [[ -n "${TEST_CLICKHOUSE_URL:-}" ]]; then
+    ping_clickhouse "$TEST_CLICKHOUSE_URL"
+  else
+    echo "bin/test: integration: TEST_CLICKHOUSE_URL is unset; suites that need ClickHouse use their own defaults and report skips themselves" >&2
+  fi
+  # shellcheck disable=SC2086
+  for dir in $DB_SUITES; do
+    echo "bin/test: integration ($dir)" >&2
+    bundle exec smartest "$dir" "$@"
+  done
+  audit_coverage "integration" "$DB_SUITES"
 }
 
 case "$suite" in
   unit)
-    run_suite "unit" "smartest/unit"
+    run_unit "$@"
     ;;
   integration)
-    export RAILS_ENV=test
-    run_suite "integration" "smartest/integration"
+    run_integration "$@"
     ;;
   all)
-    run_suite "unit" "smartest/unit"
-    export RAILS_ENV=test
-    run_suite "integration" "smartest/integration"
+    run_unit "$@"
+    run_integration "$@"
     ;;
   *)
     echo "usage: bin/test [unit|integration|all] [-- smartest args...]" >&2
     exit 2
     ;;
 esac
+
+if (( failures > 0 )); then
+  echo "bin/test: FAILURES=$failures" >&2
+  exit 1
+fi

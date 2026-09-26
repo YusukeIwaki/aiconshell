@@ -2,12 +2,18 @@
 #
 # Container entrypoint for compose and Railway.
 #
-# Database/ClickHouse setup runs ONLY when AICONSHELL_RUN_SETUP=1, which is
-# set exclusively on the one-shot `migrate` service (compose) or the predeploy
-# path (Railway). Web and worker processes boot straight into their commands,
-# so concurrent `db:prepare` runs can never contend, and a missing AI binary
-# or credential can never block startup (CLIs are resolved lazily at
-# execution time by the AI lane).
+# SQL setup (`bin/rails db:prepare`) runs ONLY when AICONSHELL_RUN_DB_SETUP=1,
+# which is set exclusively on the one-shot `migrate` service (compose) or
+# the predeploy path (Railway). Web and worker processes boot straight into
+# their commands, so concurrent `db:prepare` runs can never contend, and a
+# missing AI binary or credential can never block startup (CLIs are resolved
+# lazily at execution time by the AI lane).
+#
+# ClickHouse schema setup is deliberately NOT part of this entrypoint: the
+# EventLog is eventually consistent, so a logging outage must never block
+# application startup. Schema setup is an independent one-shot
+# (`clickhouse-init` service in compose, separate manual step on Railway);
+# until it succeeds, deliveries stay queued in PostgreSQL and retry.
 #
 # The Rails-foundation `bin/docker-entrypoint` remains available for
 # Kamal/hand-run flows; this script is the compose/Railway wiring.
@@ -18,12 +24,9 @@ if [ -z "${LD_PRELOAD+x}" ]; then
   export LD_PRELOAD
 fi
 
-if [ "${AICONSHELL_RUN_SETUP:-0}" = "1" ]; then
+if [ "${AICONSHELL_RUN_DB_SETUP:-0}" = "1" ]; then
   echo "==> aiconshell setup: db:prepare" >&2
   ./bin/rails db:prepare
-
-  echo "==> aiconshell setup: clickhouse schema" >&2
-  ./bin/setup-clickhouse
 fi
 
 exec "${@}"

@@ -2,12 +2,21 @@
 # scheduling is Solid Queue recurring jobs on the control worker.
 #
 # Jobs:
-#   unit            Smartest unit suite (no DB, no network, no AI, no creds)
-#   integration     Smartest integration suite against a PostgreSQL service
+#   unit            Every no-DB Smartest suite via `bin/test unit`
+#                   (smartest/unit, smartest/plugins, smartest/ai,
+#                   smartest/observability). No DB, no network, no AI, no creds.
+#   integration     The whole smartest/integration tree via
+#                   `bin/test integration` against real PostgreSQL AND real
+#                   ClickHouse services. bin/test pings ClickHouse first and
+#                   fails fast if it is missing, so ClickHouse-backed tests
+#                   can never skip silently here.
 #   zeitwerk        Rails autoloading check
 #   ops             compose config + static ops contracts + image builds
 #                   (app default and optional ai target; no provider login)
-#   clickhouse-smoke  real ClickHouse service + schema setup verification
+#   clickhouse-smoke  bin/setup-clickhouse mechanics against a real
+#                   ClickHouse service, using a generated throwaway probe
+#                   schema (the shipped EventLog schema itself is proven by
+#                   the integration suite, which rebuilds from it).
 name: ci
 
 on:
@@ -32,12 +41,12 @@ jobs:
         with:
           ruby-version: ${{ env.RUBY_VERSION }}
           bundler-cache: true
-      - name: Unit suite (no DB)
+      - name: No-DB suites (unit/plugins/ai/observability)
         run: bin/test unit
 
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17.6-bookworm
@@ -50,19 +59,47 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres -d aiconshell_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.11.7
+        env:
+          CLICKHOUSE_DB: aiconshell_test
+          CLICKHOUSE_USER: aiconshell
+          CLICKHOUSE_PASSWORD: aiconshell_ci
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user aiconshell --password aiconshell_ci --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
     env:
       RAILS_ENV: test
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aiconshell_test
       SECRET_KEY_BASE: ci-dummy-secret-key-base-not-a-real-secret
+      # Observability ClickHouse tests: explicit target so bin/test fails
+      # fast (instead of silently skipping) when the service is missing.
+      # The suite creates this database itself (IF NOT EXISTS).
+      TEST_CLICKHOUSE_URL: http://localhost:8123
+      TEST_CLICKHOUSE_DATABASE: aiconshell_test
+      TEST_CLICKHOUSE_USER: aiconshell
+      TEST_CLICKHOUSE_PASSWORD: aiconshell_ci
+      # Transitional aliases for observability tests moved from the
+      # standalone smartest/observability layout: same CI postgres as the
+      # foundation suite. Harmless once the move adopts TEST_DATABASE_URL.
+      TEST_PG_HOST: localhost
+      TEST_PG_PORT: 5432
+      TEST_PG_DBNAME: aiconshell_test
+      TEST_PG_USER: postgres
+      TEST_PG_PASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.RUBY_VERSION }}
           bundler-cache: true
+      - name: Preflight ClickHouse (fail fast, never silently skip)
+        run: curl -fsSL --max-time 30 "$TEST_CLICKHOUSE_URL/ping"
       - name: Prepare test database
         run: bundle exec rails db:prepare
-      - name: Integration suite (PostgreSQL)
+      - name: Integration suite (PostgreSQL + ClickHouse)
         run: bin/test integration
 
   zeitwerk:
@@ -93,6 +130,14 @@ jobs:
         run: docker build -t aiconshell:ci-app .
       - name: Build optional AI worker image (no Muse secret, no login)
         run: docker build --target ai -t aiconshell:ci-ai .
+      - name: AI worker image carries pinned Linux CLIs
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/claude aiconshell:ci-ai --version
+          docker run --rm --entrypoint /usr/local/bin/codex aiconshell:ci-ai --version
+          docker run --rm --entrypoint /usr/bin/git aiconshell:ci-ai --version
+      - name: Muse CLI absent without build secret (fails at execution)
+        run: |
+          docker run --rm --entrypoint /bin/sh aiconshell:ci-ai -c 'test ! -e /usr/local/bin/muse'
 
   clickhouse-smoke:
     runs-on: ubuntu-latest
@@ -114,7 +159,21 @@ jobs:
       CLICKHOUSE_DATABASE: aiconshell
       CLICKHOUSE_USER: aiconshell
       CLICKHOUSE_PASSWORD: aiconshell_ci
+      # Throwaway probe table: this job proves the setup SCRIPT mechanics
+      # (ping-wait, apply, verify) without depending on the shipped schema.
+      CLICKHOUSE_TABLE: ci_setup_probe
     steps:
       - uses: actions/checkout@v4
-      - name: Apply EventLog schema
-        run: ./bin/setup-clickhouse
+      - name: Apply probe schema via bin/setup-clickhouse
+        run: |
+          mkdir -p "$RUNNER_TEMP/probe-schema"
+          cat > "$RUNNER_TEMP/probe-schema/001_ci_probe.sql" <<'SQL'
+          CREATE TABLE IF NOT EXISTS ci_setup_probe
+          (
+            event_id String,
+            occurred_at DateTime64(3)
+          )
+          ENGINE = MergeTree
+          ORDER BY occurred_at;
+          SQL
+          CLICKHOUSE_SCHEMA_DIR="$RUNNER_TEMP/probe-schema" ./bin/setup-clickhouse

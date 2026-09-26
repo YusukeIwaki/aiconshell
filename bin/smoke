@@ -6,10 +6,14 @@
 #   docker compose up --build -d   # first, in another terminal (or -d here)
 #   ./bin/smoke
 #
-# Checks: web /up, PostgreSQL SELECT 1, ClickHouse ping + event_log table,
-# control/execution containers running, and one shared DATABASE_URL across
-# web/control/execution. Endpoints follow the same *_BIND/*_PORT variables as
-# compose.yml. Never prints credentials.
+# Checks: web /up, PostgreSQL SELECT 1, control/execution containers running
+# with one shared DATABASE_URL and both supervisors registered on that same
+# database, and ClickHouse ping + event_log table. ClickHouse is covered by
+# the eventual-consistency contract: an unreachable server is a WARNING
+# (deliveries stay queued and retry), but a reachable server with a missing
+# table is a FAIL (clickhouse-init should have applied the schema).
+# Endpoints follow the same *_BIND/*_PORT variables as compose.yml. Never
+# prints credentials.
 #
 set -euo pipefail
 
@@ -28,6 +32,7 @@ CH_USER="${CLICKHOUSE_USER:-aiconshell}"
 PROJECT="${COMPOSE_PROJECT_NAME:-aiconshell}"
 
 failures=0
+warnings=0
 check() { # name, command...
   local name="$1"; shift
   if "$@" > /dev/null 2>&1; then
@@ -36,6 +41,10 @@ check() { # name, command...
     echo "smoke: FAIL - $name" >&2
     failures=$((failures + 1))
   fi
+}
+warn() { # name, detail
+  echo "smoke: WARN - $1 ($2)" >&2
+  warnings=$((warnings + 1))
 }
 
 # 1. Web health endpoint.
@@ -55,19 +64,7 @@ else
     docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1"
 fi
 
-# 3. ClickHouse ping + EventLog table present.
-check "clickhouse $CH_URL answers /ping" \
-  curl -fsSL --max-time 10 "$CH_URL/ping"
-table_check() {
-  local out
-  out="$(curl -fsSL --max-time 10 --user "$CH_USER:${CLICKHOUSE_PASSWORD:-}" \
-    --get --data-urlencode "database=$CH_DB" \
-    --data-urlencode "query=EXISTS TABLE $CH_TABLE" "$CH_URL/")"
-  [[ "$out" == "1" ]]
-}
-check "clickhouse table $CH_DB.$CH_TABLE exists" table_check
-
-# 4. Workers running.
+# 3. Workers running.
 for svc in control execution; do
   state="$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | awk -v s="$svc" '$1==s{print $2; exit}')"
   if [[ "$state" == "running" ]]; then
@@ -78,18 +75,23 @@ for svc in control execution; do
   fi
 done
 
-# 5. One shared DATABASE_URL across web/control/execution.
-urls=()
+# 4. One shared DATABASE_URL across web/control/execution.
+url_web="" url_control="" url_execution="" urls_read=0
 for svc in web control execution; do
   if val="$(docker compose exec -T "$svc" printenv DATABASE_URL 2>/dev/null)"; then
-    urls+=("$val")
+    case "$svc" in
+      web) url_web="$val" ;;
+      control) url_control="$val" ;;
+      execution) url_execution="$val" ;;
+    esac
+    urls_read=$((urls_read + 1))
   else
     echo "smoke: FAIL - cannot read DATABASE_URL from $svc" >&2
     failures=$((failures + 1))
   fi
 done
-if (( ${#urls[@]} == 3 )); then
-  if [[ "${urls[0]}" == "${urls[1]}" && "${urls[1]}" == "${urls[2]}" ]]; then
+if (( urls_read == 3 )); then
+  if [[ "$url_web" == "$url_control" && "$url_control" == "$url_execution" ]]; then
     echo "smoke: ok   - web/control/execution share one DATABASE_URL"
   else
     echo "smoke: FAIL - DATABASE_URL differs between services" >&2
@@ -97,5 +99,38 @@ if (( ${#urls[@]} == 3 )); then
   fi
 fi
 
-echo "smoke: project=$PROJECT failures=$failures"
+# 5. Both supervisors registered on that same database (fork-mode bin/jobs
+# registers one Supervisor row each; heartbeats prove they are alive).
+supervisors_registered() {
+  local count
+  local tries=0
+  while (( tries < 18 )); do
+    count="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+      "SELECT COUNT(*) FROM solid_queue_processes WHERE kind LIKE 'Supervisor%' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'" 2>/dev/null | tr -d ' ')"
+    if [[ "$count" == "2" ]]; then return 0; fi
+    tries=$((tries + 1))
+    sleep 5
+  done
+  return 1
+}
+check "control+execution supervisors registered on shared DB (2 heartbeats)" \
+  supervisors_registered
+
+# 6. ClickHouse: unreachable is a warning (queued + retried); reachable
+# with a missing table is a failure (schema setup did not run).
+if curl -fsSL --max-time 10 "$CH_URL/ping" > /dev/null 2>&1; then
+  echo "smoke: ok   - clickhouse $CH_URL answers /ping"
+  table_check() {
+    local out
+    out="$(curl -fsSL --max-time 10 --user "$CH_USER:${CLICKHOUSE_PASSWORD:-}" \
+      --get --data-urlencode "database=$CH_DB" \
+      --data-urlencode "query=EXISTS TABLE $CH_TABLE" "$CH_URL/")"
+    [[ "$out" == "1" ]]
+  }
+  check "clickhouse table $CH_DB.$CH_TABLE exists" table_check
+else
+  warn "clickhouse $CH_URL unreachable" "EventLog deliveries stay queued in PostgreSQL and retry; run 'docker compose up clickhouse-init' once it is back"
+fi
+
+echo "smoke: project=$PROJECT failures=$failures warnings=$warnings"
 exit "$([ "$failures" -eq 0 ] && echo 0 || echo 1)"

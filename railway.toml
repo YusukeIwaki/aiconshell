@@ -9,7 +9,7 @@
 #   - PostgreSQL plugin  -> provides DATABASE_URL (reference it, see below)
 #   - ClickHouse template -> provides CLICKHOUSE_URL/USER/PASSWORD/DATABASE
 # Attach private volumes for /private/claude, /private/codex, /private/muse
-# on the control and execution services only.
+# and /workspaces on the control and execution services only.
 
 [build]
 builder = "DOCKERFILE"
@@ -18,9 +18,11 @@ dockerfilePath = "Dockerfile"
 [deploy]
 # Thruster fronts Puma and honors Railway's injected PORT.
 startCommand = "./bin/thrust ./bin/rails server"
-# Single migration/setup step before each deploy (db:prepare is idempotent;
-# setup-clickhouse re-applies the IF NOT EXISTS schema, then verifies it).
-preDeployCommand = "./bin/rails db:prepare && ./bin/setup-clickhouse"
+# SQL migrations only (db:prepare is idempotent). ClickHouse schema setup
+# is intentionally separate (see docs/deployment.md): the EventLog is
+# eventually consistent, so a logging outage must never block deploys.
+# Run `./bin/setup-clickhouse` via `railway run` when ClickHouse is up.
+preDeployCommand = "./bin/rails db:prepare"
 healthcheckPath = "/up"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"

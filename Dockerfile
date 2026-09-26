@@ -5,15 +5,21 @@
 # Targets:
 #   app (default) - Rails web / Solid Queue workers without AI CLIs.
 #                   Missing AI credentials or binaries never block this image.
-#   ai            - `app` plus Node.js and the Claude/Codex subscription CLIs
-#                   (pinned, overridable versions). The Muse CLI is an
-#                   authenticated distribution: operators inject an authorized
-#                   Linux binary via a build secret; it is never copied from the
-#                   host checkout and never baked in without that secret.
+#   ai            - `app` plus Node.js, git, and the Claude/Codex subscription
+#                   CLIs (pinned, overridable versions). The Muse CLI is an
+#                   authenticated distribution: operators supply an authorized
+#                   Linux binary via a BuildKit secret, and the build COPIES it
+#                   into /usr/local/bin/muse intentionally. Only the secret
+#                   mount itself is ephemeral (it never lands in a layer);
+#                   without the secret the binary is simply absent and the
+#                   provider fails at execution time. Auth credentials always
+#                   stay outside the image (mounted volumes, never baked in).
 #
 #   docker build -t aiconshell:app .
-#   docker build --target ai -t aiconshell:ai \
+#   docker build --target ai --no-cache -t aiconshell:ai \
 #     --secret id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse .
+# (--no-cache: BuildKit caches secret-mount layers, so toggling the
+# secret without it can reuse a stale layer.)
 #
 # See docs/deployment.md ("AI CLI provisioning") for the operator flow.
 
@@ -36,12 +42,15 @@ ENV RAILS_ENV="production" \
 # Private AI auth homes. Backed by named/persisted volumes in compose and
 # Railway so subscription token refresh can write without touching the image.
 # The AI lane resolves these via CLAUDE_CONFIG_DIR / CODEX_HOME /
-# MUSE_CONFIG_DIR (see lib/aiconshell/ai/config.rb); their *contents* are
-# never read by the app image, only mounted for the CLIs.
-RUN mkdir -p /private/claude /private/codex /private/muse && \
+# AICONSHELL_MUSE_HOME (see lib/aiconshell/ai/config.rb); their *contents*
+# (credentials) live only in the mounted volumes, never in image layers.
+# /workspaces is the execution-workspace root (AICONSHELL_EXECUTION_ROOT):
+# also a persisted volume at runtime, outside the application source.
+# Everything is owned by uid/gid 1000 (rails) so workers can write.
+RUN mkdir -p /private/claude /private/codex /private/muse /workspaces && \
     groupadd --system --gid 1000 rails && \
     useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash && \
-    chown -R rails:rails /private
+    chown -R rails:rails /private /workspaces
 
 # Throw-away build stage to reduce size of final images.
 FROM base AS build
@@ -86,7 +95,7 @@ RUN set -e; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH:-<unset>}" >&2; exit 1 ;; \
     esac; \
     apt-get update -qq && \
-    apt-get install --no-install-recommends -y xz-utils ca-certificates && \
+    apt-get install --no-install-recommends -y xz-utils ca-certificates git && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives; \
     curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
       -o /tmp/node.tar.xz; \
@@ -104,13 +113,17 @@ RUN npm install -g --no-audit --no-fund \
     codex --version
 
 # Muse CLI: authenticated distribution supplied by the operator at build time.
-# Without `--secret id=muse_cli,src=<authorized Linux binary>` the image still
-# builds; `muse` is simply absent and the provider fails at execution time.
-# Never commit the binary or credentials into the repository.
+# `install` copies the binary into /usr/local/bin/muse ON PURPOSE: the
+# executable is part of the ai image. What disappears after the build is
+# only the secret mount (/run/secrets/muse_cli leaves no layer behind).
+# Without `--secret id=muse_cli,src=<authorized Linux binary>` the image
+# still builds; `muse` is simply absent and the provider fails at execution
+# time. Never commit the binary or credentials into the repository.
 RUN --mount=type=secret,id=muse_cli,required=false \
     if [ -f /run/secrets/muse_cli ]; then \
       install -m 0755 /run/secrets/muse_cli /usr/local/bin/muse && \
-      echo "muse CLI installed from build secret"; \
+      muse --version && \
+      echo "muse CLI installed from build secret into the image"; \
     else \
       echo "muse CLI not supplied; skipping (see docs/deployment.md)"; \
     fi
@@ -141,9 +154,10 @@ COPY --from=build /rails /rails
 RUN chown -R rails:rails db log tmp
 USER 1000:1000
 
-# Entrypoint runs db:prepare + ClickHouse setup only when
-# AICONSHELL_RUN_SETUP=1 (the compose `migrate` service / Railway predeploy
-# path); web and workers boot straight into their commands.
+# Entrypoint runs db:prepare only when AICONSHELL_RUN_DB_SETUP=1 (the
+# compose `migrate` service); web and workers boot straight into their
+# commands. ClickHouse schema setup is a separate one-shot service
+# (`clickhouse-init`) so logging outages never block application startup.
 ENTRYPOINT ["/rails/script/docker-entrypoint"]
 
 # Start server via Thruster by default, this can be overwritten at runtime.
