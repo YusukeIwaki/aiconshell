@@ -71,7 +71,8 @@ test("Delivery reads ClickHouse config from ENV and tolerates missing plugins") 
     expect(adapter.database).to eq("aiconshell")
     expect(adapter.table).to eq("event_log")
   end
-  expect(EventLogging::Delivery.plugins_registry).to be_nil
+  expected_registry = defined?(Aiconshell::Plugins::Registry) ? Aiconshell::Plugins::Registry.default : nil
+  expect(EventLogging::Delivery.plugins_registry.equal?(expected_registry)).to eq(true)
   expect(EventLogging::Delivery.teams_sink.enabled?).to eq(false)
 end
 

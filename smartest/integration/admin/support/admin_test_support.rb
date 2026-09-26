@@ -123,8 +123,8 @@ module AdminTestSupport
 
   # Runs the block with the REAL ClickHouseAdapter wired as the search
   # backend, but with an injected fake transport (no network). Yields the
-  # list of captured transport requests. Restores the default (nil)
-  # backend afterwards.
+  # list of captured transport requests. Restores the previous search
+  # backend without resetting the Rails outbox wiring.
   def self.with_real_clickhouse_search(rows)
     unless defined?(Aiconshell::Observability::ClickHouseAdapter)
       require "aiconshell/observability"
@@ -138,11 +138,12 @@ module AdminTestSupport
     adapter = Aiconshell::Observability::ClickHouseAdapter.new(
       base_url: "http://127.0.0.1:9", database: "admin_test", transport:
     )
+    previous_backend = Aiconshell::Observability.config.search_backend
     Aiconshell::Observability.configure { |config| config.search_backend = adapter }
     Admin::EventLogSearch.reset!
     yield requests
   ensure
-    Aiconshell::Observability.reset!
+    Aiconshell::Observability.configure { |config| config.search_backend = previous_backend }
     Admin::EventLogSearch.reset!
   end
 
