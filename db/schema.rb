@@ -10,9 +10,37 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_26_145131) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_000001) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
+
+  create_table "event_deliveries", force: :cascade do |t|
+    t.text "event_id", null: false
+    t.jsonb "envelope", default: {}, null: false
+    t.text "layer", null: false
+    t.text "kind", null: false
+    t.bigint "task_id"
+    t.text "correlation_id"
+    t.timestamptz "occurred_at", null: false
+    t.text "teams_channel"
+    t.timestamptz "clickhouse_delivered_at"
+    t.integer "clickhouse_attempts", default: 0, null: false
+    t.timestamptz "clickhouse_next_retry_at"
+    t.text "clickhouse_last_error"
+    t.timestamptz "clickhouse_skipped_at"
+    t.timestamptz "teams_delivered_at"
+    t.integer "teams_attempts", default: 0, null: false
+    t.timestamptz "teams_next_retry_at"
+    t.text "teams_last_error"
+    t.timestamptz "teams_skipped_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["clickhouse_delivered_at", "clickhouse_next_retry_at"], name: "index_event_deliveries_on_clickhouse_pending"
+    t.index ["event_id"], name: "index_event_deliveries_on_event_id", unique: true
+    t.index ["occurred_at"], name: "index_event_deliveries_on_occurred_at"
+    t.index ["teams_delivered_at", "teams_next_retry_at"], name: "index_event_deliveries_on_teams_pending"
+    t.check_constraint "char_length(kind) <= 128", name: "event_deliveries_kind_length_check"
+  end
 
   create_table "solid_queue_batch_executions", force: :cascade do |t|
     t.bigint "job_id", null: false

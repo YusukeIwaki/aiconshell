@@ -10,11 +10,15 @@ module Aiconshell
     # Minimal ClickHouse HTTP adapter: batch JSONEachRow inserts and
     # parameterized search reads. All user-controlled values travel as
     # `{name:Type}` query parameters; nothing is interpolated into SQL except
-    # validated identifiers and clamped integers.
+    # validated identifiers and clamped integers. Substring search is
+    # `message LIKE %...%` (literal, escaped, length-bounded): on 26.8 LIKE
+    # is what the text/ngrambf skip indexes accelerate, while
+    # position()-based predicates and cross-column ORs use no skipping.
     class ClickHouseAdapter
       DEFAULT_TABLE = "event_log"
       DEFAULT_LIMIT = 100
       MAX_LIMIT = 1000
+      MAX_QUERY_CHARS = 200
       IDENTIFIER_PATTERN = /\A[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*\z/
 
       Response = Struct.new(:status, :body)
@@ -119,26 +123,52 @@ module Aiconshell
         end
 
         validate_layer!(layer)
-        add.call("layer = {flt_layer:String}", "flt_layer", layer) unless layer.nil?
-        add.call("kind = {flt_kind:String}", "flt_kind", kind) unless kind.nil?
+        add.call("layer = {flt_layer:String}", "flt_layer", transport_string(layer)) unless layer.nil?
+        add.call("kind = {flt_kind:String}", "flt_kind", transport_string(kind)) unless kind.nil?
         unless task_id.nil?
           raise ArgumentError, "task_id must be an Integer" unless task_id.is_a?(Integer)
 
           add.call("task_id = {flt_task:Int64}", "flt_task", task_id.to_s)
         end
         unless correlation_id.nil?
-          add.call("correlation_id = {flt_corr:String}", "flt_corr", correlation_id.to_s)
+          add.call("correlation_id = {flt_corr:String}", "flt_corr", transport_string(correlation_id))
         end
-        add.call("event_id = {flt_event:String}", "flt_event", event_id.to_s) unless event_id.nil?
+        unless event_id.nil?
+          add.call("event_id = {flt_event:String}", "flt_event", transport_string(event_id))
+        end
         add.call("occurred_at >= parseDateTime64BestEffort({flt_since:String})",
                  "flt_since", canonical_time!(since, "since")) unless since.nil?
         add.call("occurred_at <= parseDateTime64BestEffort({flt_until:String})",
                  "flt_until", canonical_time!(until_time, "until_time")) unless until_time.nil?
         unless query.nil? || query.to_s.empty?
-          conditions << "(position(message, {flt_q:String}) > 0 OR position(kind, {flt_q:String}) > 0)"
-          params["param_flt_q"] = query.to_s
+          # Literal substring over message only. LIKE (not position) is what
+          # the text/ngrambf skip indexes accelerate on 26.8, and kind has
+          # its own exact filter, so no OR that would disable skipping.
+          conditions << "message LIKE {flt_like:String}"
+          params["param_flt_like"] = like_pattern(query.to_s)
         end
         [conditions, params]
+      end
+
+      # Builds a LIKE pattern matching the query literally: LIKE wildcards
+      # (%, _) and the backslash escape are quoted, the match is wrapped in
+      # intentional %...% wildcards, and every remaining backslash is doubled
+      # for the HTTP param transport (ClickHouse unescapes \\ and sequences
+      # like \b in param values before LIKE sees them).
+      def like_pattern(text)
+        if text.length > MAX_QUERY_CHARS
+          raise ArgumentError, "query must be at most #{MAX_QUERY_CHARS} characters"
+        end
+
+        like_escaped = text.gsub(/([%_\\])/) { |match| "\\#{match}" }
+        "%#{like_escaped}%".gsub("\\") { "\\\\" }
+      end
+
+      # HTTP param transport unescapes backslash sequences in String params;
+      # doubling keeps user backslashes literal. A no-op for values without
+      # backslashes.
+      def transport_string(value)
+        value.to_s.gsub("\\") { "\\\\" }
       end
 
       def validate_layer!(layer)
@@ -193,18 +223,20 @@ module Aiconshell
         Response.new(response.code.to_i, response.body.to_s)
       end
 
+      # Curated failures only: HTTP status and action, never the raw
+      # response body (it can echo credentials, sentinels, or row content).
       def ensure_success!(response, action)
         return if response.status == 200
 
-        detail = Redaction.truncate_string(response.body.to_s.gsub(/\s+/, " ").strip, 300)
-        raise ClickHouseError, "clickhouse #{action} failed (HTTP #{response.status}): #{detail}"
+        raise ClickHouseError, "clickhouse #{action} failed (HTTP #{response.status})"
       end
 
       def parse_search_response(body)
         payload = JSON.parse(body)
         Array(payload["data"]).map { |row| normalize_row(row) }
-      rescue JSON::ParserError => e
-        raise ClickHouseError, "clickhouse search returned invalid JSON: #{Redaction.sanitize_error(e)}"
+      rescue JSON::ParserError
+        # No parser detail: JSON errors quote the offending content.
+        raise ClickHouseError, "clickhouse search returned invalid JSON"
       end
 
       def normalize_row(row)

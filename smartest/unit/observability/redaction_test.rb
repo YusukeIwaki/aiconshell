@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "test_helper"
+require "event_log_fixtures"
 
 Redaction = Aiconshell::Observability::Redaction
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "test_helper"
+require "event_log_fixtures"
 
 DeliveryService = Aiconshell::Observability::DeliveryService
 
@@ -131,4 +132,96 @@ test("prune keeps rows with a pending destination") do |memory_outbox:, test_log
 
   expect(service.prune(retention_days: 7)).to eq(0)
   expect(memory_outbox.size).to eq(1)
+end
+
+# Regression fake: listing one destination blows up while the other works.
+class PendingFailureOutbox
+  def initialize(records, failing_destination)
+    @records = records
+    @failing_destination = failing_destination
+    @marks = Hash.new { |hash, key| hash[key] = [] }
+  end
+
+  attr_reader :marks
+
+  def pending(destination, limit:, now:)
+    raise IOError, "#{destination} spool unreadable" if destination == @failing_destination
+
+    @records.first(limit)
+  end
+
+  def mark_delivered(id, destination, at:)
+    @marks["delivered-#{destination}"] << id
+  end
+
+  def mark_failed(id, destination, error:, next_retry_at:)
+    @marks["failed-#{destination}"] << id
+  end
+
+  def mark_skipped(id, destination, reason:, at:)
+    @marks["skipped-#{destination}"] << id
+  end
+end
+
+test("clickhouse pending failure still delivers teams and reports accurately") do |test_logger:, fixed_clock:|
+  envelope = EventLogTestSupport.build_envelope
+  record = { "id" => 1, "event_id" => envelope["event_id"], "envelope" => envelope,
+             "teams_channel" => "ops",
+             "clickhouse" => { "attempts" => 0 }, "teams" => { "attempts" => 0 } }
+  outbox = PendingFailureOutbox.new([record], "clickhouse")
+  teams = EventLogTestSupport::FakeTeamsSink.new
+  service = DeliveryService.new(outbox:, clickhouse: EventLogTestSupport::FakeClickHouseSink.new,
+                                teams:, logger: test_logger, clock: fixed_clock)
+
+  summary = service.deliver_pending
+
+  expect(summary.clickhouse).to eq({ "delivered" => 0, "failed" => 0, "skipped" => 0 })
+  expect(summary.teams).to eq({ "delivered" => 1, "failed" => 0, "skipped" => 0 })
+  expect(summary.error).to match(/clickhouse/)
+  expect(teams.delivered_records.size).to eq(1)
+end
+
+test("mark failures are counted without stopping the batch or Teams") do |test_logger:, fixed_clock:|
+  envelopes = [EventLogTestSupport.build_envelope, EventLogTestSupport.build_envelope(message: "second")]
+  records = envelopes.map.with_index(1) do |envelope, id|
+    { "id" => id, "event_id" => envelope["event_id"], "envelope" => envelope,
+      "teams_channel" => "ops",
+      "clickhouse" => { "attempts" => 0 }, "teams" => { "attempts" => 0 } }
+  end
+  outbox = PendingFailureOutbox.new(records, "never")
+  def outbox.mark_delivered(id, destination, at:)
+    raise IOError, "mark store down" if destination == "clickhouse"
+
+    super
+  end
+  teams = EventLogTestSupport::FakeTeamsSink.new
+  service = DeliveryService.new(outbox:, clickhouse: EventLogTestSupport::FakeClickHouseSink.new,
+                                teams:, logger: test_logger, clock: fixed_clock)
+
+  summary = service.deliver_pending
+
+  # Both ClickHouse marks failed (counted), yet Teams still delivered both.
+  expect(summary.clickhouse).to eq({ "delivered" => 0, "failed" => 2, "skipped" => 0 })
+  expect(summary.teams).to eq({ "delivered" => 2, "failed" => 0, "skipped" => 0 })
+  expect(summary.error).to be_nil
+end
+
+test("rows give up as skipped after MAX_ATTEMPTS failures") do |memory_outbox:, test_logger:, fixed_clock:|
+  envelope = EventLogTestSupport.build_envelope
+  record = memory_outbox.enqueue(envelope, teams_channel: "ops")
+  (DeliveryService::MAX_ATTEMPTS - 1).times do
+    memory_outbox.mark_failed(record["id"], "clickhouse",
+                              error: "down", next_retry_at: fixed_clock.now.utc)
+  end
+  service = delivery_service(
+    memory_outbox:, test_logger:, fixed_clock:,
+    clickhouse: EventLogTestSupport::FakeClickHouseSink.new(error: RuntimeError.new("still down"))
+  )
+
+  summary = service.deliver_pending
+
+  expect(summary.clickhouse).to eq({ "delivered" => 0, "failed" => 0, "skipped" => 1 })
+  found = memory_outbox.find_by_event_id(envelope["event_id"])
+  expect(found["clickhouse"]["skipped_at"]).to eq(fixed_clock.now.utc)
+  expect(memory_outbox.pending("clickhouse", limit: 10, now: fixed_clock.now.utc + 1_000_000)).to eq([])
 end

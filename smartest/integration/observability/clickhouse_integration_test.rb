@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "integration/observability_helper"
 
 def seed_events(adapter)
   first = EventLogTestSupport.build_envelope(
@@ -76,4 +76,17 @@ test("injection strings are literals, limits clamp") do |ch_event_log:|
   expect(ch_event_log.search(kind: "task.prioritized' OR '1'='1")).to eq([])
   expect(ch_event_log.search(limit: 5000).size).to eq(3)
   expect(ch_event_log.search(limit: 1).size).to eq(1)
+end
+
+test("LIKE wildcards and backslashes match literally") do |ch_event_log:|
+  percent = EventLogTestSupport.build_envelope(message: "disk at 100% capacity")
+  underscore = EventLogTestSupport.build_envelope(message: "rate under_score applied")
+  backslash = EventLogTestSupport.build_envelope(message: "path C:\\logs\\app checked")
+  ch_event_log.insert([percent, underscore, backslash])
+
+  expect(ch_event_log.search(query: "100%").map { |r| r["event_id"] }).to eq([percent["event_id"]])
+  expect(ch_event_log.search(query: "under_score").map { |r| r["event_id"] }).to eq([underscore["event_id"]])
+  expect(ch_event_log.search(query: "C:\\logs\\app").map { |r| r["event_id"] }).to eq([backslash["event_id"]])
+  # A bare % must not degenerate into match-everything.
+  expect(ch_event_log.search(query: "%").map { |r| r["event_id"] }).to eq([percent["event_id"]])
 end

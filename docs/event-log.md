@@ -70,14 +70,23 @@ Delivery (`Aiconshell::Observability::DeliveryService`, run by
   (`teams` / `send_message`); when the sink is disabled the rows are marked
   skipped, not retried.
 - Failures back off exponentially (2 min × 2^(attempts−1), capped at 6 h)
-  per destination. ClickHouse success followed by Teams failure never
-  re-inserts into ClickHouse.
-- Delivered rows are pruned after 7 days (`prune_retention_days:`). The
+  per destination, bounded at 25 attempts: a row that keeps failing is
+  marked skipped (terminal, prunable) so a long outage cannot grow the
+  spool without bound. Skipped ClickHouse rows never reach history —
+  alert on `*_skipped_at` growth. ClickHouse success followed by Teams
+  failure never re-inserts into ClickHouse.
+- Each sink run is isolated: a failure listing, inserting, posting, or
+  marking rows for one destination is counted and logged while the other
+  destination still runs. No DB transaction is held over HTTP calls.
+- Delivered rows are pruned after 7 days (`prune_retention_days:`); rows
+  terminal in both destinations (delivered or skipped) are prunable. The
   spool is not an archive: history lives in ClickHouse.
 
-Run one delivery job at a time (Solid Queue concurrency limit); concurrent
-runs are safe for ClickHouse (idempotent by `event_id`) but can double-post
-Teams on crash replays (see below).
+One delivery job runs at a time (Solid Queue `limits_concurrency`, `to:
+1`, conflicting runs block and reschedule); concurrent runs are safe for
+ClickHouse (idempotent by `event_id`) but could double-post Teams, so
+they are serialized. A crash between a Teams post and its delivered mark
+can still double-post on redelivery (see below).
 
 ## ClickHouse
 
@@ -86,15 +95,27 @@ against ClickHouse 26.8.11.7):
 
 - `ReplacingMergeTree(ingested_at)`, `ORDER BY (event_id, occurred_at)`,
   monthly partitions, TTL 180 days, ZSTD on `data_json`.
-- `ngrambf` index for substring search (`position`/`LIKE`), which covers
-  Japanese text that has no whitespace tokens; `text` index for ASCII token
-  queries (`hasToken`); bloom filter on `correlation_id`.
+- Substring search is `message LIKE %...%` over the `message` column only
+  (`kind` has its own exact-match filter; there is no cross-column OR).
+  The query text is matched literally: LIKE wildcards (`%`, `_`) and the
+  backslash are escaped, the pattern stays a `{name:Type}` parameter, and
+  queries are capped at 200 characters. Backslashes are additionally
+  doubled for the HTTP param transport, which unescapes sequences such as
+  `\\` and `\b` before LIKE evaluation.
+- Skip-index usage was verified with `EXPLAIN indexes = 1` on 26.8.11.7
+  against a multi-granule fixture holding rare English and Japanese
+  strings: the LIKE predicate narrows granules through the `text` index
+  (ASCII) and the `ngrambf` index (including Japanese, which has no
+  whitespace tokens), while `position(message, …) > 0` — alone or ORed
+  with a `kind` predicate — uses no skipping and is therefore not used.
+  A bloom filter covers `correlation_id`.
 - Reads always use `FINAL` (exact dedupe) with `ORDER BY occurred_at DESC`
   and a clamped `LIMIT` (default 100, max 1000). Writes are HTTP
   `JSONEachRow` batches with 5 s connect / 15 s read timeouts.
 - All user input travels as `{name:Type}` parameters over the HTTP
   interface; table names are allow-list validated and limits are clamped
-  integers. No user text is interpolated into SQL.
+  integers. No user text is interpolated into SQL. Failures report only a
+  curated status/action string, never raw response bodies.
 
 Minimum resources: a single ClickHouse node is sufficient for this
 workload; start with the vendor's small single-node sizing (2 vCPU / 4 GiB
@@ -125,9 +146,12 @@ outage cannot recurse into the outbox.
 ## Failure behavior and loss conditions
 
 - `emit` performs no network I/O and rescues everything: worst case the
-  event is dropped and a sanitized warning names layer/kind. `emit` inside
-  a rolled-back transaction loses the row with it (outbox write shares the
-  transaction); emit after commit for must-keep audit events.
+  event is dropped and a sanitized warning names layer/kind. The Rails
+  outbox INSERT runs in its own savepoint, so a rescued write error
+  (unique conflict, check violation) rolls back only the savepoint and
+  never aborts the caller's business transaction. `emit` inside
+  a rolled-back transaction still loses the row with it (the savepoint is
+  part of that transaction); emit after commit for must-keep audit events.
 - Outbox (PostgreSQL) down: `emit` drops with a warning; delivery runs
   fail loudly in logs and retry on the next tick. Events emitted during the
   outage are lost — the documented trade-off for "logging never breaks
@@ -164,11 +188,16 @@ delivery-job errors, ClickHouse `system.merges` lag, and spool table size
 (prune keeps it to ~7 days of delivered rows). To re-apply schema, re-run
 the init SQL (idempotent); column changes ship as new `ALTER` files.
 
-Rails wiring note: `lib/aiconshell` is required explicitly (`require
+Rails wiring: `config/initializers/event_log.rb` points the port at
+`EventLogging::OutboxAdapter` and the ENV-built ClickHouse adapter inside
+`to_prepare` (reload-safe, no DB/network I/O at boot — a missing
+`CLICKHOUSE_URL` leaves search unconfigured and it raises
+`NotConfiguredError`). Rails therefore never silently uses the
+`MemoryOutbox` default. `lib/aiconshell` is required explicitly (`require
 "aiconshell/observability"`), not via Zeitwerk autoload, so the same files
-load standalone in scripts and tests. If the foundation enables
-`config.autoload_lib`, exclude `lib/aiconshell` from autoloading (or remove
-the explicit requires) — mixing both double-defines constants.
+load standalone in scripts and tests; `config/application.rb` lists
+`aiconshell` in `autoload_lib(ignore:)` — mixing both double-defines
+constants.
 
 ## Why ClickHouse over MongoDB for this log
 

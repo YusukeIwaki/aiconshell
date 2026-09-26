@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require "event_log_helper"
+require "test_helper"
+require "event_log_fixtures"
 
 ClickHouseAdapter = Aiconshell::Observability::ClickHouseAdapter
 FakeTransport = EventLogTestSupport::FakeClickHouseTransport
@@ -56,12 +57,36 @@ test("search parameterizes every user value (injection-safe)") do
   request = transport.requests.first
   sql = request[:body]
   expect(sql).not_to match(/' OR '1'/)
-  expect(sql).to match(/\{flt_q:String\}/)
+  expect(sql).to match(/message LIKE \{flt_like:String\}/)
+  expect(sql).not_to match(/position\(/)
   expect(sql).to match(/FINAL/)
   params = URI.decode_www_form(request[:uri].query).to_h
-  expect(params["param_flt_q"]).to eq("' OR '1'='1")
+  expect(params["param_flt_like"]).to eq("%' OR '1'='1%")
   expect(params["param_flt_corr"]).to eq("c'1")
   expect(params["database"]).to eq("aiconshell")
+end
+
+test("search escapes LIKE wildcards and backslashes as literals") do
+  body = JSON.generate({ "data" => [], "rows" => 0 })
+  transport = FakeTransport.new([FakeResponse.new(200, body)])
+  adapter = build_adapter(transport)
+
+  adapter.search(query: "100% under_score back\\slash")
+
+  params = URI.decode_www_form(transport.requests.first[:uri].query).to_h
+  # LIKE-escaped (%, _, \ quoted) then transport-escaped (each backslash
+  # doubled so ClickHouse param unescaping restores the LIKE pattern).
+  expect(params["param_flt_like"]).to eq("%100\\\\% under\\\\_score back\\\\\\\\slash%")
+end
+
+test("search bounds query length") do
+  transport = FakeTransport.new([FakeResponse.new(200, JSON.generate({ "data" => [] }))])
+  adapter = build_adapter(transport)
+
+  expect(-> { adapter.search(query: "x" * 201) }).to raise_error(ArgumentError)
+  expect(transport.requests).to eq([])
+  adapter.search(query: "x" * 200)
+  expect(transport.requests.size).to eq(1)
 end
 
 test("search validates layer, times, and table names") do
@@ -101,7 +126,21 @@ test("transport and server failures raise sanitized ClickHouseError") do
     expect(e.message).not_to match(/zzz/)
   end
 
-  bad = FakeTransport.new([FakeResponse.new(500, "Code: 60. DB::Exception: boom")])
-  expect(-> { build_adapter(bad).insert([EventLogTestSupport.build_envelope]) })
-    .to raise_error(Aiconshell::Observability::ClickHouseError)
+  bad = FakeTransport.new([FakeResponse.new(500, "Code: 60. DB::Exception: boom password=hunter2")])
+  begin
+    build_adapter(bad).insert([EventLogTestSupport.build_envelope])
+    raise "expected ClickHouseError"
+  rescue Aiconshell::Observability::ClickHouseError => e
+    expect(e.message).to eq("clickhouse insert 1 row(s) failed (HTTP 500)")
+    expect(e.message).not_to match(/boom|hunter2|DB::Exception/)
+  end
+
+  invalid = FakeTransport.new([FakeResponse.new(200, "{not json, sentinel=xyz")])
+  begin
+    build_adapter(invalid).search
+    raise "expected ClickHouseError"
+  rescue Aiconshell::Observability::ClickHouseError => e
+    expect(e.message).to eq("clickhouse search returned invalid JSON")
+    expect(e.message).not_to match(/xyz/)
+  end
 end
