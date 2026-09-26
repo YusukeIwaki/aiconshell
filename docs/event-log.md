@@ -130,6 +130,14 @@ measured availability needs them.
 
 ## Teams delivery
 
+Set `EVENT_LOG_TEAMS_CHANNEL=channel:<teamId>/<channelId>` to send each
+layer's events to one operator-configured channel. Leave it empty to keep
+history searchable without Teams notifications. Configure the Teams plugin's
+credentials and `TEAMS_BOT_TARGETS_FILE` conversation mapping as described in
+`plugins/teams/README.md`; Graph channel IDs are not Bot conversation IDs.
+The destination is captured on each outbox row when the event is emitted.
+An internal caller may pass an explicit `teams_channel` to override it.
+
 `TeamsSink` calls `registry.invoke(plugin: "teams", operation:
 "send_message", input: {"scope", "body"})` with a ≤1000-char
 `[layer/kind] message (task #id)` body. It is disabled when no registry is

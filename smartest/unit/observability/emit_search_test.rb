@@ -37,6 +37,19 @@ test("emit never raises: invalid input is dropped with a sanitized warning") do 
   expect(log_output.string).to match(/emit dropped/)
 end
 
+test("configured Teams channel receives events from every layer") do |memory_outbox:|
+  Observability.configure do |config|
+    config.outbox = memory_outbox
+    config.default_teams_channel = "channel:team/operations"
+  end
+
+  %w[interaction coordination execution].each do |layer|
+    envelope = Observability.emit(layer: layer, kind: "work.updated", message: "Updated")
+    record = memory_outbox.find_by_event_id(envelope["event_id"])
+    expect(record["teams_channel"]).to eq("channel:team/operations")
+  end
+end
+
 test("emit never raises: outbox failures are contained") do |test_logger:, log_output:|
   broken = Object.new
   def broken.enqueue(*)
