@@ -292,20 +292,52 @@ GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
 
 ## 8. ngrok（明示 opt-in）
 
-通常は不要（外部取得はポーリングのため）。Webhook デモ等でのみ使う:
+通常は不要（外部取得はポーリングのため）。一時的な公開デモに使う場合は
+既定の `RAILS_ENV=development` で次の手順を行う。公開前に `.env` の
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` と十分に長い `SECRET_KEY_BASE` を設定する。
 
 ```sh
-NGROK_AUTHTOKEN=... docker compose --profile tunnel up ngrok
+# .env に NGROK_AUTHTOKEN を設定してから起動
+docker compose --profile tunnel up -d ngrok
 # 管理 UI: http://127.0.0.1:4040（NGROK_PORT で変更可）
 ```
 
-注意:
+起動ログ・管理 UI で公開 URL を確認し、**そのホスト名だけ**を `.env` に
+追加する。たとえば URL が `https://your-assigned-name.ngrok-free.app` の場合:
 
-- 公開 URL は起動ログ・管理 UI で確認し、使う相手にだけ共有する。
-- Rails の Host 認可に公開ホストの許可が必要。トンネル利用時は
-  `config/environments/production.rb` の `config.hosts` に公開ホストを
-  追加する（既定の開発起動では不要）。
-- トークンは `.env`（git 管理外）のみ。CI・イメージに混入しない。
+```dotenv
+RAILS_DEVELOPMENT_HOSTS=your-assigned-name.ngrok-free.app
+```
+
+```sh
+# Rails は起動時に読むため、restart ではなく環境を反映する recreate を使う
+docker compose up -d --no-deps --force-recreate web
+```
+
+ホスト許可前は Rails が公開 URL のリクエストを `403 Blocked hosts` で
+拒否する。Rails 8 組み込みの `RAILS_DEVELOPMENT_HOSTS` はカンマ区切りの
+ホスト名を既定の development 許可リストに追加する。Compose は web に
+だけ渡し、`https://`・パス・先頭の `.`・ワイルドカードは指定しない。
+複数ホストが必要なら各ホストを列挙する。この変数は production の設定には
+使われない。
+
+Host 認可と CSRF 検証は有効なままにし、ngrok の `--host-header` 等で
+公開ホストを内部名へ書き換えない。ブラウザから届く公開ホストと HTTPS の
+情報を維持する。公開 URL は使う相手にだけ共有し、ホスト名が変わったら
+許可リストを更新して web を再作成する。
+
+利用終了後は `docker compose --profile tunnel stop ngrok` で停止し、
+`.env` の `RAILS_DEVELOPMENT_HOSTS` を空に戻して上記の web 再作成を行う。
+トークンは `.env`（git 管理外）のみへ保存し、CI・イメージに混入しない。
+
+実トンネルなしでも、許可したホストを指定してローカルの Host 認可を
+確認できる（`WEB_PORT` を変更した場合は URL も変更）:
+
+```sh
+curl -i -H 'Host: your-assigned-name.ngrok-free.app' http://127.0.0.1:3000/up
+# 許可済みなら 200。別ホストでは 403 を維持する。
+curl -i -H 'Host: unlisted.example.invalid' http://127.0.0.1:3000/up
+```
 
 ## 9. CI
 
