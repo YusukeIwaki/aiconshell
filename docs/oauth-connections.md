@@ -252,10 +252,10 @@ client secret は `OAUTH_*_CLIENT_SECRET` 直書きか `OAUTH_*_CLIENT_SECRET_FI
 - Microsoft は固定 Entra tenant の仕事/学校アカウントのみ。個人アカウント
   （hotmail/outlook.com 等）は対応しない。`common` / `organizations` /
   `consumers` は tenant として受け付けない。
-- Microsoft の要求 scope（`ChannelMessage.Read.All` 等の application 寄りを含む
-  委任 scope）は tenant の管理者同意が必要になり得る。同意は対象ユーザーが
-  ブラウザで行い、確認済み principal（表示名/ID）・tenant/cloud・付与 scope を
-  画面で確認する。
+- Microsoft の要求 scope は同意したユーザー名義で動く委任された権限であり、
+  `ChannelMessage.Read.All` 等は tenant の管理者同意が必要になり得る。
+  同意は対象ユーザーがブラウザで行い、確認済み principal（表示名/ID）・
+  tenant/cloud・付与 scope を画面で確認する。
 - Atlassian は Jira Cloud 3LO で、運用設定の 1 cloud ID に固定する。
   `offline_access` は refresh token 取得用であり API 権限ではない。
 
@@ -263,8 +263,13 @@ client secret は `OAUTH_*_CLIENT_SECRET` 直書きか `OAUTH_*_CLIENT_SECRET_FI
 
 未設定（env不足）・未接続・接続中（同意待ち試行あり）・接続済み・再認証必要・
 失敗を別のバッジで区別する。「設定済み」は env が揃っていること、「接続済み」は
-検証済み接続があることであり、両者を混同しない。失敗した再同意で過去の正常接続は
-壊れない。
+検証済み接続があることであり、両者を混同しない。接続中は接続バッジに並ぶ
+追加表示であり、再接続の同意待ちでも確認済み principal・接続先・付与 scope と
+解除は隠さない。初回同意の失敗は接続行を作らず最新の試行結果として表示し、
+未接続と区別する。再同意の失敗は接続バッジを上書きせず試行結果として分けて
+表示し、過去の正常接続は壊れない。設定 env が欠けても保存済み接続・進行中試行の
+ローカル解除は行える。callback の state/code/error に型不正・過大値があれば
+provider への HTTP 前に拒否する（追加の provider 情報は無視してよい）。
 
 ### 解除の意味
 

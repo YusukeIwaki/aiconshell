@@ -243,6 +243,146 @@ test("disconnect via HTTP stops reuse and old callbacks cannot resurrect") do |h
   end
 end
 
+test("failed first consent via HTTP shows failure without a connection") do |http:|
+  OauthAdminFlowHelper.with_admin_env do
+    OauthAdminSupport.with_service do |ctx|
+      OauthAdminFlowHelper.connect_headers(http)
+
+      http.post "/admin/oauth_connections/connect", { provider: "atlassian" }
+      expect(http.last_response.status).to eq(302)
+      state = OauthAdminSupport.state_from_location(http.last_response.headers["Location"])
+
+      ctx[:transport].expect_json(:POST, "https://auth.atlassian.com/oauth/token", body: {
+        "access_token" => "at-2", "refresh_token" => "rt-2",
+        "expires_in" => 3600, "scope" => OauthTestSupport::ATLASSIAN_SCOPES, "token_type" => "Bearer"
+      })
+      ctx[:transport].expect_json(
+        :GET, "https://api.atlassian.com/oauth/token/accessible-resources", body: [
+          { "id" => OauthTestSupport::CLOUD_ID, "name" => "Test", "scopes" => ["read:jira-work"] }
+        ]
+      )
+      http.get "/oauth/atlassian/callback", { state: state, code: "auth-code-2" }
+      expect(http.last_response.status).to eq(302)
+      http.follow_redirect!
+      body = http.last_response.body
+      expect(body.include?("Atlassian（Jira Cloud）")).to eq(true)
+      expect(body.include?("失敗")).to eq(true)
+      expect(body.include?("直近の試行結果")).to eq(true)
+      expect(body.include?("必要な権限が付与されませんでした")).to eq(true)
+      expect(body.include?("接続済み")).to eq(false)
+      expect(OauthConnection.find_by(provider: "atlassian").nil?).to eq(true)
+      expect(OauthAuthAttempt.order(id: :desc).first.status).to eq("failed")
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("failed reconnect via HTTP keeps the healthy connection and separates the attempt") do |http:|
+  OauthAdminFlowHelper.with_admin_env do
+    OauthAdminSupport.with_service do |ctx|
+      OauthAdminFlowHelper.connect_headers(http)
+      OauthAdminFlowHelper.round_trip(http, ctx, "microsoft")
+      healthy = OauthConnection.find_by!(provider: "microsoft")
+      expect(healthy.state).to eq("connected")
+
+      http.post "/admin/oauth_connections/connect", { provider: "microsoft" }
+      expect(http.last_response.status).to eq(302)
+      state = OauthAdminSupport.state_from_location(http.last_response.headers["Location"])
+
+      ctx[:transport].expect_json(
+        :POST, "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token", body: {
+          "access_token" => "ms-at-2", "refresh_token" => "ms-rt-2",
+          "expires_in" => 3600, "scope" => "User.Read", "token_type" => "Bearer"
+        }
+      )
+      ctx[:transport].expect_json(:GET, "https://graph.microsoft.com/v1.0/me", body: {
+        "id" => "user-oid-1", "displayName" => "MS User", "userPrincipalName" => "u@example.test"
+      })
+      http.get "/oauth/microsoft/callback", { state: state, code: "auth-code-2" }
+      expect(http.last_response.status).to eq(302)
+      http.follow_redirect!
+      body = http.last_response.body
+      expect(body.include?("Microsoft（Teams / Graph）")).to eq(true)
+      expect(body.include?("接続済み")).to eq(true)
+      expect(body.include?("MS User")).to eq(true)
+      expect(body.include?("user-oid-1")).to eq(true)
+      expect(body.include?("直近の試行結果")).to eq(true)
+      expect(body.include?("現在の接続はそのまま残ります")).to eq(true)
+      kept = OauthConnection.find_by!(provider: "microsoft")
+      expect(kept.state).to eq("connected")
+      expect(kept.external_principal).to eq("user-oid-1")
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("reconnect attempt via HTTP preserves identity and allows disconnect") do |http:|
+  OauthAdminFlowHelper.with_admin_env do
+    OauthAdminSupport.with_service do |ctx|
+      OauthAdminFlowHelper.connect_headers(http)
+      OauthAdminFlowHelper.round_trip(http, ctx, "microsoft")
+
+      http.post "/admin/oauth_connections/connect", { provider: "microsoft" }
+      expect(http.last_response.status).to eq(302)
+
+      http.get "/admin/oauth_connections"
+      expect(http.last_response.status).to eq(200)
+      body = http.last_response.body
+      expect(body.include?("Microsoft（Teams / Graph）")).to eq(true)
+      expect(body.include?("接続済み")).to eq(true)
+      expect(body.include?("接続中")).to eq(true)
+      expect(body.include?("MS User")).to eq(true)
+      expect(body.include?("disconnect?provider=microsoft")).to eq(true)
+
+      http.post "/admin/oauth_connections/disconnect", { provider: "microsoft" }
+      expect(http.last_response.status).to eq(302)
+      expect(OauthConnection.find_by(provider: "microsoft").state).to eq("disconnected")
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("malformed present error with valid state and code is rejected before HTTP") do |http:|
+  OauthAdminFlowHelper.with_admin_env do
+    OauthAdminSupport.with_service do |ctx|
+      OauthAdminFlowHelper.connect_headers(http)
+
+      http.post "/admin/oauth_connections/connect", { provider: "atlassian" }
+      expect(http.last_response.status).to eq(302)
+      state = OauthAdminSupport.state_from_location(http.last_response.headers["Location"])
+      expect(state.empty?).to eq(false)
+
+      # Each malformed variant is rejected before the foundation runs:
+      # no token exchange, no attempt consumption.
+      http.get "/oauth/atlassian/callback",
+        { state: state, code: "auth-code-1", error: { "x" => "y" } }
+      expect(http.last_response.status).to eq(302)
+      http.get "/oauth/atlassian/callback",
+        { state: state, code: "auth-code-1", error: %w[x y] }
+      expect(http.last_response.status).to eq(302)
+      http.get "/oauth/atlassian/callback",
+        { state: state, code: "auth-code-1", error: "e" * 5000 }
+      expect(http.last_response.status).to eq(302)
+      http.get "/oauth/atlassian/callback",
+        { state: state, code: %w[auth-code-1 auth-code-2] }
+      expect(http.last_response.status).to eq(302)
+
+      expect(ctx[:transport].requests.size).to eq(0)
+      expect(OauthAuthAttempt.order(id: :desc).first.status).to eq("pending")
+      expect(OauthConnection.count).to eq(0)
+
+      # The attempt is still live: a well-formed callback still succeeds.
+      OauthTestSupport.script_atlassian_callback(ctx[:transport])
+      http.get "/oauth/atlassian/callback", { state: state, code: "auth-code-1" }
+      expect(http.last_response.status).to eq(302)
+      http.follow_redirect!
+      expect(http.last_response.body.include?("接続済み")).to eq(true)
+      expect(OauthConnection.find_by(provider: "atlassian").state).to eq("connected")
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
 test("request, redirect, and error logs never retain code, state, or authorization URLs") do |http:|
   io = StringIO.new
   sink = Logger.new(io)

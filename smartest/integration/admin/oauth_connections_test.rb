@@ -105,26 +105,204 @@ test("oauth index shows connecting while an attempt is live") do |http:|
   end
 end
 
-test("oauth index distinguishes needs_reauth and failed") do |http:|
-  OauthConnection.create!(provider: "atlassian", state: "needs_reauth",
-                          error_code: "invalid_grant", generation: 3,
-                          external_principal: "acc-123", display_name: "A User",
-                          cloud_id: OauthTestSupport::CLOUD_ID,
-                          granted_scopes: "read:jira-work")
-  OauthConnection.create!(provider: "microsoft", state: "failed",
-                          error_code: "unexpected_response", generation: 1)
-
+test("oauth index shows needs_reauth from a real refresh revocation") do |http:|
   AdminTestSupport.as_admin(http) do
     OauthAdminSupport.with_service do |ctx|
+      OauthTestSupport.connect(ctx, "atlassian")
+      row = OauthConnection.find_by!(provider: "atlassian")
+      row.update!(token_expires_at: 1.minute.ago)
+      ctx[:transport].expect_error(
+        :POST, "https://auth.atlassian.com/oauth/token",
+        Aiconshell::Plugins::HttpError.new(
+          status: 403, http_method: "POST", url: "https://auth.atlassian.com/oauth/token"
+        )
+      )
+      begin
+        ctx[:creds].access_token(ctx[:creds].binding_for("atlassian").to_h)
+      rescue Aiconshell::Oauth::Error
+        nil
+      end
+      expect(OauthConnection.find_by(provider: "atlassian").state).to eq("needs_reauth")
+
       http.get "/admin/oauth_connections"
 
       expect(http.last_response.status).to eq(200)
       body = http.last_response.body
+      expect(body.include?("Atlassian（Jira Cloud）")).to eq(true)
       expect(body.include?("再認証必要")).to eq(true)
-      expect(body.include?("失敗")).to eq(true)
       expect(body.include?("接続の有効期限が切れました。再接続してください。")).to eq(true)
-      expect(body.include?("A User")).to eq(true)
+      expect(body.include?("Atlassian User")).to eq(true)
+      expect(body.include?("acc-123")).to eq(true)
+      expect(body.include?("解除")).to eq(true)
       ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("oauth index shows a real initial failure without a connection") do |http:|
+  AdminTestSupport.as_admin(http) do
+    OauthAdminSupport.with_service do |ctx|
+      begun = ctx[:auth].begin(provider: "atlassian", browser_session_id: "browser-1")
+      ctx[:transport].expect_json(:POST, "https://auth.atlassian.com/oauth/token", body: {
+        "access_token" => "at-2", "refresh_token" => "rt-2",
+        "expires_in" => 3600, "scope" => OauthTestSupport::ATLASSIAN_SCOPES, "token_type" => "Bearer"
+      })
+      ctx[:transport].expect_json(
+        :GET, "https://api.atlassian.com/oauth/token/accessible-resources", body: [
+          { "id" => OauthTestSupport::CLOUD_ID, "name" => "Test", "scopes" => ["read:jira-work"] }
+        ]
+      )
+      begin
+        ctx[:auth].callback(provider: "atlassian", state: begun["state"],
+                            code: "auth-code-2", browser_session_id: "browser-1")
+      rescue Aiconshell::Oauth::Error
+        nil
+      end
+      expect(OauthConnection.find_by(provider: "atlassian").nil?).to eq(true)
+      expect(OauthAuthAttempt.order(id: :desc).first.status).to eq("failed")
+
+      http.get "/admin/oauth_connections"
+
+      expect(http.last_response.status).to eq(200)
+      body = http.last_response.body
+      expect(body.include?("Atlassian（Jira Cloud）")).to eq(true)
+      expect(body.include?("失敗")).to eq(true)
+      expect(body.include?("直近の試行結果")).to eq(true)
+      expect(body.include?("必要な権限が付与されませんでした")).to eq(true)
+      expect(body.include?("接続済み")).to eq(false)
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("oauth index keeps the healthy connection and shows a real reconnect failure separately") do |http:|
+  AdminTestSupport.as_admin(http) do
+    OauthAdminSupport.with_service do |ctx|
+      OauthTestSupport.connect(ctx, "microsoft")
+      healthy_principal = OauthConnection.find_by!(provider: "microsoft").external_principal
+
+      begun = ctx[:auth].begin(provider: "microsoft", browser_session_id: "browser-2")
+      ctx[:transport].expect_json(
+        :POST, "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token", body: {
+          "access_token" => "ms-at-2", "refresh_token" => "ms-rt-2",
+          "expires_in" => 3600, "scope" => "User.Read", "token_type" => "Bearer"
+        }
+      )
+      ctx[:transport].expect_json(:GET, "https://graph.microsoft.com/v1.0/me", body: {
+        "id" => "user-oid-1", "displayName" => "MS User", "userPrincipalName" => "u@example.test"
+      })
+      begin
+        ctx[:auth].callback(provider: "microsoft", state: begun["state"],
+                            code: "auth-code-2", browser_session_id: "browser-2")
+      rescue Aiconshell::Oauth::Error
+        nil
+      end
+
+      kept = OauthConnection.find_by!(provider: "microsoft")
+      expect(kept.state).to eq("connected")
+      expect(kept.external_principal).to eq(healthy_principal)
+      expect(OauthAuthAttempt.order(id: :desc).first.status).to eq("failed")
+
+      http.get "/admin/oauth_connections"
+
+      expect(http.last_response.status).to eq(200)
+      body = http.last_response.body
+      expect(body.include?("Microsoft（Teams / Graph）")).to eq(true)
+      expect(body.include?("接続済み")).to eq(true)
+      expect(body.include?("MS User")).to eq(true)
+      expect(body.include?(healthy_principal)).to eq(true)
+      expect(body.include?("直近の試行結果")).to eq(true)
+      expect(body.include?("現在の接続はそのまま残ります")).to eq(true)
+      expect(body.include?("解除")).to eq(true)
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("oauth index preserves identity and disconnect while a reconnect attempt is live") do |http:|
+  AdminTestSupport.as_admin(http) do
+    OauthAdminSupport.with_service do |ctx|
+      OauthTestSupport.connect(ctx, "microsoft")
+      ctx[:auth].begin(provider: "microsoft", browser_session_id: "browser-live")
+
+      http.get "/admin/oauth_connections"
+
+      expect(http.last_response.status).to eq(200)
+      body = http.last_response.body
+      expect(body.include?("Microsoft（Teams / Graph）")).to eq(true)
+      expect(body.include?("接続済み")).to eq(true)
+      expect(body.include?("接続中")).to eq(true)
+      expect(body.include?("MS User")).to eq(true)
+      expect(body.include?("user-oid-1")).to eq(true)
+      expect(body.include?("disconnect?provider=microsoft")).to eq(true)
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("oauth index offers disconnect for a live first attempt") do |http:|
+  AdminTestSupport.as_admin(http) do
+    OauthAdminSupport.with_service do |ctx|
+      ctx[:auth].begin(provider: "atlassian", browser_session_id: "browser-first")
+
+      http.get "/admin/oauth_connections"
+
+      expect(http.last_response.status).to eq(200)
+      body = http.last_response.body
+      expect(body.include?("Atlassian（Jira Cloud）")).to eq(true)
+      expect(body.include?("接続中")).to eq(true)
+      expect(body.include?("disconnect?provider=atlassian")).to eq(true)
+
+      http.post "/admin/oauth_connections/disconnect", { provider: "atlassian" }
+      expect(http.last_response.status).to eq(302)
+      expect(OauthAuthAttempt.order(id: :desc).first.status).to eq("expired")
+      expect(OauthConnection.find_by(provider: "atlassian").state).to eq("disconnected")
+      ctx[:transport].assert_consumed!
+    end
+  end
+end
+
+test("disconnect of a live attempt works when configuration is missing") do |http:|
+  AdminTestSupport.as_admin(http) do
+    ctx = OauthAdminSupport.install_service
+    begin
+      ctx[:auth].begin(provider: "microsoft", browser_session_id: "browser-live-missing")
+      expect(OauthAuthAttempt.active.where(provider: "microsoft").count).to eq(1)
+
+      OauthAdminSupport.uninstall_service
+      OauthAdminSupport.install_service(env: {})
+
+      http.get "/admin/oauth_connections"
+      expect(http.last_response.status).to eq(200)
+      expect(http.last_response.body.include?("disconnect?provider=microsoft")).to eq(true)
+
+      http.post "/admin/oauth_connections/disconnect", { provider: "microsoft" }
+      expect(http.last_response.status).to eq(302)
+      expect(OauthAuthAttempt.active.where(provider: "microsoft").count).to eq(0)
+      expect(OauthConnection.find_by(provider: "microsoft").state).to eq("disconnected")
+    ensure
+      OauthAdminSupport.uninstall_service
+    end
+  end
+end
+
+test("disconnect works when configuration is missing") do |http:|
+  AdminTestSupport.as_admin(http) do
+    ctx = OauthAdminSupport.install_service
+    begin
+      OauthTestSupport.connect(ctx, "atlassian")
+      expect(OauthConnection.find_by(provider: "atlassian").state).to eq("connected")
+
+      OauthAdminSupport.uninstall_service
+      OauthAdminSupport.install_service(env: {})
+      http.post "/admin/oauth_connections/disconnect", { provider: "atlassian" }
+      expect(http.last_response.status).to eq(302)
+      expect(OauthConnection.find_by(provider: "atlassian").state).to eq("disconnected")
+      http.follow_redirect!
+      expect(http.last_response.body.include?("未設定")).to eq(true)
+      expect(http.last_response.body.include?("disconnect?provider=atlassian")).to eq(false)
+    ensure
+      OauthAdminSupport.uninstall_service
     end
   end
 end

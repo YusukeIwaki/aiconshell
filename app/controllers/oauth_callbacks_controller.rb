@@ -8,9 +8,11 @@
 #
 # Every outcome redirects to the query-free admin page so code/state
 # never stay in the address bar. error_description is never read,
-# rendered, logged, or stored. Callback parameters must be short strings;
-# Array/Hash/oversized values are treated as absent so the foundation
-# rejects them with a safe classification.
+# rendered, logged, or stored. A present state/code/error key with a
+# wrong type (Array/Hash) or excessive size is rejected as a whole
+# before any provider HTTP, even when the other two look valid: such
+# input is never coerced to nil and passed on to token exchange. Extra
+# provider fields (e.g. error_description) stay ignored.
 class OauthCallbacksController < ApplicationController
   include OauthBrowserSession
 
@@ -22,6 +24,14 @@ class OauthCallbacksController < ApplicationController
     provider = params[:provider].to_s
     unless Admin::OauthStatus.known_provider?(provider)
       redirect_to root_path, alert: "不明なプロバイダーです。"
+      return
+    end
+
+    if malformed_callback_input?(params[:state]) ||
+       malformed_callback_input?(params[:code]) ||
+       malformed_callback_input?(params[:error])
+      redirect_to admin_oauth_connections_path,
+                  alert: "接続できませんでした。もう一度連携開始からお試しください。"
       return
     end
 
@@ -42,6 +52,18 @@ class OauthCallbacksController < ApplicationController
   end
 
   private
+
+  # Present-but-malformed core input: wrong type or over the byte
+  # limit. Absent (nil) and empty string mean "not supplied" and are
+  # left to the foundation; only these three keys are fenced, extra
+  # provider fields stay ignorable.
+  def malformed_callback_input?(value)
+    return false if value.nil?
+    return false if value.is_a?(String) && value.empty?
+    return true unless value.is_a?(String)
+
+    value.bytesize > MAX_CALLBACK_PARAM_BYTES
+  end
 
   def callback_text(value)
     return nil unless value.is_a?(String)

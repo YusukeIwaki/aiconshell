@@ -79,19 +79,49 @@ module AdminHelper
 
   # User-delegated OAuth display state (issue #23). "設定済み" (env
   # present) and "接続済み" (verified connection) are separate badges;
-  # this key selects only the connection badge. Unknown states fall back
-  # to 未接続, never to 接続済み.
+  # this key selects only the connection badge. A live attempt is shown
+  # as an extra 接続中 badge, never by replacing the connection badge:
+  # the verified principal stays visible while reconnecting. With no
+  # connection, a real latest failed attempt surfaces as 失敗 so an
+  # initial failure is distinguishable from 未接続. Unknown states fall
+  # back to 未接続, never to 接続済み.
   def oauth_display_state(row)
     row = row.is_a?(Hash) ? row : {}
     return "unconfigured" unless row["configured"]
-    return "connecting" if row["connecting"]
 
     case row["state"].to_s
     when "connected" then "connected"
     when "needs_reauth" then "needs_reauth"
     when "failed" then "failed"
-    else "disconnected"
+    else
+      return "failed" if row["attempt_error"].present?
+
+      "disconnected"
     end
+  end
+
+  # True when a verified connection exists, independent of the live
+  # attempt flag and configuration. Used to keep the principal table
+  # visible while a reconnect attempt is pending or env went missing.
+  def oauth_shows_identity?(row)
+    row = row.is_a?(Hash) ? row : {}
+    %w[connected needs_reauth failed].include?(row["state"].to_s)
+  end
+
+  # Local disconnect stays available while identity exists or a live
+  # attempt exists (attempt invalidation), even when unconfigured.
+  def oauth_shows_disconnect?(row)
+    row = row.is_a?(Hash) ? row : {}
+    oauth_shows_identity?(row) || !!row["connecting"]
+  end
+
+  # Latest real failed attempt for the provider row, if any. Shown
+  # separately from the connection badge so a failed reconnect never
+  # overwrites the healthy connection display.
+  def oauth_attempt_error(row)
+    row = row.is_a?(Hash) ? row : {}
+    code = row["attempt_error"].to_s
+    code.empty? ? nil : code
   end
 
   def oauth_state_label(state_key)

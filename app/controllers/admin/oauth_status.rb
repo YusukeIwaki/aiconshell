@@ -82,24 +82,51 @@ module Admin
       end
 
       # One row per provider for the index page. Never raises and never
-      # carries secrets.
+      # carries secrets. "connecting" marks a live attempt; "attempt_error"
+      # carries the latest terminal failure (failed/expired with a safe
+      # code) so the page can show real initial/reconnect failures without
+      # touching the healthy connection row. Intentional local disconnects
+      # (disconnected_local) are not failures.
       def rows
         PROVIDERS.map do |provider|
           status = safe_status(provider)
           status.merge(
             "connecting" => connecting?(provider),
-            "required_env" => required_env_names(provider)
+            "required_env" => required_env_names(provider),
+            "attempt_error" => latest_attempt_error(provider),
+            "attempt_status" => latest_attempt_status(provider)
           )
         end
       end
 
       # True while a live (unexpired, unconsumed-terminal) authorization
-      # attempt exists for the provider. Used only for the 接続中 badge.
+      # attempt exists for the provider. Shown as an extra 接続中 badge
+      # alongside the connection badge, never as a replacement that hides
+      # the verified principal or the disconnect action.
       def connecting?(provider)
         OauthAuthAttempt.active.where(provider: provider.to_s)
                         .where("expires_at > ?", Time.current).exists?
       rescue StandardError
         false
+      end
+
+      def latest_attempt_error(provider)
+        latest = OauthAuthAttempt.where(provider: provider.to_s).order(id: :desc).first
+        return nil if latest.nil?
+        return nil unless %w[failed expired].include?(latest.status.to_s)
+
+        code = latest.error_code.to_s
+        return nil if code.empty? || code == "disconnected_local"
+
+        code
+      rescue StandardError
+        nil
+      end
+
+      def latest_attempt_status(provider)
+        OauthAuthAttempt.where(provider: provider.to_s).order(id: :desc).pick(:status)
+      rescue StandardError
+        nil
       end
 
       private

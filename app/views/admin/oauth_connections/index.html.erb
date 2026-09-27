@@ -22,12 +22,15 @@
     </table>
   </div>
   <p>個人PATによる代理運用・PAT入力欄・OAuth失敗時のPAT fallbackはありません。既存サービスアカウントの設定と混同しないでください。</p>
-  <p>Microsoftの個人アカウント（hotmail/outlook.com等）は対応しません。仕事/学校アカウントで、固定Entraテナントの管理者同意が必要なscopeがあります。詳しくはセットアップ資料を参照してください。</p>
+  <p>Microsoftの個人アカウント（hotmail/outlook.com等）は対応しません。仕事/学校アカウントで、固定Entraテナントの管理者同意が必要な委任された権限があります。詳しくはセットアップ資料を参照してください。</p>
 </div>
 
 <% @rows.each do |row| %>
   <% provider = row["provider"] %>
   <% state_key = oauth_display_state(row) %>
+  <% has_identity = oauth_shows_identity?(row) %>
+  <% can_disconnect = oauth_shows_disconnect?(row) %>
+  <% attempt_error = oauth_attempt_error(row) %>
   <div class="admin-card">
     <h2 style="margin-top:0">
       <%= Admin::OauthStatus.provider_name(provider) %>
@@ -37,6 +40,9 @@
         <span class="admin-badge admin-badge-idle">未設定</span>
       <% end %>
       <span class="admin-badge <%= oauth_state_badge(state_key) %>"><%= oauth_state_label(state_key) %></span>
+      <% if row["connecting"] %>
+        <span class="admin-badge admin-badge-warn">接続中</span>
+      <% end %>
     </h2>
     <p>
       provider: <code class="admin-env"><%= provider %></code>
@@ -49,40 +55,58 @@
           <code class="admin-env"><%= name %></code>
         <% end %>
       </p>
+      <% if has_identity || row["connecting"] %>
+        <p>設定が不足しているため連携開始はできませんが、保存済み接続・進行中試行の解除はこの画面から行えます。</p>
+      <% end %>
+    <% end %>
+    <% if has_identity %>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <tr><th>確認済みユーザー名</th><th>確認済みID</th><th>接続先</th><th>付与済み権限</th></tr>
+          <tr>
+            <td><%= row["display_name"].presence || "―" %></td>
+            <td><code class="admin-env"><%= row["principal"].presence || "―" %></code></td>
+            <td><code class="admin-env"><%= oauth_fixed_id(row) %></code></td>
+            <td><%= oauth_scopes_label(row) %></td>
+          </tr>
+        </table>
+      </div>
+      <p>「設定済み」は環境変数が揃っていること、「<%= oauth_state_label("connected") %>」は検証済み接続があることを表します。両者を混同しないでください。</p>
+      <% if row["connecting"] %>
+        <p>再接続の同意待ちです。現在の接続（上記）はそのまま利用でき、解除すると進行中試行も失効します。</p>
+      <% end %>
+    <% elsif state_key == "failed" %>
+      <p>直近の同意試行が失敗しました。接続は作成されていません。連携開始からやり直してください。</p>
+    <% elsif row["connecting"] %>
+      <p>連携開始を受け付け、プロバイダー側の同意待ちです。ブラウザで同意を完了してください。解除すると進行中試行を失効させます。</p>
     <% else %>
-      <% if state_key == "connected" || state_key == "needs_reauth" || state_key == "failed" %>
-        <div class="admin-table-wrap">
-          <table class="admin-table">
-            <tr><th>確認済みユーザー名</th><th>確認済みID</th><th>接続先</th><th>付与済み権限</th></tr>
-            <tr>
-              <td><%= row["display_name"].presence || "―" %></td>
-              <td><code class="admin-env"><%= row["principal"].presence || "―" %></code></td>
-              <td><code class="admin-env"><%= oauth_fixed_id(row) %></code></td>
-              <td><%= oauth_scopes_label(row) %></td>
-            </tr>
-          </table>
-        </div>
-        <p>「設定済み」は環境変数が揃っていること、「<%= oauth_state_label("connected") %>」は検証済み接続があることを表します。両者を混同しないでください。</p>
-      <% elsif state_key == "connecting" %>
-        <p>連携開始を受け付け、プロバイダー側の同意待ちです。ブラウザで同意を完了してください。古い接続がある場合はそのまま残ります。</p>
+      <p>接続がありません。連携開始から同意を行ってください。</p>
+    <% end %>
+    <% if row["error_code"].present? %>
+      <p>接続の状態: <%= oauth_error_label(row["error_code"]) %></p>
+    <% end %>
+    <% if attempt_error.present? %>
+      <% if has_identity %>
+        <p>直近の試行結果: <%= oauth_error_label(attempt_error) %>（現在の接続はそのまま残ります）</p>
       <% else %>
-        <p>接続がありません。連携開始から同意を行ってください。</p>
+        <p>直近の試行結果: <%= oauth_error_label(attempt_error) %></p>
       <% end %>
-      <% if row["error_code"].present? %>
-        <p>前回の結果: <%= oauth_error_label(row["error_code"]) %></p>
-      <% end %>
-      <div class="admin-actions">
+    <% end %>
+    <div class="admin-actions">
+      <% if row["configured"] %>
         <%= button_to state_key == "connected" ? "再接続" : "連携開始",
               connect_admin_oauth_connections_path(provider: provider), method: :post, class: "admin-btn" %>
-        <% if state_key == "connected" || state_key == "needs_reauth" || state_key == "failed" %>
-          <%= button_to "解除", disconnect_admin_oauth_connections_path(provider: provider),
-                method: :post, class: "admin-btn",
-                form: { data: { turbo_confirm: "このアプリでの利用を停止し、トークンを破棄します。よろしいですか？" } } %>
-        <% end %>
-      </div>
-      <% if state_key == "connected" || state_key == "needs_reauth" || state_key == "failed" %>
-        <p>解除はこのアプリでの利用停止とトークン破棄です。プロバイダー側の同意取り消しは別途行ってください。失敗した再同意で過去の正常接続が壊れることはありません。</p>
       <% end %>
+      <% if can_disconnect %>
+        <%= button_to "解除", disconnect_admin_oauth_connections_path(provider: provider),
+              method: :post, class: "admin-btn",
+              form: { data: { turbo_confirm: "このアプリでの利用を停止し、トークンを破棄します。よろしいですか？" } } %>
+      <% end %>
+    </div>
+    <% if has_identity %>
+      <p>解除はこのアプリでの利用停止とトークン破棄です。プロバイダー側の同意取り消しは別途行ってください。失敗した再同意で過去の正常接続が壊れることはありません。</p>
+    <% elsif row["connecting"] %>
+      <p>解除は進行中試行の失効とトークン破棄です。プロバイダー側の同意取り消しは別途行ってください。</p>
     <% end %>
   </div>
 <% end %>

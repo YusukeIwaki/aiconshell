@@ -88,6 +88,10 @@ AI連携画面は小さなJavaScriptで進行中の更新と入力保護を行�
   （画面は `Referrer-Policy: same-origin`、認可・callbackのリダイレクトは `no-referrer`）。
   未設定・未接続・接続中・接続済み・再認証必要・失敗を別のバッジで区別し、
   「設定済み」（env完備）と「接続済み」（検証済み接続）を混同しない表示にする。
+  接続中は追加バッジであり、再接続待ち・初回同意中も確認済みprincipalと解除を隠さず、
+  設定不足時も保存済み接続・進行中試行の解除を行える。初回失敗は最新の試行結果として
+  未接続と区別し、再同意失敗は接続表示を上書きせず分けて表示する。callbackの
+  state/code/errorの型不正・過大値はHTTP前に拒否する。
   検証済みprincipal表示名/ID・cloud/tenant・付与scopeを表示し、secretの値は表示しない。
   解除はアプリ内利用停止・token破棄でありprovider側同意取り消しは別である旨を明示する。
   個人PAT入力UI・PAT fallbackは持たない。Bot運用（service account/Bot名義）と
