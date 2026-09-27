@@ -1,6 +1,28 @@
 # Working agreements
 
+## Coordination and implementation
+
+For new work without an assigned implementation lane, use [the coordinating workflow](docs/issue-development.md):
+create or refine the Issue, prepare an isolated issue branch/worktree, and prefer Muse Code
+(`muse-spark-1.3-contributor`, `xhigh`) for implementation and verification.
+Give it the Issue URL as the task entrypoint. Review independently before the authorized
+main merge/push/closure. Do not create PRs. Work already assigned to an issue worktree
+stays in that implementation lane; do not delegate it again just to satisfy this default.
+
+## Start an implementation
+
+When assigned a GitHub Issue, read it with `gh issue view NUMBER --json number,title,body,comments`.
+Read [the issue implementation skill](.agents/skills/aiconshell-issue/SKILL.md),
+then [the design map](docs/development.md) and only the linked documents relevant to the change.
+The Issue specifies the requested behavior and acceptance criteria; repository documents supply
+the standing contracts. Previous chats and personal agent configuration are not prerequisites.
 Read `docs/architecture.md` before changing boundaries or public interfaces.
+
+An assigned worktree is already the implementation workspace. Inspect its branch, status,
+and base before editing; do not switch to the main checkout or create another worktree silently.
+If an interface or dependency is missing, report the concrete conflict instead of inventing it.
+
+## Constraints
 
 - Work on one GitHub Issue per branch/worktree. Use `codex/issue-N-description`.
 - Implement and verify in the assigned worktree. Never change another worktree.
@@ -12,9 +34,16 @@ Read `docs/architecture.md` before changing boundaries or public interfaces.
 - Never commit credentials, auth caches, private volumes, `.env`, runtime logs, or model session transcripts. Never expose provider stdout/stderr or secrets in EventLog or error pages.
 - AI subprocesses receive an explicit environment and a dedicated workspace, never application DB or integration credentials. No shell interpolation of user/AI text.
 - Use official CLI subscription login flows; do not fall back to API-key billing. Unconfigured providers remain selectable but fail at execution.
+- Web has no AI CLI or auth volume. Account state comes from worker-confirmed PostgreSQL snapshots. Authentication operations are separate from Task/TaskRun; see `docs/ai-connections.md`.
 - Implement only the assigned issue scope. Document public contract changes, tests actually run, and unavailable verification honestly.
 - Parallel lanes may own different namespaces. Do not edit another lane's files or resolve its interfaces by inventing incompatible alternatives.
 
 ## Commands
 
-The Rails foundation defines `bin/test`, `bin/setup`, and `bin/jobs`. Unit and integration command details live in README. Run the relevant suite and `bin/rails zeitwerk:check` when Rails wiring changes.
+The Rails foundation defines `bin/test`, `bin/setup`, and `bin/jobs`.
+Use [docs/testing.md](docs/testing.md) for exact commands and isolated PostgreSQL/ClickHouse setup.
+On rbenv hosts: `RBENV_VERSION=3.4.9 rbenv exec bundle exec ./bin/test unit`.
+For Rails: `RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check`.
+Run the relevant suite; run Zeitwerk when Rails wiring changes.
+Commit accepted-scope changes locally and report checks actually run, skips and remaining work
+using [the handoff format](docs/issue-development.md#handoff). Do not substitute a plan for implementation.
