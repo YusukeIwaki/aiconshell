@@ -1,8 +1,8 @@
-# aiconshell local stack: same web / control-worker / execution-worker split as
+# aiconshell local stack: same web / unified-execution-worker split as
 # production (see docs/architecture.md and docs/deployment.md).
 #
 #   cp .env.example .env            # once; adjust secrets and ports
-#   docker compose up --build       # web + workers + postgres + clickhouse
+#   docker compose up --build       # web + worker + postgres + clickhouse
 #   ./bin/smoke                     # verify the running stack
 #
 # Notes:
@@ -13,9 +13,12 @@
 #   networks never collide between worktrees.
 # - Code is carried inside the image (no source bind-mounts): rebuild after
 #   pulling changes (`docker compose up --build`).
-# - Variables are allow-listed per service on purpose (no blanket env_file),
-#   so the execution worker provably receives no integration credentials.
-# - EventLog is eventually consistent: web and workers start without
+# - Variables are allow-listed per service on purpose (no blanket env_file).
+#   The unified execution worker needs the integration/ClickHouse settings
+#   for its Rails parent (polling, outbound delivery, EventLog); the AI CLI
+#   child processes never inherit them (lib/aiconshell/ai/child_env.rb
+#   builds the child env from scratch).
+# - EventLog is eventually consistent: web and the worker start without
 #   ClickHouse (no dependency on it). The one-shot `clickhouse-init`
 #   service applies the schema independently when ClickHouse is available;
 #   until then, deliveries stay queued in PostgreSQL and retry.
@@ -39,7 +42,7 @@ x-app-database: &app-database
 
 # Operator workflow settings (app/services/workflow_settings.rb). Read on
 # EVERY Rails boot (after_initialize validate!), so every Rails process
-# (web/control/execution/migrate) receives the whole block. Lease must
+# (web/execution/migrate) receives the whole block. Lease must
 # exceed AI timeout + 10s; execution root is required in production.
 x-workflow: &workflow
   AICONSHELL_EXECUTION_ROOT: ${AICONSHELL_EXECUTION_ROOT:-/workspaces}
@@ -60,16 +63,18 @@ x-clickhouse-client: &clickhouse-client
 
 # EventLog emission default (lib/aiconshell/observability.rb). Read on every
 # Rails boot (config/initializers/event_log.rb) and captured on each outbox
-# row at emit time, so EVERY Rails process (web/control/execution/migrate)
+# row at emit time, so EVERY Rails process (web/execution/migrate)
 # receives it. Blank (default) keeps history searchable without Teams
 # notifications; channel:<teamId>/<channelId> enables the Teams sink.
 x-event-log: &event-log
   EVENT_LOG_TEAMS_CHANNEL: ${EVENT_LOG_TEAMS_CHANNEL:-}
 
 # Plugin credentials + optional endpoint overrides (lib/aiconshell/plugins).
-# Web needs them for admin diagnostics; control needs them for polling,
-# outbound delivery, and the EventLog Teams sink (which reuses the Teams
-# plugin credentials). NEVER on execution or migrate.
+# Web needs them for admin diagnostics; the unified execution worker needs
+# them for polling, outbound delivery, and the EventLog Teams sink (which
+# reuses the Teams plugin credentials). NEVER on migrate. They are visible
+# to the worker's Rails parent only: AI CLI child processes receive a
+# controlled env without them (lib/aiconshell/ai/child_env.rb).
 x-integration-credentials: &integration-credentials
   GITHUB_APP_ID: ${GITHUB_APP_ID:-}
   GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
@@ -99,18 +104,22 @@ x-integration-credentials: &integration-credentials
   # applies to the other *_FILE credential paths above.
   TEAMS_BOT_TARGETS_FILE: ${TEAMS_BOT_TARGETS_FILE:-}
 
-# Self-actor filtering for polling/outbound (control queue only). Web never
-# reads these, so they stay off web.
-x-control-only: &control-only
+# Self-actor filtering for polling/outbound (control queue only, consumed
+# by the unified execution worker's control pool). Web never reads these,
+# so they stay off web.
+x-polling-only: &polling-only
   AICONSHELL_SELF_ACTOR_IDS: ${AICONSHELL_SELF_ACTOR_IDS:-}
   JIRA_SERVICE_ACCOUNT_ID: ${JIRA_SERVICE_ACCOUNT_ID:-}
 
 x-ai-auth: &ai-auth
   # Private persisted auth homes (named volumes below) plus the executable
   # paths the AI lane resolves (lib/aiconshell/ai/config.rb). Only the
-  # workers that run AI CLIs (control + execution) receive them; web stays
+  # unified execution worker that runs AI CLIs receives them; web stays
   # AI-free and displays worker-confirmed snapshots from PostgreSQL.
-  # Each role has separate auth volumes, matching Railway.
+  # The execution-side auth volumes continue to be used; the legacy
+  # control-side volumes (claude_auth/codex_auth/muse_auth) are neither
+  # mounted nor deleted here (see volumes:). Never copy auth caches
+  # between volumes; re-login follows docs/ai-connections.md (#20).
   # Muse is XDG-rooted: AICONSHELL_MUSE_HOME is the directory CONTAINING
   # the "muse" directory (auth at $AICONSHELL_MUSE_HOME/muse/auth.json).
   # There is no MUSE_CONFIG_DIR; the native CLI does not honor one.
@@ -230,38 +239,16 @@ services:
       retries: 12
       start_period: 60s
 
-  # Control plane: interaction polling, coordination dispatch, outbound and
-  # EventLog delivery, recurring scheduler. Queues `control` plus the
-  # 1-thread `ai_auth_control` pool. Also runs coordination AI (triage), so
-  # it takes the ai image and AI auth homes just like execution.
-  control:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: ${CONTROL_TARGET:-ai}
-    restart: unless-stopped
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      db:
-        condition: service_healthy
-    environment:
-      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *control-only, *ai-auth]
-      AICONSHELL_WORKER_ROLE: "control"
-    volumes:
-      - claude_auth:/private/claude
-      - codex_auth:/private/codex
-      - muse_auth:/private/muse
-      - ai_workspaces:/workspaces
-    command: ["./bin/jobs", "--config-file=config/queue_control.yml"]
-
-  # Execution plane: AI CLI subprocess runs on queue `execution` plus the
-  # 1-thread `ai_auth_execution` pool.
-  # Receives the database, workflow settings, the EventLog channel default
-  # (a non-credential `channel:<team>/<channel>` name, blank by default),
-  # AI auth homes, and the workspaces volume — and NOTHING ELSE: no
-  # GitHub/Jira/Teams/ClickHouse credentials (enforced by bin/check-compose
-  # and documented in docs/deployment.md).
+  # Unified worker: interaction polling, coordination dispatch, outbound
+  # and EventLog delivery, the recurring scheduler, AI CLI subprocess runs,
+  # and AI account operations — in one service with three separated pools
+  # (see config/queue_execution.yml): `control` (default 3 threads),
+  # `execution` (default 1 thread), and the 1-thread `ai_auth_execution`
+  # pool. Pool separation keeps a long real job or login from occupying
+  # control slots; it is not CPU/RAM isolation (see docs/deployment.md).
+  # The Rails parent holds the integration/ClickHouse settings for
+  # polling/delivery; AI CLI children never inherit them
+  # (lib/aiconshell/ai/child_env.rb).
   execution:
     build:
       context: .
@@ -274,14 +261,14 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *event-log, *ai-auth]
+      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *polling-only, *ai-auth]
       AICONSHELL_WORKER_ROLE: "execution"
     volumes:
       - execution_claude_auth:/private/claude
       - execution_codex_auth:/private/codex
       - execution_muse_auth:/private/muse
       - ai_workspaces:/workspaces
-    command: ["./bin/jobs", "--config-file=config/queue_execution.yml", "--skip-recurring"]
+    command: ["./bin/jobs", "--config-file=config/queue_execution.yml"]
 
   # Optional inbound tunnel for webhook demos. Almost never needed (the app
   # polls), and never started by default. Requires NGROK_AUTHTOKEN.
@@ -302,14 +289,16 @@ volumes:
   clickhouse:
   # Private AI subscription-auth stores. Persisted across restarts so token
   # refresh survives; never committed, never baked into images.
-  claude_auth:
-  codex_auth:
-  muse_auth:
-  # Execution has its own logins; original names stay with control.
+  # Only the execution-side volumes are mounted (see execution:). The
+  # legacy control-side volumes (claude_auth/codex_auth/muse_auth) are
+  # intentionally NOT declared here anymore: pre-existing host volumes
+  # with those names are left untouched (never deleted, never copied;
+  # re-login follows docs/ai-connections.md in #20's ops entry) and fresh
+  # checkouts simply do not create them.
   execution_claude_auth:
   execution_codex_auth:
   execution_muse_auth:
   # AI execution workspaces (AICONSHELL_EXECUTION_ROOT=/workspaces).
-  # Persisted and writable by uid 1000 so control/execution can create
-  # per-run directories outside the application source.
+  # Persisted and writable by uid 1000 so the unified worker's pools can
+  # create per-run directories outside the application source.
   ai_workspaces:

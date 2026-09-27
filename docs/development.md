@@ -15,7 +15,7 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
 | AIの仕事・provider/model/effort・process分離 | [ai-providers.md](ai-providers.md) | `lib/aiconshell/ai/`、`smartest/ai/` |
 | AIポリシーの接続表示・ログイン・状態確認 | [ai-connections.md](ai-connections.md)、CLI変更時は [ai-auth-protocol.md](ai-auth-protocol.md) | `Admin::AiStatus`、`AiAuth::RequestService` / `WorkerService`、`AiConnection` / `AiAuthSession`、`smartest/integration/ai_auth/`、`smartest/integration/admin/` |
 | EventLog・検索・配送 | [event-log.md](event-log.md) | `lib/aiconshell/observability/`、`smartest/{unit,integration}/observability/` |
-| Docker・worker queue・Railway・環境分離 | [deployment.md](deployment.md)、[railway-environments.md](railway-environments.md) | `Dockerfile`、`compose.yml`、`config/queue*.yml`、`railway*.toml`、`bin/check-compose` |
+| Docker・worker queue・Railway・環境分離 | [deployment.md](deployment.md)、[railway-environments.md](railway-environments.md) | `Dockerfile`、`compose.yml`、`config/queue_execution.yml`・`config/queue.yml`、`railway.execution.toml`、`bin/check-compose` |
 
 ## 判断を間違えやすい境界
 
@@ -23,8 +23,10 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
   Coordination の判断を通る。タスク状態を変えるのは Coordination だけ。
   一方、AI接続確認・ログインは運用操作で、`AiAuth::RequestService` に intent を渡す。
   これに Task/TaskRun、優先度付けや Execution の業務dispatchを流用しない。
-- **層とプロセスは一対一ではない。** interaction / coordination は control worker、
-  execution は execution worker。接続状態は provider × worker role の組ごとに異なる。
+- **層とプロセスは一対一ではない。** interaction / coordination / execution の
+  3層は単一 execution ワーカー内の分離 pool（control 3 / execution 1 /
+  `ai_auth_execution` 1）で動く。接続状態の正は [AIアカウント連携](ai-connections.md)
+  （#20）が定める execution の snapshot であり、旧 control の状態を複写しない。
   ポリシーは provider を選ぶ設定であり、接続完了の証拠ではない。
 - **Web上でCLIの存在を調べても利用可能性は分からない。** WebはCLIなしの `app` image、
   workerは3つのCLIを持つ `ai` image。Webは worker が保存した接続 snapshot を表示する。

@@ -2,7 +2,7 @@
 
 ## 目的と境界
 
-Web とバックグラウンドワーカーは PostgreSQL を共有する。Solid Queue も同じデータベースに配置する。状態を持つ Rails の制御処理と、CLI を呼び出す実行処理を常駐コンテナで動かす。1 利用環境は専用 DB（非特権 login role）+ Web / control / execution の3サービスが単位であり、同一環境の Web replica とは区別する。共有サーバー上の複数利用環境は同一 Railway environment に置く。詳細は [Railway 複数利用環境の運用](railway-environments.md)。
+Web とバックグラウンドワーカーは PostgreSQL を共有する。Solid Queue も同じデータベースに配置する。状態を持つ Rails の制御処理と、CLI を呼び出す実行処理を1つの常駐ワーカーで動かす。1 利用環境は専用 DB（非特権 login role）+ Web / execution の2サービスが単位であり、同一環境の Web replica とは区別する。共有サーバー上の複数利用環境は同一 Railway environment に置く。詳細は [Railway 複数利用環境の運用](railway-environments.md)。
 
 ```mermaid
 flowchart TB
@@ -28,8 +28,8 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 - Ruby 3.4.9、Rails 8、PostgreSQL、Solid Queue、Puma、ERB/CSS。
 - JSON Schema 検証は `json_schemer`。単体・結合テストは Smartest。
 - EventLog の検索用保存先は ClickHouse 26.8 系。PostgreSQL に残るのは配信待ちとリトライ状態で、永続ログアーカイブではない。
-- Docker Compose は web/control worker/execution worker/postgres/clickhouse。Railway も同じ分割。ngrok は必要時のみ。
-- コンテナイメージは役割別: `app`（web / migrate / clickhouse-init 固定。AI CLI なし）と `ai`（control / execution の既定。Claude / Codex / Muse 同梱。Muse は公式公開 Linux バイナリを固定バージョン・SHA256 検証で取得し、ビルド時ログイン不要）。Railway は `RUNTIME_TARGET`（既定 `app`、worker は `ai`）で同じ分離を行う。未設定 provider は選択可・実行時失敗が契約。
+- Docker Compose は web/unified execution worker/postgres/clickhouse。Railway も同じ分割。ngrok は必要時のみ。
+- コンテナイメージは役割別: `app`（web / migrate / clickhouse-init 固定。AI CLI なし）と `ai`（execution の既定。Claude / Codex / Muse 同梱。Muse は公式公開 Linux バイナリを固定バージョン・SHA256 検証で取得し、ビルド時ログイン不要）。Railway は `RUNTIME_TARGET`（既定 `app`、worker は `ai`）で同じ分離を行う。未設定 provider は選択可・実行時失敗が契約。
 - GitHub Actions を使う場合は CI だけとする。
 
 ## 永続モデル
@@ -50,7 +50,7 @@ Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `
 
 管理画面・管理API 起点の cross-connector 要求（issue #11）は、Task に関連付けられた永続化済みの人間 `admin.task_request` イベントで出所を確認する。source 文字列や AI が返す属性だけでは権限を与えない。Coordination は Interaction の型付き読み取りを通して情報を取得し、結果と検証済み書き込みバッチ（`coordination_result` の要約/件数と `delivery_batch_key`）を原子的に永続化する。アクションなしは `done`、アクション付きは `waiting_delivery` とし、後者の確定は Coordination の reconciler のみが行う。全期待アクションが終端状態になるまで待ち、全件 `sent` なら `done`、`failed` / `uncertain` があれば `waiting_human` にする。欠損・件数不一致は成功扱いにしない。Interaction は Task のライフサイクルを更新せず、Execution はこの読み取り・通知経路には不要。
 
-5 分 polling、滞留 inbox の再処理、実行 lease 回復、EventLog outbox 配信、outbound action 配信は再起動後も続けられる recurring jobs とする。control と execution の queue を分ける。更新イベントは ID だけでなく fingerprint を持ち、同じメッセージの編集を区別する。
+5 分 polling、滞留 inbox の再処理、実行 lease 回復、EventLog outbox 配信、outbound action 配信は再起動後も続けられる recurring jobs とする。単一ワーカー内で control / execution / `ai_auth_execution` の pool を分け、長い実作業やログインが control の実行枠を消費しないようにする。更新イベントは ID だけでなく fingerprint を持ち、同じメッセージの編集を区別する。
 
 ## Ruby ポート契約
 
@@ -139,7 +139,7 @@ ClickHouse と Teams の retry は独立。ClickHouse は event_id で重複を�
 
 タスクボード・詳細・実行履歴、フィードバック、レイヤー別 AI policy、プラグイン診断、EventLog の検索、AIアカウント連携。ENV の admin credential で認証し、未設定 production は fail closed。CSRF を維持する。人間が直接 run を作成する API や任意コマンド入力は公開しない。
 
-AIアカウント連携（`/admin/ai_connections`）は業務 Task/TaskRun とは独立した運用管理である。controller は運用サービスへ intent を渡すだけで、業務 worker を直接呼ばず task lifecycle を変えない。provider × worker role の接続 snapshot と、認証・状態確認の要求 session を共有 PostgreSQL に持つ。同じ provider/role の同時ログインは partial unique 制約で1件にし、二重 submit は既存 active を返す。job の claim と snapshot の fencing で二重実行と古い上書きを防ぐ。認証 URL/コードは `SECRET_KEY_BASE` 由来キーで暗号化し、終端で削除する。queue は `ai_auth_control` / `ai_auth_execution` を各 worker の別1スレッド pool で処理し、`AICONSHELL_WORKER_ROLE` の一致を検証する。Web に CLI・認証 volume・worker role を付けない。
+AIアカウント連携（`/admin/ai_connections`）は業務 Task/TaskRun とは独立した運用管理である。controller は運用サービスへ intent を渡すだけで、業務 worker を直接呼ばず task lifecycle を変えない。接続 snapshot と、認証・状態確認の要求 session を共有 PostgreSQL に持つ。同じ provider/role の同時ログインは partial unique 制約で1件にし、二重 submit は既存 active を返す。job の claim と snapshot の fencing で二重実行と古い上書きを防ぐ。認証 URL/コードは `SECRET_KEY_BASE` 由来キーで暗号化し、終端で削除する。認証 job は単一 execution ワーカー内の別1スレッド pool（`ai_auth_execution`）で処理し、`AICONSHELL_WORKER_ROLE=execution` の一致を検証する。Web に CLI・認証 volume・worker role を付けない。接続 snapshot の execution 一本化と旧 control 認証の失効手順は [AIアカウント連携](ai-connections.md)（#20）が正であり、本書はワーカー配置だけを述べる。
 
 ## EventLog 保存先の判断
 

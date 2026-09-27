@@ -1,21 +1,37 @@
-# Solid Queue supervisor config for the EXECUTION worker (compose
-# `execution` service, Railway execution service).
+# Solid Queue supervisor config for the UNIFIED execution worker (compose
+# `execution` service, Railway execution service). This is the canonical
+# worker config (see docs/deployment.md).
 #
-# Runs workers bound to the `execution` queue (AI CLI subprocess runs in
-# isolated workspaces) plus a separate 1-thread pool for the
-# `ai_auth_execution` queue (AI account login/status). The auth pool keeps a
-# long login wait from occupying normal execution work. The supervisor must
-# ALSO be started with `--skip-recurring` (see compose.yml /
-# docs/deployment.md) so the recurring scheduler runs solely on the control
-# worker.
+# One supervisor runs dispatchers, the recurring scheduler, and three
+# separated worker pools:
+# - `control` (default 3 threads): interaction polling, coordination
+#   dispatch, outbound delivery, EventLog outbox draining, maintenance.
+# - `execution` (default 1 thread): AI CLI subprocess runs in isolated
+#   workspaces. Kept deliberately small; it is NOT CPU/RAM isolation, only
+#   a reserved execution slot (see docs/deployment.md for DB pool sizing
+#   and how to scale).
+# - `ai_auth_execution` (1 thread): AI account login/status. The auth pool
+#   keeps a long login wait from occupying normal control or execution work.
 #
-# Flat (no per-env keys): see config/queue_control.yml for why.
+# Never merge these into a single priority queue or a wildcard pool: a long
+# real job or login must not consume control slots. The supervisor is
+# started WITHOUT `--skip-recurring` so this worker also runs the
+# recurring scheduler (config/recurring.yml, all tasks target `control`).
+#
+# Flat (no per-env keys): SolidQueue::Configuration#config_from uses the whole
+# file when no Rails.env key matches, so one file serves every environment.
+# The development config/queue.yml mirrors the same three-pool separation
+# for `bin/jobs` without args in local development.
 dispatchers:
   - polling_interval: 1
     batch_size: 500
 workers:
-  - queues: execution
+  - queues: control
     threads: 3
+    processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+    polling_interval: 1
+  - queues: execution
+    threads: 1
     processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
     polling_interval: 1
   - queues: ai_auth_execution

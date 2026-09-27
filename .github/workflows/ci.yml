@@ -1,5 +1,5 @@
 # Test-only CI. GitHub Actions is never the runtime scheduler: production
-# scheduling is Solid Queue recurring jobs on the control worker.
+# scheduling is Solid Queue recurring jobs on the unified execution worker.
 #
 # Jobs:
 #   unit            Every no-DB Smartest suite via `bin/test unit`
@@ -130,12 +130,13 @@ jobs:
         run: |
           docker compose config --format json | ruby -rjson -e '
             build = JSON.parse(STDIN.read).fetch("services").to_h { |name, svc| [name, svc.dig("build", "target")] }
-            expected = {"web" => "app", "migrate" => "app", "clickhouse-init" => "app", "control" => "ai", "execution" => "ai"}
+            expected = {"web" => "app", "migrate" => "app", "clickhouse-init" => "app", "execution" => "ai"}
             abort "default targets: #{build.slice(*expected.keys).inspect}" unless expected.all? { |name, target| build[name] == target }
+            abort "control service must be gone: #{build.keys.inspect}" if build.key?("control")
           '
-          CONTROL_TARGET=app EXECUTION_TARGET=app docker compose config --format json | ruby -rjson -e '
+          EXECUTION_TARGET=app docker compose config --format json | ruby -rjson -e '
             build = JSON.parse(STDIN.read).fetch("services").to_h { |name, svc| [name, svc.dig("build", "target")] }
-            abort "offline targets: #{build.slice("control", "execution").inspect}" unless build["control"] == "app" && build["execution"] == "app"
+            abort "offline targets: #{build.slice("execution").inspect}" unless build["execution"] == "app"
           '
       - name: Static ops contracts
         run: ruby bin/check-compose

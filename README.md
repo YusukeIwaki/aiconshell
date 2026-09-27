@@ -38,7 +38,7 @@ docker compose up --build
 cp .env.example .env   # 初回のみ。DB / ClickHouse の URL をホスト側のポートへ変更
 bin/setup --skip-server  # bundle + development/test 両 DB の db:prepare
 bin/dev                  # web（Puma, port 3000）
-bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記注意）
+AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記注意）
 ```
 
 - ホスト上で AI を実行する場合は `AICONSHELL_EXECUTION_ROOT` をリポジトリ外の
@@ -49,9 +49,17 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 - `bin/jobs` の既定 fork モードは Linux Docker 用。macOS の fork worker
   は不安定（pg ネイティブ拡張 + ObjC ランタイムの fork 安全性）のため、
   macOS ローカルでは必ず `--mode=async` を付ける。
-- 本番用ワーカー分割（control / execution の `--config-file` 指定）は
+- worker コマンドにだけ `AICONSHELL_WORKER_ROLE=execution` を明示する。
+  web（`bin/dev`）には role を与えない。`.env.example` の既定は空のままで、
+  新しい共有認証操作は role 不一致（`role_mismatch`）で失敗するため、
+  ローカルの auth queue を動かす検証では上記の worker コマンドで role を付ける。
+- async では全 pool・poller・scheduler が同一プロセスの connection pool を
+  共有するため、`RAILS_MAX_THREADS=15` で余裕を持たせる（既定 5 では足りない）。
+  fork / async の違いと DB pool の考え方は
+  [docs/deployment.md](docs/deployment.md)「同時実作業数と DB pool の目安」が正。
+- 単一ワーカーの正規設定（`config/queue_execution.yml` の `--config-file` 指定）は
   compose と Railway で行う（[docs/deployment.md](docs/deployment.md)）。
-  ローカルの `bin/jobs`（無引数）は全キューの開発用一括起動である。
+  ローカルの `bin/jobs`（無引数）は開発用 `config/queue.yml`（同じ 3 pool 分離）での一括起動である。
 
 主な環境変数（全量は `.env.example` が正）:
 
@@ -65,7 +73,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 | `AICONSHELL_EXECUTION_ROOT` | AI 作業領域ルート（production 必須） | compose は `/workspaces` volume |
 | `AICONSHELL_ALLOWED_SCOPES` | 取り込み/送信対象の `plugin:scope` 一覧 | 空（何も対象にしない） |
 | `AICONSHELL_LEASE_SECONDS` / `AICONSHELL_AI_TIMEOUT_SECONDS` | 実行 lease / AI 実行上限（lease > timeout + 10 が必須） | `1800` / `600` |
-| `RAILS_MAX_THREADS` | Puma + DB プール | `5` |
+| `RAILS_MAX_THREADS` | Puma + DB プール（async worker は上記のとおり `15` を明示） | `5` |
 | `JOB_CONCURRENCY` | `bin/jobs` の worker プロセス数 | `1` |
 
 ## 自然言語で依頼する
@@ -78,7 +86,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 
 整理層の AI ポリシーを有効にし、provider・model・effort を設定する。
 選んだ CLI の公式サブスクリプション認証、専用 AI 作業領域、
-起動中の control worker が必要。未設定 provider も選択できるが、実行時に
+起動中の execution worker が必要。未設定 provider も選択できるが、実行時に
 分類済みエラーをタスク詳細と受付 API に表示する。API キー課金へは切り替えない。
 
 連携には次の設定が必要（秘密値は private 環境変数・ファイルで渡す）:
@@ -151,24 +159,27 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 - 日常操作・AI CLI 導入・Railway・ngrok は [docs/deployment.md](docs/deployment.md)。
 - 共有 PostgreSQL サーバー上の複数利用環境は
   [docs/railway-environments.md](docs/railway-environments.md)。
-- イメージは役割別: web は常に CLI なしの `app`、worker は `ai` が既定
+- イメージは役割別: web は常に CLI なしの `app`、単一 execution worker は `ai` が既定
   （Claude/Codex/Muse 付き。Muse は公式公開 Linux バイナリを固定
   バージョン・SHA256 検証で同梱）。認証ログインは別の実行時手順。
-- 環境変数は `.env.example` が正。`execution` worker には連携資格情報を
-  渡さない（compose と AI 層の両方で遮断）。
+- 環境変数は `.env.example` が正。単一 execution worker の Rails 親は連携・
+  ClickHouse 資格情報を持つが、AI CLI 子プロセスには継承させない
+  （`ChildEnv` の契約。[docs/deployment.md](docs/deployment.md) §1）。
 - ClickHouse は結果整合性のため分離起動する: 障害時も web/worker は
   起動し、配信は outbox に滞留してリトライされる。スキーマ適用は
   `clickhouse-init`（compose）/ 別途 one-off（Railway）で行う。
-- AI のサブスクリプションログインは管理画面の「AI連携」から worker 別に行う
-  （[docs/ai-connections.md](docs/ai-connections.md)）。control と execution
-  は別 volume のため両方へのログインが要る。未連携 provider も選択可。
+- AI のサブスクリプションログインは管理画面の「AI連携」から行う
+  （[docs/ai-connections.md](docs/ai-connections.md)）。execution 側 volume を
+  継続使用し、旧 control 側 volume は消さず認証 cache をコピーしない。
+  未連携 provider も選択可。
 
 ## 構成
 
 - `app/` — Rails 8（Puma・Thruster、CSRF/CSP 既定）。`ApplicationJob` /
   `ApplicationRecord` は基底クラス。ドメイン別詳細は各 docs 参照。
-- `config/queue_control.yml` / `config/queue_execution.yml` — 本番用
-  worker 分割設定（`config/queue.yml` は開発用一括）。
+- `config/queue_execution.yml` — 単一ワーカーの正規設定（control 3 /
+  execution 1 / `ai_auth_execution` 1 の 3 pool + scheduler）。
+  `config/queue.yml` は同じ分離の開発用一括設定。
 - `lib/aiconshell/{plugins,ai,observability}/` — 明示 require の pure
   Ruby ポート（Zeitwerk 対象外）。
 - `smartest/` — `unit/`（`observability/` 含む）・`plugins/`・`ai/`（DB なし）、
