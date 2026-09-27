@@ -392,11 +392,14 @@ image 内の `chown` は、後から mount される Railway volume の所有権
    exit
    ```
 
-3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻す。
-   まず待機コマンドのまま再 deploy し、`railway ssh --service control -- id -u` が `1000`、
-   `railway ssh --service control -- test -w /data/workspaces` が成功することを確認する。
+3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻し、まず待機コマンドで再 deploy する。
+   Railway の SSH shell は root で始まることがあるため、SSH の `id -u` とアプリの実行 UID を混同しない。
+   `/proc/1/status` の `Uid` が `1000` であることと、
+   `railway ssh --service control -- runuser -u rails -- test -w /data/workspaces` の成功を確認する。
    execution でもサービス名を変えて同じ確認を行う。
-4. UID 1000 の remote shell 内で、その worker が使う provider に個別ログインする。
+4. `railway ssh --service control -- runuser -u rails -- bash` で UID 1000 の shell を開き、
+   `id -u` を確認して、その worker が使う provider に個別ログインする。
+   execution でも同様に行う。root のまま認証ファイルを作らない。
    「5. AI CLI プロビジョニング」の公式 subscription login 手順を使い、Muse の対話シェルでは
    `export XDG_CONFIG_HOME="$AICONSHELL_MUSE_HOME"` を先に実行する。
    通常の token refresh はそのサービスの volume だけに保存される。
