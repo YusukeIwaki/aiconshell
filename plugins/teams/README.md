@@ -6,6 +6,13 @@ Microsoft Teams 用の in-process プラグイン。読み取りは Microsoft Gr
 Teams に issue tracker はないため `create_issue` は非対応とし、
 課題作成は GitHub / Jira プラグインで行う。
 
+## 運用名義
+
+本プラグインは Graph application + Bot 名義の Bot 運用である（下記のアプリ資格情報）。
+同意した特定ユーザー名義で動く OAuth2 代理運用とは別の接続であり、
+管理画面の「OAuth連携」で管理する。個人 PAT による代理運用・PAT 入力・
+OAuth 失敗時の PAT fallback は提供しない。詳しくは [OAuth接続](../../docs/oauth-connections.md) を参照。
+
 ## 必要な環境変数
 
 | 変数 | 必須 | 説明 |

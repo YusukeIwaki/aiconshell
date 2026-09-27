@@ -15,6 +15,12 @@ module Interaction
       { "scopes" => Array(capability) }
     end
 
+    # Allowlist namespaces are per plugin id: `jira:PROJ` never
+    # authorizes `jira_oauth:PROJ` and vice versa. Delegated OAuth
+    # destinations normalize to their own namespace so the operator
+    # allowlist (`AICONSHELL_ALLOWED_SCOPES` with `jira_oauth:` /
+    # `teams_oauth:` entries) stays separate from the legacy Bot /
+    # service-account entries.
     def destination(plugin, operation, input)
       target = input.fetch(operation == "reply" ? "resource_id" : "scope", "").to_s
       case plugin.to_s
@@ -24,11 +30,47 @@ module Interaction
       when "jira"
         match = /\Aissue:([A-Za-z][A-Za-z0-9_]*)-\d+\z/.match(target)
         match ? match[1].upcase : target
+      when "jira_oauth"
+        if operation.to_s == "reply"
+          match = /\Aissue:([A-Za-z][A-Za-z0-9_]*)-\d+\z/.match(target)
+          match ? match[1].upcase : target
+        else
+          target.to_s.upcase
+        end
       when "teams"
         match = /\A(?:message|channel):([^\/]+)\/([^\/]+)(?:\/[^\/]+)?\z/.match(target)
         match ? "team/#{match[1]}/channel/#{match[2]}" : target
+      when "teams_oauth"
+        if operation.to_s == "reply"
+          channel = /\Amessage:([^\/]+)\/([^\/]+)\/[^\/]+\z/.match(target)
+          return "team/#{channel[1]}/channel/#{channel[2]}" if channel
+
+          chat = /\Achat_message:([^\/]+)\/[^\/]+\z/.match(target)
+          return "chat/#{chat[1]}" if chat
+
+          target
+        else
+          channel = /\Achannel:([^\/]+)\/([^\/]+)\z/.match(target)
+          return "team/#{channel[1]}/channel/#{channel[2]}" if channel
+
+          chat = /\Achat:([^\/]+)\z/.match(target)
+          return "chat/#{chat[1]}" if chat
+
+          target
+        end
       else
         target # custom plugins can use an exact operator-allowlisted resource
+      end
+    end
+
+    def oauth_plugin?(plugin)
+      %w[jira_oauth teams_oauth].include?(plugin.to_s)
+    end
+
+    def oauth_provider_name(plugin)
+      case plugin.to_s
+      when "jira_oauth" then "atlassian"
+      when "teams_oauth" then "microsoft"
       end
     end
 

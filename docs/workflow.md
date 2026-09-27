@@ -99,9 +99,20 @@ observed for that revision. Metadata timestamps in the payload do not create
 new work. Other event types retain their original fingerprint deduplication.
 
 Per-plugin/event-ID transaction advisory locks serialize snapshot writes across
-scopes, acquired in sorted order. A batch is processed in timestamp order for
+scopes, acquired in sorted order. Delegated OAuth sources scope event
+identity — the lock, watermark lookup, and DB uniqueness — by provider
+resource space (`oauth_event_space`: provider plus fixed tenant/cloud,
+raw provider IDs unchanged, never the fetching generation); legacy sources
+keep the global plugin/event lock. Re-fetching an identical handled
+revision after a reconnect dedups to the existing row and creates no new
+Task or reply; the same numeric IDs on a different cloud/tenant are a
+distinct space with distinct rows and watermarks. Task joins stay
+generation-pinned (`oauth_source_key`): a new post or edit fetched after a
+reconnect becomes current-generation work in its own Task without joining
+the old generation's Task. A batch is processed in timestamp order for
 each source. Snapshots older than the persisted watermark are ignored; equal
-timestamps are first-observed-wins (batch input order breaks ties). Providers
+timestamps are first-observed-wins within one provider space (batch input
+order breaks ties). Providers
 must supply the edit time as `occurred_at`; timestamps are compared at PostgreSQL
 microsecond precision. Conflicting changes at the same timestamp and changes
 that occur entirely between polls cannot be reconstructed. Existing rows retain
@@ -114,7 +125,76 @@ Only known bots/self actors are pre-processed to prevent echo loops; other
 system events are retained as coordination context. Set
 `AICONSHELL_SELF_ACTOR_IDS=plugin:id,...` (or `JIRA_SERVICE_ACCOUNT_ID` for Jira).
 Jira outbound writes fail with `self_actor_not_configured` without a known self
-account identity.
+account identity. Delegated `jira_oauth` / `teams_oauth` never suppress by
+actor: the consenting user's manual posts stay eligible and only durable sent
+receipts suppress the app's own echo (see below).
+
+Delegated OAuth polling, typed reads, and outbound delivery share one trusted
+boundary (issue #26). The application fixes the secret-free `oauth_binding`
+(connection id, generation, provider, principal, tenant/cloud) with the
+`oauth_credential_provider` in the invoke context; adapters resolve the same
+binding just-in-time and never re-select the current user or fall back to
+service-account credentials. Binding/provider values never enter AI
+input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
+`teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
+delegated variant. Typed-read snapshots are reused for the following
+result, fetch-time external-event snapshots (the fetching binding stored on
+each `external_events` row and copied to its `tasks` row at creation, Task
+joins scoped by the generation-pinned `oauth_source_key`) for the following
+reply, and enqueue snapshots for
+delivery; a disconnect/replacement in between stops with `stale_binding` /
+`not_connected` instead of continuing as another principal, and each Task
+is fenced by its own stored binding so same-provider Tasks from different
+generations never mix. Same raw event/resource IDs on different
+clouds/tenants are distinct isolated spaces with distinct DB
+rows, watermarks, advisory locks, and Tasks; the same space re-fetched
+after a reconnect dedups to handled rows with no new work, while a new
+post or edit in the same space becomes a separate current-generation Task;
+legacy dedup stays global.
+External-event Tasks never gain typed reads: `admin_origin_required`
+still rejects them before HTTP, and that restriction is kept. A stale
+OAuth reply is fenced before any Task mutation and re-fenced before the
+write, so a rejected reply leaves Task state, dispatch runs, actions, and
+feedback acknowledgements untouched. Refresh never changes the generation. Cursors are
+isolated per connection (`integration_cursors.oauth_binding`): a changed
+connection restarts from no cursor and never reuses another site's cursor.
+Callback/refresh/send races discard stale results instead of reviving or
+sending with a new user's token. A stale poll releases only its own cursor
+lease token, never a successor's.
+
+Self-post receipts are the sent `outbound_actions` themselves (provider
+resource, `external_id`, and the actually sent body persisted on `sent` even
+when Interaction drafting rewrote it). Receipt identity is
+generation-independent: a poll candidate matching the same provider
+resource space (provider plus fixed tenant/cloud), resource, external id,
+and content is the app echo and is not ingested, even after a reconnect
+with a cursor reset; send permission itself stays generation-pinned. A
+different id, a different resource (same numeric ids on different
+resources, clouds, or tenants never suppress), edited content, or a later
+human edit of the app post stays eligible. The receipt lookup is scoped in
+the database (newest first, no row cap) so a confirmed self-post still
+matches past any number of older receipts. While a matching `pending` /
+`sending` / `uncertain` action exists, the candidate is held without
+advancing the cursor so it is neither lost
+nor auto-replied in a loop; a mixed batch still ingests unrelated
+candidates (held rows are partitioned per candidate, the pass set
+persists, and the cursor is retained rather than advanced past held
+rows). `pending` never holds another generation — even a rate-limited
+attempt that left `request_started_at` set is an explicit rejection with
+no unknown side effect; only already-started
+writes (`sending` with `request_started_at` set, or `uncertain`) hold across
+generations in the same provider resource space, so an unknown side
+effect survives reconnect until reconciled. `sending` before
+`request_started_at` holds only its own generation. Jira holds are per issue (a reply to one issue
+never holds another), Teams holds per channel/chat, and other spaces/destinations are unaffected.
+DB or matcher errors halt ingestion and the cursor advance instead of
+treating the batch as ordinary human events.
+
+The AI coordination prompt maps operator-allowlisted permission scopes to
+write input scopes: legacy `teams` and delegated `teams_oauth` channels
+`team/t/channel/c` map to `channel:t/c`, and `teams_oauth` chats `chat/c`
+map to `chat:c`; Jira project scopes are identical for poll and write.
+Read/poll permission scopes themselves are unchanged.
 
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a
@@ -127,6 +207,8 @@ crash after a remote request started becomes `uncertain` and is not automaticall
 resent. Interrupted local drafting can return to pending after backoff. Remote
 providers do not offer an end-to-end exactly-once guarantee; operators must
 reconcile uncertain sends before deciding whether another action is needed.
+Already-started HTTP cannot be cancelled: a write whose remote acceptance is
+unknown stays `uncertain` and is never auto-resent.
 
 ## Typed admin reads and results (issue #11)
 

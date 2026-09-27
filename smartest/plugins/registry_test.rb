@@ -4,15 +4,19 @@ require_relative "plugins_test_helper"
 
 Plugins = Aiconshell::Plugins
 
-test("default registry exposes the github/jira/teams capability catalog") do
+test("default registry exposes the github/jira/teams/oauth capability catalog") do
   catalog = Plugins::Registry.default.catalog
   by_id = catalog.to_h { |entry| [entry["id"], entry] }
 
-  expect(by_id.keys).to eq(%w[github jira teams])
+  expect(by_id.keys.sort).to eq(%w[github jira jira_oauth teams teams_oauth])
   expect(by_id["github"]["operations"].map { |op| op["name"] })
     .to eq(%w[latest_events list_issues reply create_issue])
   expect(by_id["teams"]["operations"].map { |op| op["name"] })
     .to eq(%w[latest_events reply send_message create_issue])
+  expect(by_id["jira_oauth"]["operations"].map { |op| op["name"] }.sort)
+    .to eq(%w[create_issue latest_events reply])
+  expect(by_id["teams_oauth"]["operations"].map { |op| op["name"] }.sort)
+    .to eq(%w[create_issue latest_events reply send_message])
 
   unsupported = by_id["teams"]["operations"].find { |op| op["name"] == "create_issue" }
   expect(unsupported["unsupported"]).to eq(true)

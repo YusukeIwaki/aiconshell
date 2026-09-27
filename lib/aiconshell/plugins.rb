@@ -23,6 +23,8 @@ require_relative "plugins/registry"
 require_relative "plugins/github"
 require_relative "plugins/jira"
 require_relative "plugins/teams"
+require_relative "plugins/jira_oauth"
+require_relative "plugins/teams_oauth"
 
 module Aiconshell
   module Plugins

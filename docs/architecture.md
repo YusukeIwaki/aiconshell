@@ -36,7 +36,7 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 
 | モデル | 主な情報 / 制約 |
 | --- | --- |
-| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし、親スナップショットは改訂を鎖状に識別する |
+| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし（委任OAuthはprovider resource space単位で世代非依存、Task結合は取得世代別）、親スナップショットは改訂を鎖状に識別する |
 | TaskRequest | 管理画面・管理APIの依頼受付。公開UUID、UI/API別の冪等キー、title/description、固有のExternalEventへの参照。受付とイベントを同じtransactionで保存する |
 | IntegrationCursor | plugin と scope ごとの cursor JSON、lease、last_polled_at、error。全ページの durable ingest 完了後のみ更新 |
 | Task | title、description、status、priority、source reference、next_action_at、lock_version、coordination_result、delivery_batch_key。状態更新は Coordination のみ |
@@ -44,6 +44,8 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 | TaskRun | task、provider/model/effort/instructions snapshot、status、lease token/expiry、result、error、開始/終了時刻 |
 | LayerPolicy | layer（interaction/coordination/execution）、provider（claude/codex/muse）、model、effort、instructions、enabled。layer一意 |
 | OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error、delivery_batch_key。Coordination が作り Interaction が送る |
+| OauthConnection | provider ごとの委任接続1件。世代・外部principal・tenant/cloud・付与scope・状態・期限・安全な分類コード。token は専用 salt の認証付き暗号化のみ。provider 一意 |
+| OauthAuthAttempt | 短 TTL の認証試行。state は SHA256 digest のみ保持しブラウザ session に結合。code 保持なし、PKCE verifier（Microsoft のみ）は暗号化。一回消費、state_digest 一意 |
 | EventDelivery | redacted envelope、event_id、宛先別配信/再試行状態。配信済みの短期 retention |
 
 Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `waiting_delivery`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
@@ -82,6 +84,10 @@ HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検�
 `Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
 
 GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+
+ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。委任版 `jira_oauth` / `teams_oauth` は default registry へ登録済み（#26）であり、pure Ruby の登録と Rails の credential provider 注入を分離する。`catalog.configured` は `OAUTH_*` 設定の有無のみを示し、接続成功との区別は管理画面・業務統合が表示する。AI/Plugin の JSON Schema に credential や接続権限は含めない。
+
+運用名義は (1) 既存サービスアカウント/Bot 名義の Bot 運用（`jira` service account / `teams` Graph application + Bot を維持）と (2) 同意した特定ユーザー名義の OAuth2 代理運用（`jira_oauth` / `teams_oauth`）の2種類である。個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT fallback は追加しない。`jira` / `jira_oauth`、`teams` / `teams_oauth` の allowlist は別 namespace であり、旧許可を委任版へ自動転用しない。poll/query/outbound は同じ信頼された `oauth_binding` / `oauth_credential_provider` 境界を使い、binding をユーザー/AI が指定できない。接続 ID・世代・principal・tenant/cloud の snapshot は信頼されたアプリ側で固定し、refresh では世代を変えない。callback/refresh/送信の競合は fencing で扱い、既に開始した HTTP は取り消せないため成功不明の書込は `uncertain` として再送しない。自己投稿は確定 receipt（provider resource・外部 ID・実際に送った内容）の永続照合でのみ抑制し、手動発言は対象とする。詳細は [workflow](workflow.md) を参照。
 
 ### 管理依頼の read / result / receipt
 

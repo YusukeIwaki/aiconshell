@@ -50,13 +50,21 @@ module Coordination
     RESULT_SOURCE_STATUSES = %w[inbox ready waiting_human waiting_review failed].freeze
 
     def initialize(registry: Aiconshell::Plugins::Registry.default,
-                   event_sink: WorkflowEvents, clock: Time, allowed_scopes: nil)
+                   event_sink: WorkflowEvents, clock: Time, allowed_scopes: nil,
+                   oauth_credential_provider: nil)
       @validator = Interaction::ActionValidator.new(registry: registry, allowed_scopes: allowed_scopes)
       @event_sink = event_sink
       @clock = clock
+      @oauth_credential_provider = oauth_credential_provider
     end
 
-    def apply(task_id:, task_version:, feedback_ids:, policy:, result:)
+    # `oauth_bindings:` optionally carries the read-time snapshots fixed
+    # during typed reads (plugin id -> secret-free binding hash). When
+    # present, a disconnect/replacement between the read and this result
+    # rejects instead of continuing as a different principal. The AI never
+    # supplies bindings; the application fixes them. Each OAuth action's
+    # snapshot is stored on its OutboundAction for enqueue→delivery fencing.
+    def apply(task_id:, task_version:, feedback_ids:, policy:, result:, oauth_bindings: nil)
       value = result.is_a?(Hash) ? result.deep_stringify_keys : nil
       unless value.is_a?(Hash) && JSONSchemer.schema(RESULT_SCHEMA).valid?(value) &&
           value["summary"].strip.present? && !value["summary"].include?("\u0000")
@@ -85,22 +93,45 @@ module Coordination
           return reject(task_id, :feedback_required) unless pending.exists?
         end
 
+        # One verified binding per OAuth plugin, fixed here and reused
+        # for every create below: validate-plus-create never re-resolves
+        # (a second lookup could observe a replaced connection and store
+        # an unchecked or foreign snapshot). A disconnect/replacement
+        # between the typed read and this result rejects instead of
+        # continuing as another principal.
+        verified_bindings = {}
         actions.each_with_index do |action, index|
           verdict = @validator.validate(plugin: action["plugin"], operation: action["operation"], input: action["input"])
-          next if verdict.ok?
-
-          emit_rejected(task.id, verdict.code, action_index: index, action_count: actions.size)
-          return Result.new(ok: false, code: verdict.code, action_index: index)
+          unless verdict.ok?
+            emit_rejected(task.id, verdict.code, action_index: index, action_count: actions.size)
+            return Result.new(ok: false, code: verdict.code, action_index: index)
+          end
+          if Interaction::OauthContext.oauth_plugin?(action["plugin"].to_s)
+            plugin_name = action["plugin"].to_s
+            unless verified_bindings.key?(plugin_name)
+              binding_result = oauth_binding_for(plugin_name, oauth_bindings)
+              unless binding_result[:ok]
+                emit_rejected(task.id, binding_result[:code], action_index: index, action_count: actions.size)
+                return Result.new(ok: false, code: binding_result[:code], action_index: index)
+              end
+              verified_bindings[plugin_name] = binding_result[:binding]
+            end
+          end
         end
 
         now = current_time
         actions.each_with_index do |action, index|
-          OutboundAction.create!(
+          attrs = {
             plugin: action["plugin"].to_s, operation: action["operation"].to_s,
             input: action["input"].deep_stringify_keys,
             idempotency_key: "#{batch_key}-#{index + 1}",
             delivery_batch_key: batch_key, status: "pending", task: task
-          )
+          }
+          if Interaction::OauthContext.oauth_plugin?(action["plugin"].to_s)
+            stored = verified_bindings[action["plugin"].to_s]
+            attrs[:oauth_binding] = stored if OutboundAction.column_names.include?("oauth_binding") && !stored.nil?
+          end
+          OutboundAction.create!(attrs)
         end
         # Direct assignment under an explicit allowlist: the shared transition
         # map stays unchanged so ordinary external tasks gain no new edges.
@@ -125,6 +156,39 @@ module Coordination
     end
 
     private
+
+    def oauth_provider
+      @oauth_credential_provider ||= begin
+        Oauth::CredentialProvider.new(event_sink: @event_sink)
+      rescue StandardError
+        nil
+      end
+    end
+
+    # Fixes the trusted binding for one OAuth action. When read-time
+    # snapshots are supplied, the current connection must still match them;
+    # otherwise the result stops instead of continuing as another principal.
+    # Refresh never changes the generation (see TokenService), so a plain
+    # refresh does not invalidate the snapshot.
+    def oauth_binding_for(plugin, read_bindings)
+      provider = oauth_provider
+      return { ok: false, code: :credentials_missing } if provider.nil?
+
+      begin
+        current = Interaction::OauthContext.snapshot_binding(plugin, credential_provider: provider)
+      rescue Oauth::CredentialProvider::NotConnected
+        return { ok: false, code: :not_connected }
+      rescue Aiconshell::Oauth::Error
+        return { ok: false, code: :not_connected }
+      end
+      if read_bindings.is_a?(Hash) && read_bindings.key?(plugin.to_s)
+        expected = read_bindings[plugin.to_s]
+        bound = Aiconshell::Oauth::Binding.from_h(expected)
+        current_hash = current.is_a?(Hash) ? current : current.to_h
+        return { ok: false, code: :stale_binding } unless bound.matches?(current_hash)
+      end
+      { ok: true, code: :ok, binding: current }
+    end
 
     def policy_current?(policy)
       return false unless policy.is_a?(LayerPolicy) && policy.id && policy.updated_at && policy.layer == "coordination"

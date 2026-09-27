@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_080000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -101,7 +101,11 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.bigint "task_id"
     t.string "source_fingerprint"
     t.datetime "source_updated_at"
-    t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_on_plugin_event_fingerprint", unique: true
+    t.jsonb "oauth_binding"
+    t.string "oauth_source_key"
+    t.string "oauth_event_space"
+    t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_legacy_dedup", unique: true, where: "(oauth_source_key IS NULL)"
+    t.index ["plugin", "oauth_event_space", "event_id", "fingerprint"], name: "index_external_events_oauth_dedup", unique: true, where: "(oauth_event_space IS NOT NULL)"
     t.index ["plugin", "resource_id"], name: "index_external_events_on_plugin_resource"
     t.index ["processed_at"], name: "index_external_events_on_processed_at"
     t.index ["task_id"], name: "index_external_events_on_task_id"
@@ -118,6 +122,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.integer "consecutive_failures", default: 0, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.jsonb "oauth_binding"
     t.index ["plugin", "scope"], name: "index_integration_cursors_on_plugin_scope", unique: true
   end
 
@@ -131,6 +136,53 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["layer"], name: "index_layer_policies_on_layer", unique: true
+  end
+
+  create_table "oauth_auth_attempts", force: :cascade do |t|
+    t.string "provider", null: false
+    t.string "state_digest", null: false
+    t.string "browser_session_digest", default: "", null: false
+    t.string "redirect_uri", default: "", null: false
+    t.text "encrypted_code_verifier"
+    t.integer "generation_at_start", default: 0, null: false
+    t.string "status", default: "pending", null: false
+    t.string "error_code"
+    t.datetime "expires_at", null: false
+    t.datetime "consumed_at"
+    t.datetime "finished_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.string "client_id"
+    t.string "cloud_id"
+    t.string "tenant_id"
+    t.text "scopes", default: "", null: false
+    t.index ["expires_at"], name: "index_oauth_auth_attempts_on_expires_at"
+    t.index ["provider", "status"], name: "index_oauth_auth_attempts_on_provider_status"
+    t.index ["state_digest"], name: "index_oauth_auth_attempts_on_state_digest", unique: true
+  end
+
+  create_table "oauth_connections", force: :cascade do |t|
+    t.string "provider", null: false
+    t.integer "generation", default: 0, null: false
+    t.string "state", default: "unknown", null: false
+    t.string "error_code"
+    t.string "external_principal", default: "", null: false
+    t.string "display_name", default: "", null: false
+    t.string "tenant_id"
+    t.string "cloud_id"
+    t.text "granted_scopes", default: "", null: false
+    t.text "encrypted_access_token"
+    t.text "encrypted_refresh_token"
+    t.datetime "token_expires_at"
+    t.string "refresh_lease_token"
+    t.datetime "refresh_lease_expires_at"
+    t.integer "refresh_lease_generation"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.string "client_id"
+    t.index ["provider"], name: "index_oauth_connections_on_provider", unique: true
+    t.index ["refresh_lease_token"], name: "index_oauth_connections_on_refresh_lease", unique: true
+    t.index ["state"], name: "index_oauth_connections_on_state"
   end
 
   create_table "outbound_actions", force: :cascade do |t|
@@ -153,6 +205,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.datetime "request_started_at"
     t.datetime "next_attempt_at"
     t.string "delivery_batch_key"
+    t.jsonb "oauth_binding"
     t.index ["delivery_batch_key"], name: "index_outbound_actions_on_delivery_batch_key"
     t.index ["idempotency_key"], name: "index_outbound_actions_on_idempotency_key", unique: true
     t.index ["lease_expires_at"], name: "index_outbound_actions_on_lease_expires_at"
@@ -383,10 +436,13 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.text "work_plan", default: "", null: false
     t.jsonb "coordination_result"
     t.string "delivery_batch_key"
+    t.jsonb "oauth_binding"
+    t.string "oauth_source_key"
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
+    t.index ["source_plugin", "oauth_source_key", "source_resource_id"], name: "index_tasks_one_open_per_source_oauth", unique: true, where: "((oauth_source_key IS NOT NULL) AND ((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"
-    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY (ARRAY[('inbox'::character varying)::text, ('ready'::character varying)::text, ('running'::character varying)::text, ('waiting_human'::character varying)::text, ('waiting_review'::character varying)::text, ('waiting_delivery'::character varying)::text, ('failed'::character varying)::text])))"
+    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source_legacy", unique: true, where: "((oauth_source_key IS NULL) AND ((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
     t.index ["status"], name: "index_tasks_on_status"
   end
 

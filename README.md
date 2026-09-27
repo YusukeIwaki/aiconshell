@@ -101,6 +101,13 @@ AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    #
 - 許可対象の例は
   `AICONSHELL_ALLOWED_SCOPES=github:owner/repo,teams:team/TEAM_ID/channel/CHANNEL_ID`。
   Teams 送信入力の宛先は `channel:TEAM_ID/CHANNEL_ID` である。
+- 運用名義は既存サービスアカウント/Bot 名義の Bot 運用と同意ユーザー名義の
+  OAuth2 代理運用（`jira_oauth` / `teams_oauth`、`OAUTH_*` 設定）の2種類のみ。
+  個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT
+  fallback は提供しない。委任版の許可は別 namespace（例
+  `jira_oauth:PROJ`、`teams_oauth:team/TEAM_ID/channel/CHANNEL_ID`）で指定し、
+  旧許可の自動転用はしない。詳細は [OAuth 接続](docs/oauth-connections.md) と
+  各 plugin README を参照。
 
 サーバーに設定したトークンを手元の `ADMIN_API_TOKEN` に設定して実行する:
 
