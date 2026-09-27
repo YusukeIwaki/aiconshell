@@ -34,6 +34,11 @@ shared variable を使う場合は利用環境の接頭辞を付け、必要な�
 
 - `DATABASE_URL` には専用 role の接続文字列だけを入れる。
   管理者接続（例: `${{Postgres.DATABASE_URL}}`）をそのまま参照しない。
+- shared variable には private DNS を含む完成済みの接続文字列を置き、
+  サービス間参照を入れ子にしない。各アプリの `DATABASE_URL` から
+  `${{shared.AICONSHELL_PRODUCTION_DATABASE_URL}}` を参照する。
+  deploy 前に解決後の host / database / role が期待値かを確認する。
+  接続文字列全体やパスワードは確認ログに出さない。
 - 他環境の連携資格情報を渡さない。`execution` には連携資格情報を渡さない
   （既存境界どおり）。
 - `railway variable list ... --json` は秘密値をそのまま表示する。
