@@ -21,6 +21,8 @@ Aiconshell::Ai::Runner.new.call(
 `configured?` checks only that the CLI exists on PATH and the private auth
 location is mounted; subscription validity (expired login, usage limits) is a
 runtime failure (`ExecutionFailed` with `kind` `:auth` or `:usage_limit`).
+This diagnostic belongs to the executing worker. Admin pages use worker-confirmed
+`AiConnection` snapshots instead; see [AI connections](ai-connections.md).
 
 ## Provider commands
 
@@ -95,8 +97,11 @@ Notes and edges:
 
 ## Login and credential homes
 
-Use the official subscription login flows on a machine with a browser, then
-persist only the resulting credential directories:
+Start the official subscription login on each worker through the
+[AI connections admin page](ai-connections.md); the operator approves the
+challenge in their browser. The worker itself needs no browser. Persist each
+worker's own credential directories. Direct CLI login is also available when
+operating that worker; the automated protocol is in [ai-auth-protocol.md](ai-auth-protocol.md).
 
 | Provider | Login | Credential home (presence-checked) | Child env override |
 | --- | --- | --- | --- |

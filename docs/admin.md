@@ -1,6 +1,7 @@
-# 管理画面 (Issue #7)
+# 管理画面
 
-日本語 server-rendered 管理画面。ERB + 自前 CSS のみ（外部フォント・CDN・JS 不使用）。
+日本語 server-rendered 管理画面。ERB + 自前 CSS を使う。外部フォント・CDNには依存しない。
+AI連携画面は小さなJavaScriptで進行中の更新と入力保護を行う。
 
 - タスクボード (`/admin/tasks`)：状態別ボード、状態フィルタ、50件単位のページ送り
 - タスク詳細 (`/admin/tasks/:id`)：概要・作業計画、フィードバック一覧・投稿、実行結果付き履歴、送信アクション
@@ -9,10 +10,10 @@
 - EventLog 検索 (`/admin/event_logs`)：層・種別・タスク・期間・キーワード
 - AIアカウント連携 (`/admin/ai_connections`)：provider × worker role の状態確認・連携開始・認証案内・コード入力・キャンセル（[ai-connections.md](ai-connections.md)）
 
-## 所有ファイル（このレーン）
+## 主なファイル
 
 - `config/routes.rb` の `draw(:admin)` 1行 + `config/routes/admin.rb`（詳細定義）
-- `app/controllers/admin/*.rb`（`BaseController` + 5 画面 + 3 表示アダプタ）
+- `app/controllers/admin/*.rb`（`BaseController`、各画面、表示アダプタ）
 - `app/views/layouts/admin.html.erb`、`app/views/admin/**/*.erb`
 - `app/assets/stylesheets/admin.css`
 - `app/helpers/admin_helper.rb`
@@ -20,7 +21,7 @@
 - `smartest/integration/admin/*_test.rb` + `support/admin_test_support.rb`
 - `docs/admin.md`（本書）
 
-## 依存する公開契約（実レーン統合済み）
+## 依存する公開契約
 
 管理画面は次の実契約に依存する。検証は実モデル・実ライブラリを相手に行う。
 
@@ -32,9 +33,10 @@
   フィードバック投稿は人間限定（`author_type` を `"human"` に固定）で
   `TaskFeedback` 行の作成のみ行い、タスク状態・優先度・run への直接更新はしない。
   送信アクションは状態・エラーコードの表示のみで、再送操作は持たない。
-- AI ポート：`Aiconshell::Ai::Registry.default` の `providers`（常に claude/codex/muse）、
-  `configured?(provider)`、`diagnose(provider)`。診断は Web プロセス上の確認であり、
-  ワーカーでの利用可否を保証しない旨を画面に明示する。未ロード時は「診断不可」に縮退する。
+- AI表示：`Admin::AiStatus.providers` は常に claude/codex/muse。
+  `diagnosis(provider, layer:)` はworkerが保存した `AiConnection` のrole別snapshotを読む。
+  WebローカルのCLIや認証ホームから推測しない。snapshotなしは未確認、読取失敗は診断不可。
+  ログイン・状態確認の運用入口は [ai-connections.md](ai-connections.md) を参照。
 - plugins ポート：`Aiconshell::Plugins::Registry.default.catalog`
  （`id/operations/required_env/configured`、env は名前のみ）。失敗時は行内通知に縮退する。
 - EventLog ポート：`EventLogging::Search.search`（実体は `Aiconshell::Observability.search`）。
@@ -58,7 +60,8 @@
 - 全 `/admin` に Basic 認証。SHA256 ダイジェストの `secure_compare`、未設定時は全拒否。
   CSRF は Rails 既定のまま（無効化しない）。
 - provider は claude/codex/muse を常に選択・保存可。未設定は診断バッジのみで保存成功し、
-  未知 ID は 422 で拒否する。worker 直接実行ボタンは持たない。
+  未知 ID は 422 で拒否する。業務workerを直接実行するボタンは持たない。
+  AI連携の運用操作は別の永続受付と専用auth queueを使い、Task/TaskRunを変更しない。
 - 一覧の保存済み行には「接続状態を再確認」があり、保存済み provider と層対応 role の
   状態確認を `AiAuth::RequestService#request_status` に依頼する。対象は保存済み設定からのみ
   決まり、リクエストの付加パラメータで変更できない。受付は `admin_ai_connections_path` へ

@@ -63,6 +63,8 @@ RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check
 `rbenv exec bash bin/test` ではなく、上記のBundler経由で起動する。
 依存関係の初回確認は `RBENV_VERSION=3.4.9 rbenv exec bundle check`。
 足りなければ同じRubyで `bundle install` する（lockfileは維持）。
+テスト出力を `tail` / `tee` へ渡すなら `set -o pipefail` で終了コードを保持する。
+複数コマンドの最後が成功したことだけで合格にせず、Smartestの失敗・skip件数も確認する。
 
 ## worktree用の一時DB
 
@@ -70,6 +72,9 @@ RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check
 だけを起動する。アプリ本体やAI CLIのコンテナをbuildする必要はない。
 以下はローカル専用の合成パスワードを使う例。tagを担当Issueにし、未使用のportを選ぶ。
 同じDBで並列にintegration suiteを動かさない（fixtureはrollback以外の実commitも使う）。
+空きportの確認は `docker ps --format '{{.Names}} {{.Ports}}'` などで行う。
+他プロジェクトのcontainerの `Config.Env` やホストの全環境変数を列挙して接続情報を探さず、
+自分で作ったテストサービスの明示的な `TEST_*` 接続だけを使う。
 
 ```sh
 export AICONSHELL_TEST_TAG=aiconshell-issue-N
@@ -183,6 +188,8 @@ DB フィクスチャはテストごとに rollback する。受付の
 - 永続化された状態、有意な境界リクエスト、未送信であること、スキーマ拒否、
   部分結果メタデータ、成功済み重複の抑止を検証する。
 - 正確なプロンプト文面や呼び出し順序は、安全契約でない限り固定しない。
+- 画面テストは対象のform・行・通知要素を特定して検証する。同じ文言が別の場所に
+  表示されているだけで通らないようにし、説明文の登場回数など無関係な内容には依存しない。
 - OAuth/トークン取得の POST と、外部可視の Teams 書き込みは区別する。
   後者は activity 書き込み URL への `requests_to` で数える。
 - 想定外呼び出しが rescue されても黙って通過させないため、
