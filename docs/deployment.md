@@ -87,10 +87,9 @@ docker compose up --build
 ./bin/smoke            # 別ターミナル、または -d 起動後に実行
 ```
 
-- worker は既定で `ai` イメージ（Claude/Codex 付き。`muse` は
-  `compose.muse.yml` の override でのみ追加）。CLI 不要の検証は
-  `CONTROL_TARGET=app EXECUTION_TARGET=app` を付けて起動する
-  （「5. AI CLI プロビジョニング」参照）。
+- worker は既定で `ai` イメージ（Claude/Codex/Muse 付き）。
+  CLI 不要の検証は `CONTROL_TARGET=app EXECUTION_TARGET=app` を付けて
+  起動する（「5. AI CLI プロビジョニング」参照）。
 - ポートは既定で loopback 束縛: web 3000、PostgreSQL 5432、ClickHouse
   8123。`WEB_PORT` / `POSTGRES_PORT` / `CLICKHOUSE_PORT`（+ `*_BIND`）で
   変更できる。既定の開発用資格情報のまま `0.0.0.0` 束縛にしないこと。
@@ -133,10 +132,11 @@ ruby bin/check-compose               # compose/queue/recurring/Dockerfile/CI の
 `Dockerfile` の `app` / `ai` ターゲットが役割別イメージを作る。
 `web` / `migrate` / `clickhouse-init` は `app` 固定（CLI なし）、
 `control` / `execution` は `ai` が既定（control も coordination AI を
-実行するため両方とも `ai`）。`ai` には Claude / Codex が入り、
-`muse` は任意の override（`compose.muse.yml` + ビルドシークレット）
-でのみ追加される。認証ログインはビルドとは別の実行時手順（本節末尾）。
-web には AI CLI も AI auth 環境変数・volume も渡さない
+実行するため両方とも `ai`）。`ai` には Claude / Codex / Muse の3つが
+入り、通常の `docker compose up --build` で両 worker に揃う。
+CLI 配布物の導入とサブスクリプションの実行時認証は別物である:
+ビルドにログインは不要で、認証ログインはビルドとは別の実行時手順
+（本節末尾）。web には AI CLI も AI auth 環境変数・volume も渡さない
 （`bin/check-compose` が検証）。
 
 | CLI | 導入元 | 既定バージョン（ARG で上書き可） |
@@ -145,7 +145,7 @@ web には AI CLI も AI auth 環境変数・volume も渡さない
 | `claude` | npm `@anthropic-ai/claude-code` | `CLAUDE_CODE_VERSION=2.1.283` |
 | `codex` | npm `@openai/codex` | `CODEX_VERSION=0.157.1` |
 | `git` | apt（AI の工程コマンド用） | ディストリビューション版 |
-| `muse` | 運営者支給の Linux バイナリ（要認証配布） | ビルドシークレットで注入 |
+| `muse` | 公式公開 Linux バイナリ（lookaside 配布。自動更新ランチャーではなく固定バイナリ） | `MUSE_VERSION=1.4.0-R4302.1` + アーキテクチャ別 SHA256（ARG で上書き可。更新時はバージョンと両 SHA256 を同時に更新） |
 
 Compose は `Dockerfile` の target から直接ビルドする。単体の
 `docker build -t ...` で付けたタグが Compose から自動で使われることは
@@ -161,46 +161,26 @@ CONTROL_TARGET=app EXECUTION_TARGET=app docker compose up --build
 既存の `.env` に `CONTROL_TARGET=app` / `EXECUTION_TARGET=app` がある場合は、
 CLI を使う両 worker の値を `ai` に変更する。
 
-Muse を追加・更新するときは、最初のビルドも含めて次の手順を使う。
-BuildKit は secret の内容・有無をキャッシュキーにしないため、
-`--no-cache` で Muse 未導入の古い層を再利用しないようにする:
-
-```sh
-# muse 付き（MUSE_CLI_PATH は compose.muse.yml のみが読む必須変数。
-# 正規の Linux バイナリへの絶対パスをリポジトリ外に置く。
-# イメージのアーキテクチャと一致させること。ホストの macOS バイナリや
-# 資格情報は使わない。override は両 worker を ai に固定する）
-export MUSE_CLI_PATH="$HOME/.cache/aiconshell/muse-cli/muse"
-docker compose -f compose.yml -f compose.muse.yml build --no-cache control execution
-docker compose -f compose.yml -f compose.muse.yml up --build
-```
-
-Muse をイメージから外すときは override を省き、同様に再ビルドする:
-
-```sh
-docker compose -f compose.yml build --no-cache control execution
-docker compose -f compose.yml up --build
-```
-
 下記は単体ビルド（private registry 用など）の例であり、付けたタグは
-Compose から自動では使われない:
+Compose から自動では使われない。どちらもログイン情報なしでビルドできる:
 
 ```sh
 # 基本イメージ
 docker build -t aiconshell:app .
-# CLI 付き（muse 抜きでもビルド可。その場合 muse は実行時失敗扱い）
+# CLI 付き（Claude / Codex / Muse の3つ入り）
 docker build --target ai -t aiconshell:ai .
-# muse を含める場合（リポジトリ外の正規 Linux バイナリをシークレットで渡す）
-docker build --target ai --no-cache -t aiconshell:ai \
-  --secret "id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse" .
 ```
 
-`muse` の取り扱いを正確に述べる: ビルド時の `install` はバイナリを
-`/usr/local/bin/muse` に**意図的にコピーし、ai イメージの一部にする**。
-ビルド後に消えるのはシークレットのマウント（`/run/secrets/muse_cli`
-はレイヤに残らない）だけであり、認証資格情報は常にイメージ外
-（マウント volume）に置く。資格情報をリポジトリやイメージに混入
-させないこと。ビルド時の入力ファイルと実行時の認証情報は別物である。
+`muse` の取り扱いを正確に述べる: ビルドは公式の公開 manifest
+（https://api.meta.ai/muse-code/channels/muse-stable）と同じ配布元から
+ネイティブ Linux バイナリを取得し、アーキテクチャ別 SHA256 を検証して
+`/usr/local/bin/muse` に置く。取得元は公開 URL であり、ビルド時の
+ログイン・API キー・auth cache は不要である。自動更新するランチャー
+ではなく固定バージョンのバイナリを同梱し、`muse --version` で確認する。
+認証資格情報は常にイメージ外（マウント volume）に置く。資格情報や
+バイナリをリポジトリに混入させないこと。配布物の導入と実行時の認証は
+別物である: 未認証の provider は選択可・実行時失敗が契約であり、
+ログインは下記の実行時手順で行う。
 
 CLI 不要のローカル検証向けに、worker を `app` に明示切替できる
 （`.env` の既定は `ai`）:
@@ -337,12 +317,12 @@ Compose は web `app` 固定・worker `ai` 既定（`CONTROL_TARGET` /
 `EXECUTION_TARGET` で `app` に明示切替可）で同じ分離を行う。
 [Railway の Docker build variables](https://docs.railway.com/builds/dockerfiles#using-variables-at-build-time)
 
-repo build の `ai` には Claude / Codex CLI が入る。Muse は認可された Linux binary を
-BuildKit secret で渡す既存の手順が別途必要で（ローカルは `compose.muse.yml` の override を使う）、
-Railway service variable から binary や認証を image に埋め込まない。Muse を使う worker は
-「5. AI CLI プロビジョニング」で作った private registry の image を
-source にする運用も可能。その場合も上表の worker 設定・以下の専用 volume / 個別ログインを使う。
-Muse binary が無ければ Muse は未構成のままであり、選択時に実行エラーになる。
+repo build の `ai` には Claude / Codex / Muse CLI が入る（公開配布からの
+取得であり、ビルド時ログイン不要）。Railway service variable から
+binary や認証を image に埋め込まない。private registry の image を
+source にする運用も可能で、その場合も上表の worker 設定・以下の専用
+volume / 個別ログインを使う。未認証の provider は未構成のままであり、
+選択時に実行エラーになる。
 
 ### 環境変数と独立した volume
 
@@ -502,13 +482,13 @@ curl -i -H 'Host: unlisted.example.invalid' http://127.0.0.1:3000/up
 | `unit` | `bin/test unit`（DB なし全 suite: unit/plugins/ai） |
 | `integration` | 実 PostgreSQL + 実 ClickHouse サービス上で `bin/test integration`（`TEST_DATABASE_URL` + `TEST_CLICKHOUSE_*`。ClickHouse 到達の事前確認あり） |
 | `zeitwerk` | `bin/rails zeitwerk:check` |
-| `ops` | `docker compose config`、worker target 解決（既定 ai・offline app・muse override）、`ruby bin/check-compose`、`app`/`ai` ビルド、`app` の CLI 不在確認（claude/codex/muse）、pinned CLI の `--version` 確認（claude/codex/git）+ シークレット無し `muse` 不在の確認 |
+| `ops` | `docker compose config`、worker target 解決（既定 ai・offline app）、`ruby bin/check-compose`、`app`/`ai` ビルド、`app` の CLI 不在確認（claude/codex/muse）、pinned CLI の `--version` 確認（claude/codex/muse/git） |
 | `clickhouse-smoke` | 実 ClickHouse サービス + `./bin/setup-clickhouse` の機構確認（使い捨てスキーマ。出荷 `event_log` スキーマ自体は integration が出荷 SQL から再構築して検証） |
 
 CI は live provider・実アカウント・資格情報を一切使わない。サブスクリ
 プションのログインは検証しない（運営者作業であり、CI では不可）。
-AI イメージのビルドもログインなし（`muse` はシークレット無しで不在
-となり、provider 実行時失敗の契約どおり）。
+AI イメージのビルドもログインなし（3 CLI は公開配布から取得。未認証
+provider は選択可・実行時失敗の契約どおり）。
 
 ## 10. 検証
 
@@ -516,7 +496,7 @@ AI イメージのビルドもログインなし（`muse` はシークレット�
 
 - `docker compose config`、`ruby bin/check-compose` が通る。
   通常設定は web=app・control=ai・execution=ai と解決され、
-  app 明示切替と muse override 設定も有効。
+  app 明示切替も有効。
 - `docker compose up --build` 後、`./bin/smoke` が全件 ok
   （web `/up`、PostgreSQL、両 worker 起動、`DATABASE_URL` 一致、両
   supervisor の共有 DB 登録、6 件の recurring 登録、
@@ -526,8 +506,8 @@ AI イメージのビルドもログインなし（`muse` はシークレット�
   いずれかの suite で実行され、沈黙 skip なし）。
 - `docker build .`（既定 `app`）と `docker build --target ai .` が成功し、
   `app` には `claude` / `codex` / `muse` が無く（`command -v` 不在）、
-  `ai` では `claude --version` / `codex --version` / `git --version` が
-  Linux 上で動く（`muse` はシークレット無しでは不在）。
+  `ai` では `claude --version` / `codex --version` /
+  `muse --version` / `git --version` が Linux 上で動く。
 - 管理画面が Basic 認証で 200、未認証で 401 を返す
   （`/admin`・`/admin/event_logs`・`/admin/plugins`・
   `/admin/layer_policies`）。
@@ -547,7 +527,6 @@ AI イメージのビルドもログインなし（`muse` はシークレット�
 - Railway への実デプロイ・実ドメイン公開。
 - ngrok の実公開・外部 Webhook 受信。
 - 各 CLI のサブスクリプションログイン・トークン更新。
-  （`muse` Linux バイナリの入手を含む）
 - 実 GitHub / Jira / Teams への投稿・取得。
 
 ## 11. トラブルシュート
