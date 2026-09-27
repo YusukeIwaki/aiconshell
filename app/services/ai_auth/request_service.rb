@@ -13,7 +13,9 @@ module AiAuth
     LOGIN_TIMEOUT_SECONDS = 900
     STATUS_TIMEOUT_SECONDS = 120
     STALE_HEARTBEAT_AFTER_SECONDS = 300
-    MAX_CODE_CHARS = 4096
+    # Runtime contract: auth codes are bounded by bytes, not characters.
+    MAX_CODE_BYTES = 4096
+    MAX_CODE_CHARS = MAX_CODE_BYTES
 
     PROVIDERS = %w[claude codex muse].freeze
     WORKER_ROLES = %w[control execution].freeze
@@ -44,7 +46,7 @@ module AiAuth
       # text including any "#state" fragment is preserved for the worker.
       text = code.strip
       raise InvalidRequest, "認証コードを入力してください。" if text.empty?
-      raise InvalidRequest, "認証コードが長すぎます。" if text.length > MAX_CODE_CHARS
+      raise InvalidRequest, "認証コードが長すぎます。" if text.bytesize > MAX_CODE_BYTES
       if text.match?(/[\x00-\x1F\x7F]/)
         raise InvalidRequest, "認証コードは1行で入力してください。改行や制御文字は使えません。"
       end

@@ -2,13 +2,33 @@
 <% if @has_active %>
   <% content_for :head do %>
     <script>
-      // Poll without destroying typed codes: skip reload while any auth
-      // code input is present, rescheduling until the form disappears
-      // (submitted, cancelled, or finished).
+      // Poll without destroying typed codes: defer reload only while an
+      // auth code input has a value or holds focus. Empty unfocused inputs
+      // still auto-reload so deadlines and other providers stay fresh.
+      // After submit the page navigates (and the flag releases the defer),
+      // so polling resumes; a manual "更新する" link is always available.
       (function () {
+        var submitted = false;
+        document.addEventListener("submit", function (e) {
+          if (e.target && e.target.querySelector &&
+              e.target.querySelector('input[name="auth_code"]')) {
+            submitted = true;
+          }
+        });
+        function shouldDefer() {
+          if (submitted) { return false; }
+          var inputs = document.querySelectorAll('input[name="auth_code"]');
+          for (var i = 0; i < inputs.length; i++) {
+            var el = inputs[i];
+            if ((el.value && el.value.length > 0) || document.activeElement === el) {
+              return true;
+            }
+          }
+          return false;
+        }
         function schedule() {
           setTimeout(function () {
-            if (document.querySelector('input[name="auth_code"]')) {
+            if (shouldDefer()) {
               schedule();
             } else {
               location.reload();
@@ -42,7 +62,7 @@
 
 <% if @has_active %>
   <div class="admin-card">
-    <p style="margin:0">進行中の操作があります。このページは5秒ごとに自動更新されます（コード入力中は入力を保護するため自動更新を停止します）。手動で確認する場合は <%= link_to "更新する", admin_ai_connections_path %> を押してください。</p>
+    <p style="margin:0">進行中の操作があります。このページは5秒ごとに自動更新されます（コードの入力中・入力済みは入力を保護するため自動更新を延期します。未入力のままなら自動更新されます）。手動で確認する場合は <%= link_to "更新する", admin_ai_connections_path %> を押してください。</p>
   </div>
 <% end %>
 
@@ -96,7 +116,7 @@
             <% if session.input_submitted_at.present? %>
               <p>認証コードは受付済みです。workerが処理を続けています。結果が出るまでお待ちください。</p>
             <% else %>
-              <p>認証ページで表示されたコードを入力してください。入力中は暗号化して一時保存され、workerへ一度だけ渡した後に削除されます。</p>
+              <p>認証ページで表示されたコードを入力してください。送信されたコードは暗号化して一時保存され、workerへ一度だけ渡した後に削除されます。</p>
               <% if row[:provider] == "claude" %>
                 <p>Claudeの認証コードは authorizationCode#state 全体を1行で入力してください。#以降を取り除かないでください。</p>
               <% end %>

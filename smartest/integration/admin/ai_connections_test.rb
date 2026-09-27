@@ -39,12 +39,33 @@ test("ai connections index lists all six provider and role pairs in Japanese") d
   end
 end
 
-test("index carries no-store cache and no-referrer policy") do |http:|
+test("index with no history renders without nil errors") do |http:|
+  AdminTestSupport.as_admin(http) do
+    expect(AiAuthSession.count).to eq(0)
+    expect(AiConnection.count).to eq(0)
+
+    http.get "/admin/ai_connections"
+
+    # Regression: nil sessions/snapshots must not raise NoMethodError on
+    # `active?`; every pair renders its start/check actions instead.
+    expect(http.last_response.status).to eq(200)
+    body = http.last_response.body
+    expect(body.include?("連携開始")).to eq(true)
+    expect(body.include?("状態確認")).to eq(true)
+    expect(body.include?("未確認")).to eq(true)
+  end
+end
+
+test("index carries no-store cache and same-origin referrer policy") do |http:|
   AdminTestSupport.as_admin(http) do
     http.get "/admin/ai_connections"
 
     expect(http.last_response.headers["Cache-Control"]).to eq("no-store")
-    expect(http.last_response.headers["Referrer-Policy"]).to eq("no-referrer")
+    # same-origin (not no-referrer): IAB browsers send `Origin: null` under
+    # no-referrer and Rails rejects POSTs with InvalidAuthenticityToken.
+    # CSRF origin checks stay enabled; external auth links keep
+    # rel=noopener noreferrer in the view (covered below).
+    expect(http.last_response.headers["Referrer-Policy"]).to eq("same-origin")
   end
 end
 
@@ -66,10 +87,19 @@ test("login start creates one session and one role job, double submit reuses it"
     http.get "/admin/ai_connections"
     body = http.last_response.body
     expect(body.include?("待機中") || body.include?("処理中") || body.include?("入力待ち")).to eq(true)
-    # JS polling without meta refresh (input-safe).
+    # JS polling without meta refresh (input-safe): reload is deferred only
+    # while a code input has a value or focus; empty/unfocused still reloads
+    # so deadlines and other providers stay fresh. Submit resumes polling
+    # and a manual link is always available.
     expect(body.include?('http-equiv="refresh"')).to eq(false)
     expect(body.include?("location.reload")).to eq(true)
     expect(body.include?('input[name="auth_code"]')).to eq(true)
+    expect(body.include?("activeElement")).to eq(true)
+    expect(body.include?("el.value")).to eq(true)
+    expect(body.include?("submitted")).to eq(true)
+    expect(body.include?("更新する")).to eq(true)
+    expect(body.include?("入力中・入力済みは入力を保護するため自動更新を延期")).to eq(true)
+    expect(body.include?("未入力のままなら自動更新")).to eq(true)
   end
 end
 
@@ -135,8 +165,14 @@ test("code input renders once, keeps #state, then shows received") do |http:|
     expect(body.include?("Claude公式認証画面を開く")).to eq(true)
     expect(body.include?("#state")).to eq(true)
     expect(body.include?("#以降を取り除かない")).to eq(true)
-    expect(body.include?("暗号化して一時保存")).to eq(true)
+    # Submitted (not typing) codes are encrypted at rest; no pre-submit autosave.
+    expect(body.include?("送信されたコードは暗号化して一時保存")).to eq(true)
+    expect(body.include?("入力中は暗号化")).to eq(false)
     expect(body.include?("保存されません")).to eq(false)
+    # Footer states the accurate long-term secret policy (temporary
+    # challenges are shown; long-term tokens/API keys never are).
+    expect(body.include?("長期トークン・APIキーは表示しません")).to eq(true)
+    expect(body.include?("認証内容）は表示しません")).to eq(false)
 
     http.post "/admin/ai_connections/#{needing.uuid}/code", { auth_code: "  input-secret-7#state-9 " }
     expect(http.last_response.status).to eq(302)

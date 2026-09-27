@@ -228,7 +228,7 @@ module AiAuth
     end
 
     def settle(session_id, claim_token, status:, result_state:, result_error:, snapshot:)
-      now_time = now
+      now_time = nil
       session = nil
       effective_status = status
       effective_state = result_state
@@ -243,10 +243,11 @@ module AiAuth
           return Result.new(ok: false, code: :duplicate_delivery)
         end
 
-        # Re-verify ownership window just before the final write: a cancel
-        # or deadline that landed while the runtime was producing its
-        # outcome must win over a stale "connected". Secrets are cleared
+        # Re-evaluate the clock AFTER the row lock is held: time spent
+        # waiting for the lock can push the session past its deadline, and
+        # that expiry must win over a stale "connected". Secrets are cleared
         # and no snapshot is written for these terminals.
+        now_time = now
         if row.expired_due?(now_time)
           effective_status = "expired"
           effective_state = "expired"
@@ -288,27 +289,34 @@ module AiAuth
     # last_session_id fencing keeps the newest terminal result authoritative
     # even when an old snapshot write lands after a newer one.
     def update_snapshot(session, state, error_code, now_time)
+      sanitized = error_code ? ErrorCodes.sanitize(error_code) : nil
       AiConnection.transaction do
+        # First insert with ON CONFLICT DO NOTHING. insert_all skips
+        # validations, so a concurrent first insert cannot surface as
+        # RecordInvalid from the uniqueness validator inside a savepoint;
+        # the loser simply inserts zero rows and falls through to the
+        # locked find + fencing below.
+        AiConnection.insert_all(
+          [{
+            provider: session.provider,
+            worker_role: session.worker_role,
+            state: state,
+            error_code: sanitized,
+            checked_at: now_time,
+            last_session_uuid: session.uuid,
+            last_session_id: session.id,
+            created_at: now_time,
+            updated_at: now_time
+          }],
+          unique_by: :index_ai_connections_on_provider_and_role
+        )
         snapshot = AiConnection.lock.find_by(provider: session.provider, worker_role: session.worker_role)
-        if snapshot.nil?
-          begin
-            AiConnection.transaction(requires_new: true) do
-              snapshot = AiConnection.create!(
-                provider: session.provider, worker_role: session.worker_role,
-                state: state, error_code: error_code ? ErrorCodes.sanitize(error_code) : nil,
-                checked_at: now_time, last_session_uuid: session.uuid, last_session_id: session.id
-              )
-            end
-          rescue ActiveRecord::RecordNotUnique
-            snapshot = AiConnection.lock.find_by(provider: session.provider, worker_role: session.worker_role)
-          end
-        end
         return if snapshot.nil?
         return if snapshot.last_session_id && snapshot.last_session_id > session.id
 
         snapshot.update!(
           state: state,
-          error_code: error_code ? ErrorCodes.sanitize(error_code) : nil,
+          error_code: sanitized,
           checked_at: now_time,
           last_session_uuid: session.uuid,
           last_session_id: session.id

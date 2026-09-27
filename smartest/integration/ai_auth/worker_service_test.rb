@@ -384,6 +384,49 @@ test("settle converts stale connected to expired when deadline lands just before
   end
 end
 
+test("settle re-evaluates now after the row lock, so lock-wait expiry wins") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_login(provider: "claude", role: "control")
+    token = SecureRandom.uuid
+    base = Time.current
+    session.update_columns(status: "running", claim_token: token,
+                           claimed_at: base, heartbeat_at: base,
+                           expires_at: base + 10, updated_at: base)
+    fake_clock = Class.new do
+      attr_accessor :now_time
+      def current = now_time
+      def now = now_time
+    end.new
+    fake_clock.now_time = base
+
+    service = AiAuth::WorkerService.new(runner: AiAuthTestSupport::FakeAuthRunner.immediate,
+                                        event_sink: WorkflowFakes::FakeEventSink.new,
+                                        clock: fake_clock)
+    # Simulate the deadline passing while waiting for the row lock: advance
+    # the clock when the lock is acquired. Post-lock evaluation must see
+    # expiry; a pre-lock timestamp would have seen `base` and saved connected.
+    original_lock = AiAuthSession.method(:lock)
+    AiAuthSession.define_singleton_method(:lock) do |*args, **kwargs, &blk|
+      fake_clock.now_time = base + 11
+      original_lock.call(*args, **kwargs, &blk)
+    end
+    begin
+      result = service.send(:settle, session.id, token,
+                            status: "succeeded", result_state: "connected",
+                            result_error: nil, snapshot: true)
+    ensure
+      AiAuthSession.define_singleton_method(:lock, original_lock)
+    end
+
+    expect(result.code).to eq(:expired)
+    reloaded = session.reload
+    expect(reloaded.status).to eq("expired")
+    expect(reloaded.encrypted_challenge).to eq(nil)
+    expect(AiConnection.find_by(provider: "claude", worker_role: "control")).to eq(nil)
+  end
+end
+
 test("unknown error codes collapse to provider_error and never persist raw text") do |db:|
   expect(db.transaction_open?).to eq(true)
   with_worker_role("control") do
@@ -460,6 +503,75 @@ test("snapshot fencing refuses an old write after a newer result") do |db:|
     after = AiConnection.find_by(provider: "codex", worker_role: "control")
     expect(after.state).to eq("failed")
     expect(after.last_session_id).to eq(second.id)
+  end
+end
+
+test("concurrent first inserts from separate connections do not raise and fence by session") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  provider = "muse"
+  role = "execution"
+  # Threads commit outside the test transaction, so clean committed rows via
+  # a separate connection before and after (the test transaction only holds
+  # AiAuthSession rows, which threads never query).
+  cleanup = lambda do
+    cleaner = Thread.new do
+      ActiveRecord::Base.connection_pool.with_connection do
+        AiConnection.where(provider: provider, worker_role: role).delete_all
+      end
+    end
+    cleaner.join
+  end
+  cleanup.call
+  begin
+    first = AiAuthSession.create!(uuid: SecureRandom.uuid, provider: provider, worker_role: role,
+                                 operation: "status_check", status: "succeeded",
+                                 expires_at: 10.minutes.from_now, finished_at: Time.current)
+    second = AiAuthSession.create!(uuid: SecureRandom.uuid, provider: provider, worker_role: role,
+                                  operation: "status_check", status: "succeeded",
+                                  expires_at: 10.minutes.from_now, finished_at: Time.current)
+    expect(second.id > first.id).to eq(true)
+
+    errors = Queue.new
+    ready = Queue.new
+    start = Queue.new
+    workers = [
+      [[first.id, first.uuid], "connected", nil],
+      [[second.id, second.uuid], "failed", "provider_error"]
+    ].map do |(attrs, state, err)|
+      Thread.new do
+        begin
+          # Each thread checks out its own real DB connection from the pool.
+          ActiveRecord::Base.connection_pool.with_connection do
+            # Threads use only in-memory fencing keys; the session rows live
+            # in the uncommitted test transaction and are never queried here.
+            fake = AiAuthSession.new(provider: provider, worker_role: role,
+                                     uuid: attrs[1], id: attrs[0])
+            ready << true
+            start.pop
+            service = AiAuth::WorkerService.new(
+              runner: AiAuthTestSupport::FakeAuthRunner.immediate,
+              event_sink: WorkflowFakes::FakeEventSink.new)
+            service.send(:update_snapshot, fake, state, err, Time.current)
+          end
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          errors << e
+        end
+      end
+    end
+    2.times { ready.pop }
+    2.times { start << true }
+    workers.each(&:join)
+    raise errors.pop unless errors.empty?
+
+    # One row; the newer session wins regardless of write order (fencing).
+    # The main connection (READ COMMITTED) sees the threads' committed rows.
+    rows = AiConnection.where(provider: provider, worker_role: role).to_a
+    expect(rows.size).to eq(1)
+    expect(rows.first.last_session_id).to eq(second.id)
+    expect(rows.first.state).to eq("failed")
+    expect(rows.first.error_code).to eq("provider_error")
+  ensure
+    cleanup.call
   end
 end
 

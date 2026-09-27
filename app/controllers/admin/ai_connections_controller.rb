@@ -68,7 +68,10 @@ module Admin
 
     def set_private_headers
       response.headers["Cache-Control"] = "no-store"
-      response.headers["Referrer-Policy"] = "no-referrer"
+      # same-origin keeps CSRF Origin/Referer checks working in IAB browsers
+      # (no-referrer sends `Origin: null` and breaks POSTs). External auth
+      # links still use rel=noopener noreferrer in the view.
+      response.headers["Referrer-Policy"] = "same-origin"
     end
 
     def start_notice(session)

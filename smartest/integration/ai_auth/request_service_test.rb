@@ -293,6 +293,58 @@ test("code submit rejects double POST after receipt") do |db:|
   expect(AiAuth::SecretBox.default.decrypt(session.reload.encrypted_input_code)).to eq("first-code-1")
 end
 
+test("code submit enforces 4096 bytes, not characters") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  service = request_service
+
+  make_waiting = lambda do |provider, role|
+    session = service.request_login(provider: provider, worker_role: role)
+    session.update_columns(
+      status: "waiting",
+      encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+        { "verification_uri" => "https://example.invalid/auth", "user_code" => nil, "input_required" => true }
+      ),
+      challenge_updated_at: Time.current,
+      updated_at: Time.current
+    )
+    session
+  end
+
+  # 4096 ASCII bytes is accepted (boundary).
+  ok_ascii = make_waiting.call("claude", "control")
+  service.submit_code(session_uuid: ok_ascii.uuid, code: "a" * 4096)
+  expect(AiAuth::SecretBox.default.decrypt(ok_ascii.reload.encrypted_input_code).bytesize).to eq(4096)
+
+  # 4097 ASCII bytes is rejected.
+  over_ascii = make_waiting.call("codex", "control")
+  begin
+    service.submit_code(session_uuid: over_ascii.uuid, code: "b" * 4097)
+    raise "expected InvalidRequest"
+  rescue AiAuth::RequestService::InvalidRequest => e
+    expect(e.message.include?("長すぎ")).to eq(true)
+  end
+  expect(over_ascii.reload.input_code_present?).to eq(false)
+
+  # 2000 multibyte chars (6000 bytes) exceed bytes though under 4096 chars.
+  over_multi = make_waiting.call("muse", "control")
+  multi_over = "あ" * 2000
+  expect(multi_over.length).to eq(2000)
+  expect(multi_over.bytesize > 4096).to eq(true)
+  begin
+    service.submit_code(session_uuid: over_multi.uuid, code: multi_over)
+    raise "expected InvalidRequest"
+  rescue AiAuth::RequestService::InvalidRequest => e
+    expect(e.message.include?("長すぎ")).to eq(true)
+  end
+  expect(over_multi.reload.input_code_present?).to eq(false)
+
+  # 1365 multibyte chars (4095 bytes) fit within bytes and keep #state/trim.
+  ok_multi = make_waiting.call("claude", "execution")
+  multi_ok = "  #{'あ' * 100}#state-keep  "
+  service.submit_code(session_uuid: ok_multi.uuid, code: multi_ok)
+  expect(AiAuth::SecretBox.default.decrypt(ok_multi.reload.encrypted_input_code)).to eq("#{'あ' * 100}#state-keep")
+end
+
 test("code submit is rejected after cancel is requested") do |db:|
   expect(db.transaction_open?).to eq(true)
   service = request_service
