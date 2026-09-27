@@ -238,7 +238,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: ${CONTROL_TARGET:-app}
+      target: ${CONTROL_TARGET:-ai}
     restart: unless-stopped
     depends_on:
       migrate:
@@ -264,7 +264,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: ${EXECUTION_TARGET:-app}
+      target: ${EXECUTION_TARGET:-ai}
     restart: unless-stopped
     depends_on:
       migrate:
