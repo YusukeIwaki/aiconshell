@@ -1,5 +1,14 @@
 # Working agreements
 
+## Coordination and implementation
+
+For new work without an assigned implementation lane, use [the coordinating workflow](docs/issue-development.md):
+create or refine the Issue, prepare an isolated issue branch/worktree, and prefer Muse Code
+(`muse-spark-1.3-contributor`, `xhigh`) for implementation and verification.
+Give it the Issue URL as the task entrypoint. Review independently before the authorized
+main merge/push/closure. Do not create PRs. Work already assigned to an issue worktree
+stays in that implementation lane; do not delegate it again just to satisfy this default.
+
 ## Start an implementation
 
 When assigned a GitHub Issue, read it with `gh issue view NUMBER --json number,title,body,comments`.

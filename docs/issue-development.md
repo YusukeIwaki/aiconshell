@@ -6,8 +6,13 @@ Issue URLだけを新しい実装セッションに渡せるよう、恒久的�
 Issueには今回の変更理由、観測できる期待動作、対象外、依存Issueを記す。
 [Issueテンプレート](../.github/ISSUE_TEMPLATE/implementation.md) を使える。
 実装方針を逐一Issueへ複製する必要はない。
+この手順をIssueだけで引き継いだ [Muse実装試行の記録](issue-workflow-verification.md) も参照できる。
 
 ## 準備する人（コーディネーター）
+
+実装と動作確認は原則Muse Codeに委譲し、コーディネーターが独立して検収する。
+実装用worktreeを指定されたセッションは実装担当であり、再委譲は不要。
+Museが使えないなどの制約があれば、その制約を報告し、同じIssueの範囲で引き継ぐ。
 
 1. `gh issue list` で重複を確認し、1つの変更を1 Issueにする。
    独立する変更は別Issueにし、依存するものは必要なbase commit/Issueを明示する。
