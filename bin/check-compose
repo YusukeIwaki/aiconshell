@@ -126,12 +126,9 @@ check(failures, "unified worker holds integration/ClickHouse/polling settings in
   %w[CLICKHOUSE_URL CLICKHOUSE_DATABASE CLICKHOUSE_USER CLICKHOUSE_PASSWORD].each do |var|
     assert(env.key?(var), "execution is missing #{var} (EventLog delivery needs it)")
   end
-  # The AI lane never inherits these into CLI subprocesses
-  # (lib/aiconshell/ai/child_env.rb builds the child env from scratch).
-  child_env = File.read(File.join(ROOT, "lib/aiconshell/ai/child_env.rb"))
-  assert(child_env.include?("unsetenv_others") || child_env.include?("constructed from scratch") ||
-    child_env.include?("never inherited"),
-    "child_env.rb must document that parent credentials never reach AI children")
+  # AI subprocess isolation is verified by the behavior tests in
+  # smartest/ai/child_env_test.rb and process_runner_test.rb (bin/test unit).
+  # This static check only verifies the Rails parent's Compose variables.
 end
 
 check(failures, "web has credentials but no polling-only vars; migrate has neither") do
@@ -273,12 +270,13 @@ check(failures, "worker carries the execution role, web/migrate carry none") do
   job_file = File.join(ROOT, "app/jobs/ai_auth_job.rb")
   assert(File.file?(job_file), "missing app/jobs/ai_auth_job.rb for the auth queue")
   job_source = File.read(job_file)
-  # The declared default belongs to #20 (ai_auth_execution once integrated);
-  # pre-integration trees still declare ai_auth_control. Either is accepted
-  # here because RequestService routes explicitly per role; the unified
-  # worker only consumes ai_auth_execution.
-  assert(job_source.match?(/queue_as :ai_auth_(control|execution)/),
-    "AiAuthJob must declare an ai_auth role queue (default unification is #20's scope)")
+  # Final contract (default unification is #20's scope; this file is not
+  # edited here): AiAuthJob must default to ai_auth_execution. A
+  # pre-integration tree still declaring ai_auth_control fails this check;
+  # report that failure as the known #20 dependency instead of accepting
+  # the old queue.
+  assert(job_source.match?(/queue_as :ai_auth_execution/),
+    "AiAuthJob must declare queue_as :ai_auth_execution (final contract; pre-#20 trees fail here as a known dependency)")
   request_source = File.read(File.join(ROOT, "app/services/ai_auth/request_service.rb"))
   assert(request_source.include?("ai_auth_"), "RequestService must reserve the ai_auth role queue")
 end

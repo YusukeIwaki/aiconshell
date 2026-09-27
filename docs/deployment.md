@@ -59,14 +59,25 @@ PostgreSQL / ClickHouse）を使うための手順書。全体設計は
   増やす場合は `config/queue_execution.yml` の `execution` pool の
   `threads` を上げて `docker compose up --build`（Railway は再デプロイ）
   する。減らす場合も同じ箇所だけを変える。
-- DB 接続の目安: `config/database.yml` の `pool` は
-  `RAILS_MAX_THREADS`（既定5）に従う。worker 内の同時 DB 使用は
-  control 3 + execution N + auth 1 + dispatcher/scheduler 分が上限と
-  なるため、`execution` の threads を上げる場合は `RAILS_MAX_THREADS`
-  も同じ worker に十分な値で揃え、PostgreSQL の `max_connections`
-  （共有サーバーでは他利用環境の分も合算）を超えないことを確認する。
-  `JOB_CONCURRENCY`（worker プロセス数）は接続数を倍加させるため、
-  通常は `1` のまま threads だけを調整する。
+- DB 接続の考え方は fork / async で分ける（Solid Queue 1.7）。
+  `config/database.yml` の `pool` は `RAILS_MAX_THREADS` に従うが、
+  その適用範囲がモードで異なる。
+  - fork（compose / Railway の Linux 既定）: 各 pool は別プロセスで動き、
+    `RAILS_MAX_THREADS` はプロセスごとの pool サイズになる。既定 5 は
+    各プロセス（control 3 threads / execution 1 / auth 1 /
+    dispatcher 系）に十分である。
+  - async（macOS ローカルの `bin/jobs --mode=async`）: 全 pool・
+    dispatcher・heartbeat・scheduler が同じプロセス・同じ connection
+    pool を使う。同時 DB 使用の上限は control 3 + execution N +
+    auth 1 + dispatcher/scheduler 分の合計になるため、既定 5 では足りない。
+    async 起動例には合計に余裕を持つ `RAILS_MAX_THREADS=15` を付ける
+    （README「開発ループ」の起動例どおり）。
+- `execution` pool の `threads` を上げる場合は、使うモードに合わせて
+  `RAILS_MAX_THREADS` も同じ worker に十分な値で揃え、PostgreSQL の
+  `max_connections`（共有サーバーでは他利用環境の分も合算）を超えない
+  ことを確認する。`JOB_CONCURRENCY`（worker プロセス数）は fork 時に
+  プロセス数ぶん接続数を倍加させるため、通常は `1` のまま threads だけを
+  調整する。
 
 ## 2. 定期実行
 
@@ -466,17 +477,23 @@ DB 初期化用コンテナと一時的な operator 資格情報は作業後に�
 本番インフラ変更は検収者が行う。実装者は検証に使う自分の Compose
 project/volume だけを操作する。切替は次の順序で行う:
 
-1. 旧 control worker を停止する（新旧の scheduler が二重に recurring を
-   登録しないように先に止める）。停止前に control queue の滞留と
-   `ai_auth_control` の進行中セッションを確認し、進行中の認証は終わるか
-   キャンセルしてから止める。
-2. 既存 execution の設定と連携 env を準備する: Start Command を
-   `./bin/jobs --config-file=config/queue_execution.yml`（`--skip-recurring`
-   なし）にし、`DATABASE_URL`・ワークフロー設定・`EVENT_LOG_TEAMS_CHANNEL`・
-   ClickHouse・連携資格情報・自アクタ ID・AI auth・
-   `AICONSHELL_WORKER_ROLE=execution`・`RUNTIME_TARGET=ai` を揃える。
-   `/data` volume（`/data/auth/*`・`/data/workspaces`）は既存のまま継続使用
-   する。旧 control の volume は消さず、認証 cache をコピーしない。
+1. 旧 control の GitHub 自動デプロイを解除してから、旧 control worker を
+   停止する（新旧の scheduler が二重に recurring を登録しないように先に
+   止める。自動デプロイを残すと main push 後に廃止済み config で再起動する）。
+   停止前に control queue の滞留と `ai_auth_control` の進行中セッションを
+   確認し、進行中の認証は終わるかキャンセルしてから止める。
+2. 既存 execution の設定と連携 env を準備する。本番調査では各 Railway
+   サービスが dashboard の explicit startCommand を使い、config-as-code
+   file は未指定だったため、repository の TOML 変更だけでは反映されない
+   （§7 冒頭の表と優先順位どおり）。dashboard の実際の設定を確認し、
+   execution の dashboard startCommand を
+   `./bin/jobs --config-file=config/queue_execution.yml`（残っている
+   `--skip-recurring` を除去）にしたうえで、`DATABASE_URL`・
+   ワークフロー設定・`EVENT_LOG_TEAMS_CHANNEL`・ClickHouse・連携資格情報・
+   自アクタ ID・AI auth・`AICONSHELL_WORKER_ROLE=execution`・
+   `RUNTIME_TARGET=ai` を揃える。`/data` volume
+   （`/data/auth/*`・`/data/workspaces`）は既存のまま継続使用する。
+   旧 control の volume は消さず、認証 cache をコピーしない。
 3. execution をデプロイする。単一ワーカーが control / execution /
    `ai_auth_execution` の 3 pool と scheduler を起動することを
    deployment details で確認する。
@@ -488,11 +505,15 @@ project/volume だけを操作する。切替は次の順序で行う:
    `/railway.control.toml` 参照の除去）。旧 control の volume は検証完了まで
    残し、不要確定後に運営者が削除する。
 
-rollback: 切替検証で異常があれば execution を旧 Start Command
-（`--skip-recurring` 付き）に戻すか、旧 control を再起動して scheduler を
-戻す。旧 control の volume と認証は残してあるため、再ログインは不要である。
-新 execution デプロイで DB migration は走らない（pre-deploy は web のみ）
-ため、schema の巻き戻しは発生しない。
+rollback: 切替検証で異常があれば、まず単一 execution worker を停止する
+（scheduler の二重起動を避ける）。そのうえで両 worker（必要なら web も）を
+変更前のリリース/イメージ・起動設定へ戻して再デプロイする。旧 start
+command（`--skip-recurring` 付き）に戻すだけでは成立しない。新コードには
+`config/queue_control.yml` がなく、execution は引き続き control queue を
+消費するため、execution を戻さず旧 control を再起動するだけでは二重消費・
+scheduler 二重起動になる。旧 control の volume と認証は残してあるため、
+再ログインは不要である。新 execution デプロイで DB migration は走らない
+（pre-deploy は web のみ）ため、schema の巻き戻しは発生しない。
 
 ## 8. ngrok（明示 opt-in）
 
@@ -608,8 +629,9 @@ execution 枠の占有中も control 処理が進むことは、実 provider・�
 3. `execution` queue に長時間 job を積んで単一 execution thread を占有させ、
    その間に `control` queue の job が完了することと、2 件目の `execution`
    job が待機することを確認する。リポジトリに job クラスを追加せず行う
-   場合は、一時 PG 上の `bin/jobs --mode=async` 検証プロセスと /tmp の
-   probe 定義を使う（本番・共有 DB では行わない）。
+   場合は、一時 PG 上の
+   `AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async`
+   検証プロセスと /tmp の probe 定義を使う（本番・共有 DB では行わない）。
 
 ### 10.2 運営者アカウントが必要な範囲（自動検証しない）
 

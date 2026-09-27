@@ -299,6 +299,6 @@ volumes:
   execution_codex_auth:
   execution_muse_auth:
   # AI execution workspaces (AICONSHELL_EXECUTION_ROOT=/workspaces).
-  # Persisted and writable by uid 1000 so control/execution can create
-  # per-run directories outside the application source.
+  # Persisted and writable by uid 1000 so the unified worker's pools can
+  # create per-run directories outside the application source.
   ai_workspaces:

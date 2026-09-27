@@ -38,7 +38,7 @@ docker compose up --build
 cp .env.example .env   # 初回のみ。DB / ClickHouse の URL をホスト側のポートへ変更
 bin/setup --skip-server  # bundle + development/test 両 DB の db:prepare
 bin/dev                  # web（Puma, port 3000）
-bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記注意）
+AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記注意）
 ```
 
 - ホスト上で AI を実行する場合は `AICONSHELL_EXECUTION_ROOT` をリポジトリ外の
@@ -49,6 +49,14 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 - `bin/jobs` の既定 fork モードは Linux Docker 用。macOS の fork worker
   は不安定（pg ネイティブ拡張 + ObjC ランタイムの fork 安全性）のため、
   macOS ローカルでは必ず `--mode=async` を付ける。
+- worker コマンドにだけ `AICONSHELL_WORKER_ROLE=execution` を明示する。
+  web（`bin/dev`）には role を与えない。`.env.example` の既定は空のままで、
+  新しい共有認証操作は role 不一致（`role_mismatch`）で失敗するため、
+  ローカルの auth queue を動かす検証では上記の worker コマンドで role を付ける。
+- async では全 pool・poller・scheduler が同一プロセスの connection pool を
+  共有するため、`RAILS_MAX_THREADS=15` で余裕を持たせる（既定 5 では足りない）。
+  fork / async の違いと DB pool の考え方は
+  [docs/deployment.md](docs/deployment.md)「同時実作業数と DB pool の目安」が正。
 - 単一ワーカーの正規設定（`config/queue_execution.yml` の `--config-file` 指定）は
   compose と Railway で行う（[docs/deployment.md](docs/deployment.md)）。
   ローカルの `bin/jobs`（無引数）は開発用 `config/queue.yml`（同じ 3 pool 分離）での一括起動である。
@@ -65,7 +73,7 @@ bin/jobs --mode=async    # Solid Queue 監視（macOS は async 必須。下記�
 | `AICONSHELL_EXECUTION_ROOT` | AI 作業領域ルート（production 必須） | compose は `/workspaces` volume |
 | `AICONSHELL_ALLOWED_SCOPES` | 取り込み/送信対象の `plugin:scope` 一覧 | 空（何も対象にしない） |
 | `AICONSHELL_LEASE_SECONDS` / `AICONSHELL_AI_TIMEOUT_SECONDS` | 実行 lease / AI 実行上限（lease > timeout + 10 が必須） | `1800` / `600` |
-| `RAILS_MAX_THREADS` | Puma + DB プール | `5` |
+| `RAILS_MAX_THREADS` | Puma + DB プール（async worker は上記のとおり `15` を明示） | `5` |
 | `JOB_CONCURRENCY` | `bin/jobs` の worker プロセス数 | `1` |
 
 ## 自然言語で依頼する
