@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_040002) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -131,6 +131,53 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["layer"], name: "index_layer_policies_on_layer", unique: true
+  end
+
+  create_table "oauth_auth_attempts", force: :cascade do |t|
+    t.string "provider", null: false
+    t.string "state_digest", null: false
+    t.string "browser_session_digest", default: "", null: false
+    t.string "redirect_uri", default: "", null: false
+    t.text "encrypted_code_verifier"
+    t.integer "generation_at_start", default: 0, null: false
+    t.string "status", default: "pending", null: false
+    t.string "error_code"
+    t.datetime "expires_at", null: false
+    t.datetime "consumed_at"
+    t.datetime "finished_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.string "client_id"
+    t.string "cloud_id"
+    t.string "tenant_id"
+    t.text "scopes", default: "", null: false
+    t.index ["expires_at"], name: "index_oauth_auth_attempts_on_expires_at"
+    t.index ["provider", "status"], name: "index_oauth_auth_attempts_on_provider_status"
+    t.index ["state_digest"], name: "index_oauth_auth_attempts_on_state_digest", unique: true
+  end
+
+  create_table "oauth_connections", force: :cascade do |t|
+    t.string "provider", null: false
+    t.integer "generation", default: 0, null: false
+    t.string "state", default: "unknown", null: false
+    t.string "error_code"
+    t.string "external_principal", default: "", null: false
+    t.string "display_name", default: "", null: false
+    t.string "tenant_id"
+    t.string "cloud_id"
+    t.text "granted_scopes", default: "", null: false
+    t.text "encrypted_access_token"
+    t.text "encrypted_refresh_token"
+    t.datetime "token_expires_at"
+    t.string "refresh_lease_token"
+    t.datetime "refresh_lease_expires_at"
+    t.integer "refresh_lease_generation"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.string "client_id"
+    t.index ["provider"], name: "index_oauth_connections_on_provider", unique: true
+    t.index ["refresh_lease_token"], name: "index_oauth_connections_on_refresh_lease", unique: true
+    t.index ["state"], name: "index_oauth_connections_on_state"
   end
 
   create_table "outbound_actions", force: :cascade do |t|

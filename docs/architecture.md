@@ -44,6 +44,8 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 | TaskRun | task、provider/model/effort/instructions snapshot、status、lease token/expiry、result、error、開始/終了時刻 |
 | LayerPolicy | layer（interaction/coordination/execution）、provider（claude/codex/muse）、model、effort、instructions、enabled。layer一意 |
 | OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error、delivery_batch_key。Coordination が作り Interaction が送る |
+| OauthConnection | provider ごとの委任接続1件。世代・外部principal・tenant/cloud・付与scope・状態・期限・安全な分類コード。token は専用 salt の認証付き暗号化のみ。provider 一意 |
+| OauthAuthAttempt | 短 TTL の認証試行。state は SHA256 digest のみ保持しブラウザ session に結合。code 保持なし、PKCE verifier（Microsoft のみ）は暗号化。一回消費、state_digest 一意 |
 | EventDelivery | redacted envelope、event_id、宛先別配信/再試行状態。配信済みの短期 retention |
 
 Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `waiting_delivery`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
@@ -82,6 +84,8 @@ HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検�
 `Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
 
 GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+
+ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。この基盤だけでは旧 default registry へ委任 plugin を登録しない（管理画面・adapter・業務統合は後続 Issue）。
 
 ### 管理依頼の read / result / receipt
 

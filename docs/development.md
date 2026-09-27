@@ -14,6 +14,7 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
 | GitHub / Teams / Jira の操作 | [architecture.md の Plugins](architecture.md#plugins)、[各 plugin README](../plugins/) | `lib/aiconshell/plugins/`、`plugins/`、`smartest/plugins/` |
 | AIの仕事・provider/model/effort・process分離 | [ai-providers.md](ai-providers.md) | `lib/aiconshell/ai/`、`smartest/ai/` |
 | AIポリシーの接続表示・ログイン・状態確認 | [ai-connections.md](ai-connections.md)、CLI変更時は [ai-auth-protocol.md](ai-auth-protocol.md) | `Admin::AiStatus`、`AiAuth::RequestService` / `WorkerService`、`AiConnection` / `AiAuthSession`、`smartest/integration/ai_auth/`、`smartest/integration/admin/` |
+| ユーザー委任OAuthの接続・token管理 | [oauth-connections.md](oauth-connections.md) | `Aiconshell::Oauth::*`、`Oauth::AuthService` / `TokenService` / `CredentialProvider`、`OauthConnection` / `OauthAuthAttempt`、`smartest/unit/oauth/`、`smartest/integration/oauth/` |
 | EventLog・検索・配送 | [event-log.md](event-log.md) | `lib/aiconshell/observability/`、`smartest/{unit,integration}/observability/` |
 | Docker・worker queue・Railway・環境分離 | [deployment.md](deployment.md)、[railway-environments.md](railway-environments.md) | `Dockerfile`、`compose.yml`、`config/queue_execution.yml`・`config/queue.yml`、`railway.execution.toml`、`bin/check-compose` |
 
