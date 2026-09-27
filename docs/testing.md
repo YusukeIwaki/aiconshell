@@ -63,6 +63,8 @@ RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check
 `rbenv exec bash bin/test` ではなく、上記のBundler経由で起動する。
 依存関係の初回確認は `RBENV_VERSION=3.4.9 rbenv exec bundle check`。
 足りなければ同じRubyで `bundle install` する（lockfileは維持）。
+テスト出力を `tail` / `tee` へ渡すなら `set -o pipefail` で終了コードを保持する。
+複数コマンドの最後が成功したことだけで合格にせず、Smartestの失敗・skip件数も確認する。
 
 ## worktree用の一時DB
 
