@@ -5,6 +5,10 @@ AI エンジニア基盤。外部サービス（GitHub / Jira / Teams）のイ�
 設計は [docs/architecture.md](docs/architecture.md)、運用手順は
 [docs/deployment.md](docs/deployment.md)。
 
+機能追加・修正は [Issue開発手順](docs/issue-development.md) と
+[設計資料の入口](docs/development.md) から始める。エージェントへはIssue URLを渡し、
+AGENTS.mdとリポジトリ内skillから前提を読み込ませる。
+
 ## 要件
 
 - Docker（Compose v2）— コンテナ起動用

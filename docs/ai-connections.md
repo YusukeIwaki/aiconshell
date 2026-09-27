@@ -19,6 +19,24 @@
 
 ## worker・queue・volume
 
+### アプリケーション内の入口
+
+Webの運用操作は `AiAuth::RequestService` に渡す。主な公開メソッドは
+`request_login(provider:, worker_role:)`、`request_status(provider:, worker_role:)`、
+`submit_code(session_uuid:, code:)`、`cancel(session_uuid:)`。
+`request_status` は `AiAuthSession` を永続化して role別の `AiAuthJob` を予約し、
+同じ provider/role に進行中の操作があればそのsessionを返す。
+戻り値は受付・進行中の操作であり、接続済みの判定ではない。
+`AiAuth::WorkerService` が実行して `AiConnection` snapshot を更新する。
+これらの操作は業務 `Task` / `TaskRun` や `LayerPolicy` を変更しない。
+
+画面用の `Admin::AiStatus.diagnosis(provider, layer:)` はsnapshotを読む。
+層→role対応は `Admin::AiStatus.worker_role_for(layer)` を使用する。
+`AiConnection` がない/未確認でもprovider選択と状態確認の受付は可能。
+provider/roleは既知値のみ許可し、認証やCSRFを迂回する経路を追加しない。
+
+### 実行プロセス
+
 - worker には `AICONSHELL_WORKER_ROLE=control|execution` を明示する。Web には付けない。auth job は要求 role と一致しない worker では実行せず、安全な分類で失敗する。
 - 専用queue `ai_auth_control` / `ai_auth_execution` を、対応 worker の別1スレッドpoolで処理する。長い認証待ちが通常の control/execution 処理を塞がない。
 - Compose: `config/queue_control.yml` と `config/queue_execution.yml` が2pool構成。`ruby bin/check-compose` が検証する。

@@ -54,9 +54,57 @@ ClickHouse への配送・検索は別の結合テストで検証するため、
 RBENV_VERSION=3.4.9 rbenv exec ruby -v
 RBENV_VERSION=3.4.9 rbenv exec bundle exec smartest smartest/unit
 RBENV_VERSION=3.4.9 RAILS_ENV=test rbenv exec ruby bin/rails db:prepare
-RBENV_VERSION=3.4.9 rbenv exec ruby -e 'exec("bash", "bin/test", "unit")'
+RBENV_VERSION=3.4.9 rbenv exec bundle exec ./bin/test unit
+RBENV_VERSION=3.4.9 rbenv exec bundle exec ./bin/test all
 RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check
 ```
+
+`bin/test` はbashスクリプト。`rbenv exec ruby bin/test` や
+`rbenv exec bash bin/test` ではなく、上記のBundler経由で起動する。
+依存関係の初回確認は `RBENV_VERSION=3.4.9 rbenv exec bundle check`。
+足りなければ同じRubyで `bundle install` する（lockfileは維持）。
+
+## worktree用の一時DB
+
+既存の開発DB・別レーン・productionの接続を流用せず、必要ならDockerでテスト用サービス
+だけを起動する。アプリ本体やAI CLIのコンテナをbuildする必要はない。
+以下はローカル専用の合成パスワードを使う例。tagを担当Issueにし、未使用のportを選ぶ。
+同じDBで並列にintegration suiteを動かさない（fixtureはrollback以外の実commitも使う）。
+
+```sh
+export AICONSHELL_TEST_TAG=aiconshell-issue-N
+export AICONSHELL_TEST_PG_PORT=15439
+export AICONSHELL_TEST_CH_PORT=18129
+docker run --detach --rm --name "${AICONSHELL_TEST_TAG}-pg" \
+  -p "127.0.0.1:${AICONSHELL_TEST_PG_PORT}:5432" \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=aiconshell_test postgres:17.6-bookworm
+docker run --detach --rm --name "${AICONSHELL_TEST_TAG}-ch" \
+  -p "127.0.0.1:${AICONSHELL_TEST_CH_PORT}:8123" \
+  -e CLICKHOUSE_DB=aiconshell_test -e CLICKHOUSE_USER=aiconshell \
+  -e CLICKHOUSE_PASSWORD=aiconshell_ci clickhouse/clickhouse-server:26.8.11.7
+
+export TEST_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:${AICONSHELL_TEST_PG_PORT}/aiconshell_test"
+export TEST_CLICKHOUSE_URL="http://127.0.0.1:${AICONSHELL_TEST_CH_PORT}"
+export TEST_CLICKHOUSE_DATABASE=aiconshell_test
+export TEST_CLICKHOUSE_USER=aiconshell TEST_CLICKHOUSE_PASSWORD=aiconshell_ci
+# standalone EventLog fixtureも同じ専用PGへ向ける
+export TEST_PG_HOST=127.0.0.1 TEST_PG_PORT="$AICONSHELL_TEST_PG_PORT"
+export TEST_PG_DBNAME=aiconshell_test TEST_PG_USER=postgres TEST_PG_PASSWORD=postgres
+export RAILS_ENV=test
+
+docker exec "${AICONSHELL_TEST_TAG}-pg" pg_isready -U postgres -d aiconshell_test
+curl --fail --silent --show-error "$TEST_CLICKHOUSE_URL/ping"
+# 起動直後で未準備なら短く待って上のreadiness確認を再実行する
+RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails db:prepare
+RBENV_VERSION=3.4.9 rbenv exec bundle exec ./bin/test all
+```
+
+Rails wiringの変更はZeitwerkも確認する。対象を絞るときは例えば
+`RBENV_VERSION=3.4.9 RAILS_ENV=test rbenv exec bundle exec smartest smartest/integration/admin`。
+ClickHouseと無関係な対象テストだけならPGのみでよいが、全suiteの完全検証とは報告しない。
+終わったら **自分が作った上記2コンテナだけ** を
+`docker stop "${AICONSHELL_TEST_TAG}-pg" "${AICONSHELL_TEST_TAG}-ch"` で片付ける。
+他レーンのコンテナやvolumeの一括pruneはしない。
 
 ## 境界フィクスチャ
 
