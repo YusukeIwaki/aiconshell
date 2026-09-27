@@ -99,9 +99,14 @@ observed for that revision. Metadata timestamps in the payload do not create
 new work. Other event types retain their original fingerprint deduplication.
 
 Per-plugin/event-ID transaction advisory locks serialize snapshot writes across
-scopes, acquired in sorted order. A batch is processed in timestamp order for
+scopes, acquired in sorted order. Delegated OAuth sources additionally scope
+the lock, watermark lookup, and DB uniqueness by connection
+(`oauth_source_key`: provider plus fixed tenant/cloud plus fetching
+generation, raw provider IDs unchanged); legacy sources keep the global
+plugin/event lock. A batch is processed in timestamp order for
 each source. Snapshots older than the persisted watermark are ignored; equal
-timestamps are first-observed-wins (batch input order breaks ties). Providers
+timestamps are first-observed-wins within one connection scope (batch input
+order breaks ties). Providers
 must supply the edit time as `occurred_at`; timestamps are compared at PostgreSQL
 microsecond precision. Conflicting changes at the same timestamp and changes
 that occur entirely between polls cannot be reconstructed. Existing rows retain
@@ -128,12 +133,19 @@ input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
 `teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
 delegated variant. Typed-read snapshots are reused for the following
 result, fetch-time external-event snapshots (stored on each
-`external_events` row and copied to its `tasks` row at creation,
-first-observed-wins) for the following reply, and enqueue snapshots for
+`external_events` row and copied to its `tasks` row at creation, scoped by
+`oauth_source_key`) for the following reply, and enqueue snapshots for
 delivery; a disconnect/replacement in between stops with `stale_binding` /
 `not_connected` instead of continuing as another principal, and each Task
 is fenced by its own stored binding so same-provider Tasks from different
-generations never mix. Refresh never changes the generation. Cursors are
+generations never mix. Same raw event/resource IDs on different
+clouds/tenants/generations are distinct isolated sources with distinct DB
+rows, watermarks, advisory locks, and Tasks; legacy dedup stays global.
+External-event Tasks never gain typed reads: `admin_origin_required`
+still rejects them before HTTP, and that restriction is kept. A stale
+OAuth reply is fenced before any Task mutation and re-fenced before the
+write, so a rejected reply leaves Task state, dispatch runs, actions, and
+feedback acknowledgements untouched. Refresh never changes the generation. Cursors are
 isolated per connection (`integration_cursors.oauth_binding`): a changed
 connection restarts from no cursor and never reuses another site's cursor.
 Callback/refresh/send races discard stale results instead of reviving or
@@ -152,13 +164,25 @@ resources, clouds, or tenants never suppress), edited content, or a later
 human edit of the app post stays eligible. The receipt lookup is scoped in
 the database (newest first, no row cap) so a confirmed self-post still
 matches past any number of older receipts. While a matching `pending` /
-`sending` / `uncertain` action exists for the same connection and
-destination (send started but receipt not yet stored, or outcome unknown),
-the candidate is held without advancing the cursor so it is neither lost
-nor auto-replied in a loop; Jira holds are per issue (a reply to one issue
-never holds another), and other connections/destinations are unaffected.
+`sending` / `uncertain` action exists, the candidate is held without
+advancing the cursor so it is neither lost
+nor auto-replied in a loop; a mixed batch still ingests unrelated
+candidates (held rows are partitioned per candidate, the pass set
+persists, and the cursor is retained rather than advanced past held
+rows). Not-yet-started intents (`pending`, or `sending` before
+`request_started_at`) hold only the same generation; already-started
+writes (`sending` with `request_started_at`, or `uncertain`) hold across
+generations in the same provider resource space, so an unknown side
+effect survives reconnect until reconciled. Jira holds are per issue (a reply to one issue
+never holds another), Teams holds per channel/chat, and other spaces/destinations are unaffected.
 DB or matcher errors halt ingestion and the cursor advance instead of
 treating the batch as ordinary human events.
+
+The AI coordination prompt maps operator-allowlisted permission scopes to
+write input scopes: legacy `teams` and delegated `teams_oauth` channels
+`team/t/channel/c` map to `channel:t/c`, and `teams_oauth` chats `chat/c`
+map to `chat:c`; Jira project scopes are identical for poll and write.
+Read/poll permission scopes themselves are unchanged.
 
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a

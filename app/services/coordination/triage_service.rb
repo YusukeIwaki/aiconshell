@@ -121,9 +121,15 @@ module Coordination
 
             # Serialize different event rows for one external source. The
             # partial unique index also protects callers outside this path.
-            key = Digest::SHA256.digest("#{event.plugin}\0#{event.resource_id}").unpack1("q>")
+            # OAuth sources isolate by connection scope (`oauth_source_key`);
+            # legacy sources keep the global plugin/resource lock. Same raw
+            # IDs on different connections never share a Task.
+            source_key = event.respond_to?(:oauth_source_key) ? event.oauth_source_key : nil
+            key = Digest::SHA256.digest("#{event.plugin}\0#{source_key}\0#{event.resource_id}").unpack1("q>")
             Task.connection.execute("SELECT pg_advisory_xact_lock(#{key})")
-            task = Task.open_status.lock.find_by(source_plugin: event.plugin, source_resource_id: event.resource_id)
+            task_scope = Task.open_status.lock.where(source_plugin: event.plugin, source_resource_id: event.resource_id)
+            task_scope = task_scope.where(oauth_source_key: source_key) if Task.column_names.include?("oauth_source_key")
+            task = task_scope.first
             if task
               if event.actor_type == "human"
                 TaskFeedback.create!(task: task, body: body_from(event), author: event.actor_id.to_s, author_type: "human")
@@ -135,11 +141,16 @@ module Coordination
               # (never the current connection): a later reply is fenced
               # against the connection that produced the event. An
               # existing open Task keeps the binding it was created with.
+              # Same resource IDs on other connections create their own
+              # Tasks instead of joining this one.
               attrs = { title: title_from(event), description: body_from(event), status: "inbox", priority: 0,
                         source_plugin: event.plugin, source_resource_id: event.resource_id }
               if Task.column_names.include?("oauth_binding") && event.respond_to?(:oauth_binding) &&
                   !event.oauth_binding.nil?
                 attrs[:oauth_binding] = event.oauth_binding
+              end
+              if Task.column_names.include?("oauth_source_key") && event.respond_to?(:oauth_source_key)
+                attrs[:oauth_source_key] = source_key
               end
               task = Task.create!(attrs)
             end
@@ -323,9 +334,8 @@ module Coordination
         end,
         "allowed_targets" => @query_service.allowed_targets.flat_map do |plugin, scopes|
           scopes.map do |scope|
-            teams = plugin == "teams" && %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
             { "plugin" => plugin, "permission_scope" => scope,
-              "input_scope" => teams ? "channel:#{teams[1]}/#{teams[2]}" : scope }
+              "input_scope" => input_scope_for(plugin, scope) }
           end
         end
       }
@@ -354,7 +364,9 @@ module Coordination
         A done or cancelled task with new feedback must first use the existing
         transition to inbox before a later result can be applied.
         Use only supported write schemas and operator-allowed destinations. Teams
-        send_message uses input_scope channel:team/channel, not its permission_scope.
+        send_message uses input_scope channel:team/channel (teams_oauth channel
+        team/t/channel/c maps to channel:t/c, chat/c maps to chat:c), not its
+        permission_scope.
         waiting_delivery is server-owned and cannot be requested or changed by AI.
         Allowed transitions: #{JSON.generate(Task::TRANSITIONS)}
         Return only JSON matching the supplied schema.
@@ -362,6 +374,32 @@ module Coordination
         TASKS: #{JSON.generate(snapshots.map { |entry| entry[:context] })}
         OBSERVATIONS: #{JSON.generate(observations)}
       PROMPT
+    end
+
+    # Maps an operator-allowlisted permission scope to the write input
+    # scope the AI must use. Legacy `teams` channels and delegated
+    # `teams_oauth` channels/chats poll as `team/t/channel/c` or `chat/c`
+    # but send as `channel:t/c` or `chat:c`. Jira project scopes and all
+    # other plugins use the same string for poll and write. Read/poll
+    # permission scopes themselves are unchanged.
+    def input_scope_for(plugin, scope)
+      scope = scope.to_s
+      if plugin.to_s == "teams"
+        match = %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
+        return "channel:#{match[1]}/#{match[2]}" if match
+
+        return scope
+      end
+      if plugin.to_s == "teams_oauth"
+        channel = %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
+        return "channel:#{channel[1]}/#{channel[2]}" if channel
+
+        chat = %r{\Achat/([^/]+)\z}.match(scope)
+        return "chat:#{chat[1]}" if chat
+
+        return scope
+      end
+      scope
     end
 
     def query_keywords(request)
@@ -466,14 +504,24 @@ module Coordination
         next false if task.status == "waiting_delivery" || ruling["status"] == "waiting_delivery"
         next false unless LayerPolicy.where(id: policy.id, enabled: true, updated_at: policy.updated_at).exists?
         next false unless valid_reply?(task, ruling["reply"])
+        # Fence stale OAuth replies before any mutation: a disconnect or
+        # replacement between fetch and reply rejects with no Task change,
+        # no dispatch, and no feedback acknowledgement. `next false` here
+        # commits nothing because nothing changed yet.
+        if ruling["reply"]
+          next false unless oauth_reply_current?(task, oauth_bindings)
+        end
 
         target = ruling.fetch("status", task.status)
         dispatch = ruling["dispatch"] == true
         if %w[done cancelled].include?(task.status)
           next false if entry[:feedback_ids].empty?
           if target == "inbox" && task.source_plugin.present? && task.source_resource_id.present?
-            next false if Task.open_status.where(source_plugin: task.source_plugin, source_resource_id: task.source_resource_id)
-                              .where.not(id: task.id).exists?
+            reopen_scope = Task.open_status.where(source_plugin: task.source_plugin, source_resource_id: task.source_resource_id)
+            if Task.column_names.include?("oauth_source_key") && task.respond_to?(:oauth_source_key)
+              reopen_scope = reopen_scope.where(oauth_source_key: task.oauth_source_key)
+            end
+            next false if reopen_scope.where.not(id: task.id).exists?
           end
         end
         next false if dispatch && %w[waiting_human waiting_review].include?(task.status) && entry[:feedback_ids].empty?
@@ -504,7 +552,10 @@ module Coordination
           raise ActiveRecord::Rollback unless run
         end
         if ruling["reply"]
-          next false unless oauth_reply_current?(task, oauth_bindings)
+          # Re-fence after mutations but before the write: a replacement
+          # that landed while waiting for locks rolls everything back
+          # instead of partially committing Task/dispatch state.
+          raise ActiveRecord::Rollback unless oauth_reply_current?(task, oauth_bindings)
 
           create_reply_action(task, ruling["reply"], entry[:version], oauth_bindings) or raise ActiveRecord::Rollback
         end

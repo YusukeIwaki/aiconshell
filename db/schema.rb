@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_060000) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_070000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -102,7 +102,9 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_060000) do
     t.string "source_fingerprint"
     t.datetime "source_updated_at"
     t.jsonb "oauth_binding"
-    t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_on_plugin_event_fingerprint", unique: true
+    t.string "oauth_source_key"
+    t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_legacy_dedup", unique: true, where: "(oauth_source_key IS NULL)"
+    t.index ["plugin", "oauth_source_key", "event_id", "fingerprint"], name: "index_external_events_oauth_dedup", unique: true, where: "(oauth_source_key IS NOT NULL)"
     t.index ["plugin", "resource_id"], name: "index_external_events_on_plugin_resource"
     t.index ["processed_at"], name: "index_external_events_on_processed_at"
     t.index ["task_id"], name: "index_external_events_on_task_id"
@@ -434,10 +436,12 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_060000) do
     t.jsonb "coordination_result"
     t.string "delivery_batch_key"
     t.jsonb "oauth_binding"
+    t.string "oauth_source_key"
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
+    t.index ["source_plugin", "oauth_source_key", "source_resource_id"], name: "index_tasks_one_open_per_source_oauth", unique: true, where: "((oauth_source_key IS NOT NULL) AND ((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"
-    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY (ARRAY[('inbox'::character varying)::text, ('ready'::character varying)::text, ('running'::character varying)::text, ('waiting_human'::character varying)::text, ('waiting_review'::character varying)::text, ('waiting_delivery'::character varying)::text, ('failed'::character varying)::text])))"
+    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source_legacy", unique: true, where: "((oauth_source_key IS NULL) AND ((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
     t.index ["status"], name: "index_tasks_on_status"
   end
 

@@ -112,17 +112,41 @@ module Interaction
       invalid = response["events"].size - rows.size
 
       if OauthContext.oauth_plugin?(plugin_name)
-        held = hold_for_inflight?(rows, plugin_name, oauth_snapshot)
-        if held
-          cursor.with_lock do
-            next unless cursor.lease_token == token
+        held_rows, pass_rows = partition_held(rows, plugin_name, oauth_snapshot)
+        if held_rows.any?
+          # Mixed batches ingest unrelated candidates while retaining held
+          # ones: persist the pass set but never advance the cursor past
+          # held candidates (they are re-fetched via overlap until the
+          # send settles). DB/matcher errors above propagate and halt
+          # everything instead of treating the batch as ordinary events.
+          pass_rows = suppress_self_posts(pass_rows, plugin_name, oauth_snapshot)
+          outcome = cursor.with_lock(requires_new: true) do
+            next result(false, :stale_poll, retryable: true) unless cursor.lease_token == token && cursor.lease_active?(now)
+
+            if !OauthContext.snapshot_current?(oauth_snapshot, plugin_name, credential_provider: oauth_provider)
+              cursor.update!(lease_token: nil, lease_expires_at: nil)
+              next result(false, :stale_binding, retryable: true)
+            end
+            if OauthContext.oauth_plugin?(plugin_name)
+              current_stored = cursor.respond_to?(:oauth_binding) ? cursor.oauth_binding : nil
+              unless binding_equal?(current_stored, stored_binding)
+                cursor.update!(lease_token: nil, lease_expires_at: nil)
+                next result(false, :stale_binding, retryable: true)
+              end
+            end
+
+            inserted = persist_events(pass_rows, plugin_name, oauth_snapshot)
+            raise ActiveRecord::Rollback unless cursor.lease_active?(now)
 
             cursor.update!(lease_token: nil, lease_expires_at: nil,
               last_error: "held for in-flight delivery; cursor retained",
               consecutive_failures: cursor.consecutive_failures + 1)
-          end
+            result(false, :held, ingested: inserted, skipped: invalid, retryable: true)
+          end || result(false, :stale_poll, retryable: true)
+          @event_sink.emit(layer: "interaction", kind: "poll.failed",
+            message: "Poll held", data: { plugin: plugin_name, ingested: outcome.ingested })
           emit_hold(plugin_name)
-          return result(false, :held, retryable: true)
+          return outcome
         end
         rows = suppress_self_posts(rows, plugin_name, oauth_snapshot)
       end
@@ -222,20 +246,26 @@ module Interaction
       nil
     end
 
-    # True when any candidate overlaps a pending/sending/uncertain
-    # action for the same connection and destination. DB or matcher
-    # errors propagate (never coerce to false): the outer rescue then
-    # halts ingestion and the cursor advance instead of treating the
-    # batch as ordinary human events.
-    def hold_for_inflight?(rows, plugin, snapshot)
-      return false if rows.empty?
+    # Partitions candidates into held vs ingestible. Held rows overlap a
+    # pending/sending/uncertain action for their destination (see
+    # SelfPostMatcher.hold_candidate? for pending vs started scoping).
+    # DB or matcher errors propagate (never coerce to false): the outer
+    # rescue then halts ingestion and the cursor advance instead of
+    # treating the batch as ordinary human events.
+    def partition_held(rows, plugin, snapshot)
+      return [[], rows] if rows.empty?
 
       actions = OutboundAction.where(plugin: plugin, status: %w[pending sending uncertain]).to_a
-      return false if actions.empty?
+      return [[], rows] if actions.empty?
 
-      rows.any? do |row|
+      rows.partition do |row|
         actions.any? { |action| SelfPostMatcher.hold_candidate?(row, action, poll_binding: snapshot) }
       end
+    end
+
+    def hold_for_inflight?(rows, plugin, snapshot)
+      held, _pass = partition_held(rows, plugin, snapshot)
+      held.any?
     end
 
     # Suppresses only durable self-post echoes. Receipts are scoped in
@@ -295,26 +325,35 @@ module Interaction
       nil
     end
 
-    # Every persisted row keeps the trusted binding that fetched it
-    # (first-observed-wins; a later generation never rewrites it), so
+    # Every persisted row keeps the trusted binding that fetched it, so
     # triage can fence the later Task reply against the fetch-time
-    # connection instead of the current one.
+    # connection instead of the current one. Raw provider IDs stay
+    # unchanged; connection scope lives in `oauth_source_key` (provider
+    # plus tenant/cloud plus fetching generation). Same IDs on different
+    # clouds/tenants/generations are distinct sources with distinct
+    # watermarks; legacy rows keep global dedup with a NULL key.
     def persist_events(rows, plugin = nil, snapshot = nil)
       stamp_binding!(rows, plugin, snapshot)
       snapshots, events = rows.partition { |row| snapshot_row?(row) }
       # A source can appear through multiple cursors. Serialize its first insert
       # as well as later revisions. Stable lock order avoids cross-batch deadlocks.
-      sources = snapshots.group_by { |row| row.values_at("plugin", "event_id") }.sort
+      sources = snapshots.group_by { |row| row.values_at("plugin", "oauth_source_key", "event_id") }.sort
       sources.each do |identity, _|
         key = Digest::SHA256.digest(JSON.generate(["poll-snapshot", *identity])).unpack1("q>")
         ExternalEvent.connection.execute("SELECT pg_advisory_xact_lock(#{key})")
       end
 
+      unique_by = if OauthContext.oauth_plugin?(plugin.to_s)
+        :index_external_events_oauth_dedup
+      else
+        :index_external_events_legacy_dedup
+      end
       inserted = events.empty? ? 0 : ExternalEvent.insert_all(events,
-        unique_by: :index_external_events_on_plugin_event_fingerprint, returning: %w[id]).rows.size
-      sources.each do |(plugin, event_id), revisions|
+        unique_by: unique_by, returning: %w[id]).rows.size
+      sources.each do |(plugin, source_key, event_id), revisions|
         previous = ExternalEvent.where(plugin: plugin, event_id: event_id, event_type: snapshot_event_types)
-          .order(occurred_at: :desc, id: :desc).lock.first
+        previous = previous.where(oauth_source_key: source_key)
+        previous = previous.order(occurred_at: :desc, id: :desc).lock.first
         # Adapters/pages need not return chronological order. Preserve the input
         # order for timestamp ties; conflicting tied snapshots are first-wins.
         revisions.each_with_index.sort_by { |row, index| [row["occurred_at"], index] }.each do |row, _|
@@ -347,7 +386,11 @@ module Interaction
       return unless OauthContext.oauth_plugin?(plugin.to_s) && snapshot.is_a?(Hash)
       return unless ExternalEvent.column_names.include?("oauth_binding")
 
-      rows.each { |row| row["oauth_binding"] = snapshot }
+      key = OauthContext.source_key_for(plugin.to_s, snapshot)
+      rows.each do |row|
+        row["oauth_binding"] = snapshot
+        row["oauth_source_key"] = key if ExternalEvent.column_names.include?("oauth_source_key")
+      end
     end
 
     def snapshot_row?(row)

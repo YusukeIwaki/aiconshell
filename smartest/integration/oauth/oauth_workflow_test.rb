@@ -868,8 +868,9 @@ test("event task keeps its fetch binding and never replies as a reconnected prin
 
     # A new event under the new generation makes its own Task with its own
     # binding: same-provider Tasks from different generations never mix
-    # through one plugin-wide snapshot. The old revision re-polls but
-    # dedups instead of duplicating or rewriting its stored generation.
+    # through one plugin-wide snapshot. Raw IDs stay unchanged; connection
+    # scope isolates the rows, so the same comment re-polled under the new
+    # generation is a distinct row (old row keeps gen1) with its own Task.
     transport.expect_json(:POST, "#{OauthWorkflowSupport::JIRA_BASE}/rest/api/3/search/jql", body: {
                             "issues" => [
                               OauthWorkflowSupport.jira_issue("PROJ-1", updated: "2026-09-26T12:01:00.000+0000"),
@@ -888,8 +889,11 @@ test("event task keeps its fetch binding and never replies as a reconnected prin
       ]))
     transport.expect_json(:GET, %r{/issue/PROJ-2/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
     expect(poller.call(plugin: "jira_oauth", scope: "PROJ").ok).to eq(true)
-    expect(ExternalEvent.where(plugin: "jira_oauth", event_id: "jira:comment:200").count).to eq(1)
-    expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:200").oauth_binding["generation"]).to eq(gen1)
+    rows_200 = ExternalEvent.where(plugin: "jira_oauth", event_id: "jira:comment:200").order(:id).to_a
+    expect(rows_200.size).to eq(2)
+    expect(rows_200.map { |row| row.oauth_binding["generation"] }.sort).to eq([gen1, gen2].sort)
+    expect(rows_200.map(&:oauth_source_key).uniq.size).to eq(2)
+    expect(rows_200.first.oauth_binding["generation"]).to eq(gen1)
     event2 = ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:202")
     expect(event2.nil?).to eq(false)
     expect(event2.oauth_binding["generation"]).to eq(gen2)
@@ -929,6 +933,7 @@ test("event task keeps its fetch binding and never replies as a reconnected prin
       ]))
     transport.expect_json(:GET, %r{/issue/PROJ-2/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
     expect(poller.call(plugin: "jira_oauth", scope: "PROJ").ok).to eq(true)
+    expect(ExternalEvent.where(plugin: "jira_oauth", event_id: "jira:comment:200").count).to eq(2)
     expect(ExternalEvent.where(plugin: "jira_oauth", event_id: "jira:comment:202").count).to eq(1)
     expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:202").oauth_binding["generation"]).to eq(gen2)
     transport.assert_consumed!
@@ -1766,4 +1771,295 @@ test("receipt scope ignores generation but never crosses cloud or tenant") do |d
                                 idempotency_key: "scope-check-2", status: "sent")
   expect(Interaction::SelfPostMatcher.receipt_scope_matches?(unscoped, moved)).to eq(false)
   expect(Interaction::SelfPostMatcher.receipt_scope_matches?(action, nil)).to eq(false)
+end
+
+test("same event and resource IDs across connections stay isolated with no partial stale reply") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_workflow_env(scopes: "jira_oauth:PROJ") do
+    transport = BoundaryFixtures::HttpTransport.new
+    ctx = OauthWorkflowSupport.services_with(transport)
+    OauthWorkflowSupport.connect_both(ctx)
+    registry = OauthWorkflowSupport.build_registry(transport)
+    sink = WorkflowFakes::FakeEventSink.new
+    poller = Interaction::PollService.new(registry: registry, event_sink: sink,
+                                          oauth_credential_provider: ctx[:creds])
+    gen1 = OauthConnection.find_by(provider: "atlassian").generation
+    LayerPolicy.create!(layer: "coordination", provider: "claude", enabled: true)
+    LayerPolicy.create!(layer: "execution", provider: "codex", enabled: true)
+
+    # Same raw provider IDs under the first generation.
+    transport.expect_json(:POST, "#{OauthWorkflowSupport::JIRA_BASE}/rest/api/3/search/jql", body: {
+                            "issues" => [OauthWorkflowSupport.jira_issue("PROJ-1", updated: "2026-09-26T12:01:00.000+0000")]
+                          })
+    transport.expect_json(:GET, %r{/issue/PROJ-1/comment}, body:
+      OauthWorkflowSupport.jira_page("comments", [
+        OauthWorkflowSupport.jira_comment("600", updated: "2026-09-26T12:02:00.000+0000", text: "same ids human")
+      ]))
+    transport.expect_json(:GET, %r{/issue/PROJ-1/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
+    expect(poller.call(plugin: "jira_oauth", scope: "PROJ").ok).to eq(true)
+    event1 = ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:600")
+    expect(event1.nil?).to eq(false)
+    expect(event1.resource_id).to eq("issue:PROJ-1")
+    expect(event1.oauth_binding["generation"]).to eq(gen1)
+
+    triage_newest = lambda do |answer|
+      BoundaryFixtures.with_ai(answers: [answer]) do |ai|
+        triage = Coordination::TriageService.new(ai_runner: ai.runner, registry: registry,
+                                                 event_sink: sink, clock: Time,
+                                                 oauth_credential_provider: ctx[:creds])
+        outcome = triage.call(batch_limit: 10)
+        ai.process_runner.assert_consumed!
+        outcome
+      end
+    end
+    newest_id = lambda { Task.where(source_plugin: "jira_oauth").order(:id).last.id }
+    first = triage_newest.call(lambda do |_call|
+      { "rulings" => [{ "task_id" => newest_id.call, "reply" => { "body" => "ack gen1" } }] }
+    end)
+    expect(first.triaged).to eq(1)
+    task1 = Task.where(source_plugin: "jira_oauth").order(:id).last
+    expect(task1.source_resource_id).to eq("issue:PROJ-1")
+    expect(task1.oauth_binding["generation"]).to eq(gen1)
+    key1 = task1.oauth_source_key
+    expect(key1.nil?).to eq(false)
+    expect(task1.outbound_actions.count).to eq(1)
+
+    # Reconnect as another principal: same cloud, new generation.
+    ctx[:auth].disconnect(provider: "atlassian")
+    begun = ctx[:auth].begin(provider: "atlassian", browser_session_id: "s-same-ids")
+    OauthTestSupport.script_atlassian_callback(transport, principal: "acc-999")
+    ctx[:auth].callback(provider: "atlassian", state: begun["state"],
+                        code: "auth-code-1", browser_session_id: "s-same-ids")
+    gen2 = OauthConnection.find_by(provider: "atlassian").generation
+    expect(gen2 == gen1).to eq(false)
+
+    # The SAME raw event/resource IDs re-polled under the new connection
+    # are a distinct isolated row, never merged into the old Task.
+    transport.expect_json(:POST, "#{OauthWorkflowSupport::JIRA_BASE}/rest/api/3/search/jql", body: {
+                            "issues" => [OauthWorkflowSupport.jira_issue("PROJ-1", updated: "2026-09-26T12:01:00.000+0000")]
+                          })
+    transport.expect_json(:GET, %r{/issue/PROJ-1/comment}, body:
+      OauthWorkflowSupport.jira_page("comments", [
+        OauthWorkflowSupport.jira_comment("600", updated: "2026-09-26T12:02:00.000+0000", text: "same ids human")
+      ]))
+    transport.expect_json(:GET, %r{/issue/PROJ-1/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
+    expect(poller.call(plugin: "jira_oauth", scope: "PROJ").ok).to eq(true)
+    rows = ExternalEvent.where(plugin: "jira_oauth", event_id: "jira:comment:600").order(:id).to_a
+    expect(rows.size).to eq(2)
+    expect(rows.map { |row| row.oauth_binding["generation"] }.sort).to eq([gen1, gen2].sort)
+    expect(rows.map(&:oauth_source_key).uniq.size).to eq(2)
+    expect(rows.map(&:resource_id).uniq).to eq(["issue:PROJ-1"])
+
+    # Ingest without replying: the new row must create its own Task.
+    BoundaryFixtures.with_ai(answers: [{ "rulings" => [] }]) do |ai|
+      triage = Coordination::TriageService.new(ai_runner: ai.runner, registry: registry,
+                                               event_sink: sink, clock: Time,
+                                               oauth_credential_provider: ctx[:creds])
+      triage.call(batch_limit: 10)
+      ai.process_runner.assert_consumed!
+    end
+    tasks = Task.where(source_plugin: "jira_oauth", source_resource_id: "issue:PROJ-1").order(:id).to_a
+    expect(tasks.size).to eq(2)
+    expect(tasks.map { |task| task.oauth_binding["generation"] }.sort).to eq([gen1, gen2].sort)
+    expect(tasks.map(&:oauth_source_key).uniq.size).to eq(2)
+    task2 = tasks.find { |task| task.oauth_binding["generation"] == gen2 }
+    expect(task2.id == task1.id).to eq(false)
+    # Each generation's own issue snapshot plus comment join to its own
+    # Task: Task1 keeps its gen1 comment feedback, Task2 has its gen2
+    # comment feedback, and neither gained the other's feedback.
+    expect(task1.reload.task_feedbacks.count).to eq(1)
+    expect(task2.reload.task_feedbacks.count).to eq(1)
+
+    # A stale reply targeting the old Task rejects with no partial state:
+    # no status/priority/plan change, no dispatch run, no extra action,
+    # no feedback acknowledgement.
+    feedback = TaskFeedback.create!(task: task1, body: "clarify old", author: "human")
+    before = task1.reload.attributes.slice("status", "priority", "work_plan", "next_action_at", "last_error")
+    actions_before = task1.outbound_actions.count
+    runs_before = task1.task_runs.count
+    stale = triage_newest.call({ "rulings" => [{ "task_id" => task1.id, "priority" => 99,
+                                                 "status" => "ready", "dispatch" => true,
+                                                 "work_plan" => "stale plan",
+                                                 "reply" => { "body" => "stale reply" } }] })
+    expect(stale.triaged).to eq(0)
+    expect(stale.rejected).to eq(1)
+    task1.reload
+    expect(task1.attributes.slice("status", "priority", "work_plan")).to eq(before.slice("status", "priority", "work_plan"))
+    expect(task1.outbound_actions.count).to eq(actions_before)
+    expect(task1.task_runs.count).to eq(runs_before)
+    expect(feedback.reload.processed_at.nil?).to eq(true)
+
+    # The new Task replies fine under its own generation.
+    fresh = triage_newest.call({ "rulings" => [{ "task_id" => task2.id, "reply" => { "body" => "ack gen2" } }] })
+    expect(fresh.triaged).to eq(1)
+    expect(task2.reload.outbound_actions.count).to eq(1)
+    expect(task2.outbound_actions.first.oauth_binding["generation"]).to eq(gen2)
+    expect(task1.reload.outbound_actions.count).to eq(actions_before)
+    transport.assert_consumed!
+  end
+end
+
+test("one jira poll ingests unrelated candidates while retaining held ones") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_workflow_env(scopes: "jira_oauth:PROJ") do
+    transport = BoundaryFixtures::HttpTransport.new
+    ctx = OauthWorkflowSupport.services_with(transport)
+    OauthWorkflowSupport.connect_both(ctx)
+    registry = OauthWorkflowSupport.build_registry(transport)
+    sink = WorkflowFakes::FakeEventSink.new
+    poller = Interaction::PollService.new(registry: registry, event_sink: sink,
+                                          oauth_credential_provider: ctx[:creds])
+
+    task = OauthWorkflowSupport.admin_task
+    policy = LayerPolicy.create!(layer: "coordination", provider: "codex", enabled: true)
+    result_service = Coordination::ResultService.new(registry: registry, event_sink: sink,
+                                                     clock: Time, oauth_credential_provider: ctx[:creds])
+    applied = result_service.apply(task_id: task.id, task_version: task.lock_version,
+                                   feedback_ids: [], policy: policy,
+                                   result: { "summary" => "s", "actions" => [
+                                     { "plugin" => "jira_oauth", "operation" => "reply",
+                                       "input" => { "resource_id" => "issue:PROJ-1", "body" => "held reply" } }
+                                   ] })
+    expect(applied.ok).to eq(true)
+
+    # One mixed response: PROJ-1 overlaps the pending reply (held),
+    # PROJ-2 is unrelated human work (ingested) in the same batch.
+    transport.expect_json(:POST, "#{OauthWorkflowSupport::JIRA_BASE}/rest/api/3/search/jql", body: {
+                            "issues" => [
+                              OauthWorkflowSupport.jira_issue("PROJ-1", updated: "2026-09-26T12:40:00.000+0000"),
+                              OauthWorkflowSupport.jira_issue("PROJ-2", updated: "2026-09-26T12:41:00.000+0000",
+                                                              summary: "other", text: "other desc")
+                            ]
+                          })
+    transport.expect_json(:GET, %r{/issue/PROJ-1/comment}, body:
+      OauthWorkflowSupport.jira_page("comments", [
+        OauthWorkflowSupport.jira_comment("710", updated: "2026-09-26T12:42:00.000+0000", text: "held issue words")
+      ]))
+    transport.expect_json(:GET, %r{/issue/PROJ-1/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
+    transport.expect_json(:GET, %r{/issue/PROJ-2/comment}, body:
+      OauthWorkflowSupport.jira_page("comments", [
+        OauthWorkflowSupport.jira_comment("711", updated: "2026-09-26T12:43:00.000+0000", text: "unrelated words")
+      ]))
+    transport.expect_json(:GET, %r{/issue/PROJ-2/changelog}, body: OauthWorkflowSupport.jira_page("values", []))
+    mixed = poller.call(plugin: "jira_oauth", scope: "PROJ")
+    expect(mixed.ok).to eq(false)
+    expect(mixed.code).to eq(:held)
+    # PROJ-2 ingests its issue snapshot plus comment; PROJ-1 (issue plus
+    # comment) stays held without advancing the cursor.
+    expect(mixed.ingested).to eq(2)
+    expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:711").nil?).to eq(false)
+    expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:issue:PROJ-2").nil?).to eq(false)
+    expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:comment:710").nil?).to eq(true)
+    expect(ExternalEvent.find_by(plugin: "jira_oauth", event_id: "jira:issue:PROJ-1").nil?).to eq(true)
+    expect(IntegrationCursor.find_by(plugin: "jira_oauth", scope: "PROJ").cursor.nil?).to eq(true)
+    transport.assert_consumed!
+  end
+end
+
+test("uncertain sends hold the same space after reconnect while old pending does not") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_workflow_env(scopes: "teams_oauth:team/team-1/channel/chan-1,teams_oauth:team/team-1/channel/chan-2") do
+    transport = BoundaryFixtures::HttpTransport.new
+    ctx = OauthWorkflowSupport.services_with(transport)
+    OauthWorkflowSupport.connect_both(ctx)
+    registry = OauthWorkflowSupport.build_registry(transport)
+    sink = WorkflowFakes::FakeEventSink.new
+    poller = Interaction::PollService.new(registry: registry, event_sink: sink,
+                                          oauth_credential_provider: ctx[:creds])
+    policy = LayerPolicy.create!(layer: "coordination", provider: "codex", enabled: true)
+    result_service = Coordination::ResultService.new(registry: registry, event_sink: sink,
+                                                     clock: Time, oauth_credential_provider: ctx[:creds])
+
+    # An old pending (never started) for chan-1.
+    pending_task = OauthWorkflowSupport.admin_task
+    expect(result_service.apply(task_id: pending_task.id, task_version: pending_task.lock_version,
+                                feedback_ids: [], policy: policy,
+                                result: { "summary" => "s", "actions" => [
+                                  { "plugin" => "teams_oauth", "operation" => "send_message",
+                                    "input" => { "scope" => "channel:team-1/chan-1", "body" => "old pending" } }
+                                ] }).ok).to eq(true)
+    pending_action = OutboundAction.last
+    expect(pending_action.request_started_at.nil?).to eq(true)
+
+    # A started write for chan-1 that really times out -> uncertain.
+    uncertain_task = OauthWorkflowSupport.admin_task
+    expect(result_service.apply(task_id: uncertain_task.id, task_version: uncertain_task.lock_version,
+                                feedback_ids: [], policy: policy,
+                                result: { "summary" => "s", "actions" => [
+                                  { "plugin" => "teams_oauth", "operation" => "send_message",
+                                    "input" => { "scope" => "channel:team-1/chan-1", "body" => "uncertain write" } }
+                                ] }).ok).to eq(true)
+    uncertain_action = OutboundAction.last
+    send_url = "#{OauthWorkflowSupport::GRAPH_BASE}/teams/team-1/channels/chan-1/messages"
+    transport.expect_error(:POST, send_url,
+                           Aiconshell::Plugins::TransportTimeout.new(http_method: "POST", url: send_url,
+                                                                    timeout_kind: "read"))
+    delivery = Interaction::OutboundService.new(registry: registry, event_sink: sink,
+                                                oauth_credential_provider: ctx[:creds]).call(uncertain_action.id)
+    expect(delivery.code).to eq(:delivery_uncertain)
+    expect(uncertain_action.reload.status).to eq("uncertain")
+
+    # Reconnect in the same tenant: generation moves, provider space stays.
+    ctx[:auth].disconnect(provider: "microsoft")
+    begun = ctx[:auth].begin(provider: "microsoft", browser_session_id: "s-uncertain-reconnect")
+    OauthTestSupport.script_microsoft_callback(transport, principal: "user-oid-2")
+    ctx[:auth].callback(provider: "microsoft", state: begun["state"],
+                        code: "auth-code-1", browser_session_id: "s-uncertain-reconnect")
+
+    # Same destination still held by the uncertain side effect.
+    OauthWorkflowSupport.script_teams_channel_message(transport, msg_id: "msg-same", body: "uncertain write")
+    held = poller.call(plugin: "teams_oauth", scope: "team/team-1/channel/chan-1")
+    expect(held.ok).to eq(false)
+    expect(held.code).to eq(:held)
+    expect(ExternalEvent.where(plugin: "teams_oauth").count).to eq(0)
+
+    # Another destination in the same connection is unaffected.
+    OauthWorkflowSupport.script_teams_channel_message(transport, team: "team-1", channel: "chan-2",
+                                                      msg_id: "msg-other", body: "other channel words")
+    other = poller.call(plugin: "teams_oauth", scope: "team/team-1/channel/chan-2")
+    expect(other.ok).to eq(true)
+    expect(ExternalEvent.find_by(plugin: "teams_oauth",
+                                 resource_id: "message:team-1/chan-2/msg-other").nil?).to eq(false)
+
+    # The old pending alone never holds a reconnected poll: settle the
+    # uncertain out of the way in this isolated check by marking it failed
+    # (operator reconciliation), then the same destination ingests.
+    uncertain_action.reload.update!(status: "failed", error_code: "reconciled", error: "operator review")
+    pending_action.reload.update!(status: "failed", error_code: "reconciled", error: "operator review")
+    OauthWorkflowSupport.script_teams_channel_message(transport, msg_id: "msg-after", body: "new human words")
+    passed = poller.call(plugin: "teams_oauth", scope: "team/team-1/channel/chan-1")
+    expect(passed.ok).to eq(true)
+    expect(ExternalEvent.find_by(plugin: "teams_oauth",
+                                 resource_id: "message:team-1/chan-1/msg-after").nil?).to eq(false)
+    transport.assert_consumed!
+  end
+end
+
+test("decision prompts map teams_oauth channels and chats to send input scopes") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_workflow_env(scopes: "teams:team/t1/channel/c1,teams_oauth:team/team-1/channel/chan-1,teams_oauth:chat/chat-9,jira_oauth:PROJ") do
+    transport = BoundaryFixtures::HttpTransport.new
+    ctx = OauthWorkflowSupport.services_with(transport)
+    OauthWorkflowSupport.connect_both(ctx)
+    registry = OauthWorkflowSupport.build_registry(transport)
+    sink = WorkflowFakes::FakeEventSink.new
+    query = Interaction::QueryService.new(registry: registry, event_sink: sink,
+                                          oauth_credential_provider: ctx[:creds])
+    triage = Coordination::TriageService.new(ai_runner: nil, registry: registry,
+                                             event_sink: sink, clock: Time,
+                                             oauth_credential_provider: ctx[:creds])
+    prompt = triage.send(:decision_prompt, [], [])
+    capabilities = JSON.parse(prompt[/CAPABILITIES: (\{.*\})\nTASKS:/m, 1])
+    targets = capabilities.fetch("allowed_targets")
+    by_permission = targets.to_h { |entry| [[entry["plugin"], entry["permission_scope"]], entry["input_scope"]] }
+    expect(by_permission[["teams", "team/t1/channel/c1"]]).to eq("channel:t1/c1")
+    expect(by_permission[["teams_oauth", "team/team-1/channel/chan-1"]]).to eq("channel:team-1/chan-1")
+    expect(by_permission[["teams_oauth", "chat/chat-9"]]).to eq("chat:chat-9")
+    expect(by_permission[["jira_oauth", "PROJ"]]).to eq("PROJ")
+    # The prompt never carries bindings or tokens; read scopes stay as-is.
+    expect(prompt.include?("oauth_binding")).to eq(false)
+    expect(prompt.include?("oauth_credential_provider")).to eq(false)
+    expect(query.allowed_targets["teams_oauth"]).to include("team/team-1/channel/chan-1")
+    transport.assert_consumed!
+  end
 end

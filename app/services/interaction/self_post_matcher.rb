@@ -31,17 +31,28 @@ module Interaction
       end
     end
 
-    # True when an in-flight/uncertain action covers the same connection
-    # and destination as a poll candidate, so the candidate must be held
-    # (not ingested as new work and not skipped via cursor advance).
-    # The connection match stays generation-pinned (send permission):
-    # another connection's poll never holds for this action, and this
-    # action never holds another connection's poll.
+    # True when an in-flight/uncertain action covers a poll candidate, so
+    # the candidate must be held (not ingested as new work and not skipped
+    # via cursor advance). Not-yet-started intents (`pending`, or `sending`
+    # before `request_started_at`) hold only the same generation (send
+    # permission stays generation-pinned): an old pending never holds a
+    # reconnected poll. Already-started writes (`sending` with
+    # `request_started_at`, or `uncertain`) hold across generations in the
+    # same provider resource space: the unknown external side effect
+    # survives reconnect, so the matching echo stays held until reconciled.
+    # Different clouds/tenants/destinations never hold.
     def hold_candidate?(event, action, poll_binding: nil)
       return false unless event.is_a?(Hash) && action.respond_to?(:plugin)
       return false unless event["plugin"].to_s == action.plugin.to_s
       return false unless %w[pending sending uncertain].include?(action.status.to_s)
-      return false unless binding_matches?(action, poll_binding)
+
+      started = action.status.to_s == "uncertain" ||
+        (action.respond_to?(:request_started_at) && !action.request_started_at.nil?)
+      if started
+        return false unless receipt_scope_matches?(action, poll_binding)
+      else
+        return false unless binding_matches?(action, poll_binding)
+      end
 
       hold_keys_match?(hold_key_for_event(event), hold_key_for_action(action), event)
     end
