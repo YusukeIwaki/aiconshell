@@ -11,8 +11,10 @@
 #                   fails fast if it is missing, so ClickHouse-backed tests
 #                   can never skip silently here.
 #   zeitwerk        Rails autoloading check
-#   ops             compose config + static ops contracts + image builds
-#                   (app default and optional ai target; no provider login)
+#   ops             compose config + static ops contracts + resolved worker
+#                   targets (default ai, offline app, muse override) +
+#                   image builds (app default and optional ai target;
+#                   no provider login, no credentials)
 #   clickhouse-smoke  bin/setup-clickhouse mechanics against a real
 #                   ClickHouse service, using a generated throwaway probe
 #                   schema (the shipped EventLog schema itself is proven by
@@ -124,10 +126,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compose config validates
         run: docker compose config --quiet
+      - name: Resolved worker targets (default ai, offline app, muse override)
+        run: |
+          docker compose config --format json | ruby -rjson -e '
+            build = JSON.parse(STDIN.read).fetch("services").to_h { |name, svc| [name, svc.dig("build", "target")] }
+            expected = {"web" => "app", "migrate" => "app", "clickhouse-init" => "app", "control" => "ai", "execution" => "ai"}
+            abort "default targets: #{build.slice(*expected.keys).inspect}" unless expected.all? { |name, target| build[name] == target }
+          '
+          CONTROL_TARGET=app EXECUTION_TARGET=app docker compose config --format json | ruby -rjson -e '
+            build = JSON.parse(STDIN.read).fetch("services").to_h { |name, svc| [name, svc.dig("build", "target")] }
+            abort "offline targets: #{build.slice("control", "execution").inspect}" unless build["control"] == "app" && build["execution"] == "app"
+          '
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/muse-fixture"
+          MUSE_CLI_PATH="$RUNNER_TEMP/muse-fixture" docker compose -f compose.yml -f compose.muse.yml config --format json | ruby -rjson -e '
+            services = JSON.parse(STDIN.read).fetch("services")
+            build = services.to_h { |name, svc| [name, svc.dig("build", "target")] }
+            abort "muse targets: #{build.slice("control", "execution").inspect}" unless build["control"] == "ai" && build["execution"] == "ai"
+            with_secret = services.select { |_, svc| Array(svc.dig("build", "secrets")).to_s.include?("muse_cli") }.keys
+            abort "muse build secret on: #{with_secret.inspect}" unless with_secret.sort == %w[control execution]
+          '
       - name: Static ops contracts
         run: ruby bin/check-compose
       - name: Build default (app) image
         run: docker build -t aiconshell:ci-app .
+      - name: Default app image carries no AI CLIs
+        run: |
+          docker run --rm --entrypoint /bin/sh aiconshell:ci-app -c 'for bin in claude codex muse; do if command -v "$bin" >/dev/null 2>&1; then echo "unexpected AI CLI in app image: $bin" >&2; exit 1; fi; done'
       - name: Build optional AI worker image (no Muse secret, no login)
         run: docker build --target ai -t aiconshell:ci-ai .
       - name: AI worker image carries pinned Linux CLIs
