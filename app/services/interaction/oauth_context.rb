@@ -43,13 +43,15 @@ module Interaction
       base.merge("oauth_binding" => resolved, "oauth_credential_provider" => credential_provider)
     end
 
-    # Connection-scoped source key for OAuth inbox isolation (issue #26).
-    # Provider raw IDs stay unchanged; this key scopes the lock, DB
-    # uniqueness, and Task join per connection generation plus provider
-    # resource space (provider plus fixed tenant/cloud). Legacy plugins
-    # always return nil and keep global dedup. OAuth plugins with a
-    # missing/blank binding also return nil (fail open toward the legacy
-    # global path; polls fence missing bindings before persisting).
+    # Generation-scoped source key for OAuth Task isolation (issue #26).
+    # Provider raw IDs stay unchanged; this key scopes the Task join (and
+    # its DB uniqueness) per fetching connection generation plus provider
+    # resource space (provider plus fixed tenant/cloud), so a new post or
+    # edit fetched after a reconnect becomes current-generation work
+    # without joining the old generation's Task. Legacy plugins always
+    # return nil and keep global dedup. OAuth plugins with a missing/blank
+    # binding also return nil (fail open toward the legacy global path;
+    # polls fence missing bindings before persisting).
     def source_key_for(plugin, binding)
       return nil unless oauth_plugin?(plugin.to_s)
       return nil unless binding.is_a?(Hash)
@@ -68,6 +70,30 @@ module Interaction
 
       [provider, get.call("tenant").to_s, get.call("cloud").to_s,
        connection_id, generation, get.call("principal").to_s].join("\u001F")
+    end
+
+    # Generation-independent event identity for OAuth inbox dedup
+    # (issue #26). The same external object revision re-fetched after a
+    # reconnect is already-handled work, not a new Task: dedup, snapshot
+    # watermarks, and poll serialization locks all scope by provider
+    # resource space (provider plus fixed tenant/cloud) with the raw
+    # provider IDs unchanged. A different cloud/tenant with the same
+    # numeric IDs is a distinct space and stays ingestible. Task joins
+    # and reply permission stay generation-pinned via `source_key_for`
+    # above; legacy plugins always return nil and keep global dedup.
+    def event_space_key_for(plugin, binding)
+      return nil unless oauth_plugin?(plugin.to_s)
+      return nil unless binding.is_a?(Hash)
+
+      get = ->(key) do
+        value = binding[key.to_s]
+        value = binding[key.to_sym] if value.nil?
+        value
+      end
+      provider = get.call("provider").to_s
+      return nil if provider.empty?
+
+      [provider, get.call("tenant").to_s, get.call("cloud").to_s].join("\u001F")
     end
 
     # True when a previously fixed snapshot still matches the current

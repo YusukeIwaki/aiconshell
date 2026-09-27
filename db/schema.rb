@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_070000) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_080000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -103,8 +103,9 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_070000) do
     t.datetime "source_updated_at"
     t.jsonb "oauth_binding"
     t.string "oauth_source_key"
+    t.string "oauth_event_space"
     t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_legacy_dedup", unique: true, where: "(oauth_source_key IS NULL)"
-    t.index ["plugin", "oauth_source_key", "event_id", "fingerprint"], name: "index_external_events_oauth_dedup", unique: true, where: "(oauth_source_key IS NOT NULL)"
+    t.index ["plugin", "oauth_event_space", "event_id", "fingerprint"], name: "index_external_events_oauth_dedup", unique: true, where: "(oauth_event_space IS NOT NULL)"
     t.index ["plugin", "resource_id"], name: "index_external_events_on_plugin_resource"
     t.index ["processed_at"], name: "index_external_events_on_processed_at"
     t.index ["task_id"], name: "index_external_events_on_task_id"

@@ -328,16 +328,21 @@ module Interaction
     # Every persisted row keeps the trusted binding that fetched it, so
     # triage can fence the later Task reply against the fetch-time
     # connection instead of the current one. Raw provider IDs stay
-    # unchanged; connection scope lives in `oauth_source_key` (provider
-    # plus tenant/cloud plus fetching generation). Same IDs on different
-    # clouds/tenants/generations are distinct sources with distinct
-    # watermarks; legacy rows keep global dedup with a NULL key.
+    # unchanged. External identity scopes by provider resource space
+    # (`oauth_event_space`: provider plus tenant/cloud, never the
+    # fetching generation): the same object revision re-fetched after a
+    # reconnect dedups to the already-handled row instead of creating new
+    # work, while the same numeric IDs on a different cloud/tenant stay
+    # distinct rows with distinct watermarks. The generation-scoped Task
+    # join key (`oauth_source_key`) is stamped alongside so triage pins
+    # genuinely new posts/edits to their fetching generation; legacy rows
+    # keep global dedup with NULL keys.
     def persist_events(rows, plugin = nil, snapshot = nil)
       stamp_binding!(rows, plugin, snapshot)
       snapshots, events = rows.partition { |row| snapshot_row?(row) }
       # A source can appear through multiple cursors. Serialize its first insert
       # as well as later revisions. Stable lock order avoids cross-batch deadlocks.
-      sources = snapshots.group_by { |row| row.values_at("plugin", "oauth_source_key", "event_id") }.sort
+      sources = snapshots.group_by { |row| row.values_at("plugin", "oauth_event_space", "event_id") }.sort
       sources.each do |identity, _|
         key = Digest::SHA256.digest(JSON.generate(["poll-snapshot", *identity])).unpack1("q>")
         ExternalEvent.connection.execute("SELECT pg_advisory_xact_lock(#{key})")
@@ -350,9 +355,9 @@ module Interaction
       end
       inserted = events.empty? ? 0 : ExternalEvent.insert_all(events,
         unique_by: unique_by, returning: %w[id]).rows.size
-      sources.each do |(plugin, source_key, event_id), revisions|
+      sources.each do |(plugin, event_space, event_id), revisions|
         previous = ExternalEvent.where(plugin: plugin, event_id: event_id, event_type: snapshot_event_types)
-        previous = previous.where(oauth_source_key: source_key)
+        previous = previous.where(oauth_event_space: event_space)
         previous = previous.order(occurred_at: :desc, id: :desc).lock.first
         # Adapters/pages need not return chronological order. Preserve the input
         # order for timestamp ties; conflicting tied snapshots are first-wins.
@@ -387,9 +392,11 @@ module Interaction
       return unless ExternalEvent.column_names.include?("oauth_binding")
 
       key = OauthContext.source_key_for(plugin.to_s, snapshot)
+      space = OauthContext.event_space_key_for(plugin.to_s, snapshot)
       rows.each do |row|
         row["oauth_binding"] = snapshot
         row["oauth_source_key"] = key if ExternalEvent.column_names.include?("oauth_source_key")
+        row["oauth_event_space"] = space if ExternalEvent.column_names.include?("oauth_event_space")
       end
     end
 

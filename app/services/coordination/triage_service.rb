@@ -121,9 +121,11 @@ module Coordination
 
             # Serialize different event rows for one external source. The
             # partial unique index also protects callers outside this path.
-            # OAuth sources isolate by connection scope (`oauth_source_key`);
-            # legacy sources keep the global plugin/resource lock. Same raw
-            # IDs on different connections never share a Task.
+            # OAuth Task joins isolate by fetching generation
+            # (`oauth_source_key`); legacy sources keep the global
+            # plugin/resource lock. A new post or edit from another
+            # generation never joins this Task (handled revisions never
+            # re-create events at all: event dedup is generation-free).
             source_key = event.respond_to?(:oauth_source_key) ? event.oauth_source_key : nil
             key = Digest::SHA256.digest("#{event.plugin}\0#{source_key}\0#{event.resource_id}").unpack1("q>")
             Task.connection.execute("SELECT pg_advisory_xact_lock(#{key})")

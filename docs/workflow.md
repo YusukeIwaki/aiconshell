@@ -99,13 +99,19 @@ observed for that revision. Metadata timestamps in the payload do not create
 new work. Other event types retain their original fingerprint deduplication.
 
 Per-plugin/event-ID transaction advisory locks serialize snapshot writes across
-scopes, acquired in sorted order. Delegated OAuth sources additionally scope
-the lock, watermark lookup, and DB uniqueness by connection
-(`oauth_source_key`: provider plus fixed tenant/cloud plus fetching
-generation, raw provider IDs unchanged); legacy sources keep the global
-plugin/event lock. A batch is processed in timestamp order for
+scopes, acquired in sorted order. Delegated OAuth sources scope event
+identity — the lock, watermark lookup, and DB uniqueness — by provider
+resource space (`oauth_event_space`: provider plus fixed tenant/cloud,
+raw provider IDs unchanged, never the fetching generation); legacy sources
+keep the global plugin/event lock. Re-fetching an identical handled
+revision after a reconnect dedups to the existing row and creates no new
+Task or reply; the same numeric IDs on a different cloud/tenant are a
+distinct space with distinct rows and watermarks. Task joins stay
+generation-pinned (`oauth_source_key`): a new post or edit fetched after a
+reconnect becomes current-generation work in its own Task without joining
+the old generation's Task. A batch is processed in timestamp order for
 each source. Snapshots older than the persisted watermark are ignored; equal
-timestamps are first-observed-wins within one connection scope (batch input
+timestamps are first-observed-wins within one provider space (batch input
 order breaks ties). Providers
 must supply the edit time as `occurred_at`; timestamps are compared at PostgreSQL
 microsecond precision. Conflicting changes at the same timestamp and changes
@@ -132,15 +138,19 @@ service-account credentials. Binding/provider values never enter AI
 input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
 `teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
 delegated variant. Typed-read snapshots are reused for the following
-result, fetch-time external-event snapshots (stored on each
-`external_events` row and copied to its `tasks` row at creation, scoped by
-`oauth_source_key`) for the following reply, and enqueue snapshots for
+result, fetch-time external-event snapshots (the fetching binding stored on
+each `external_events` row and copied to its `tasks` row at creation, Task
+joins scoped by the generation-pinned `oauth_source_key`) for the following
+reply, and enqueue snapshots for
 delivery; a disconnect/replacement in between stops with `stale_binding` /
 `not_connected` instead of continuing as another principal, and each Task
 is fenced by its own stored binding so same-provider Tasks from different
 generations never mix. Same raw event/resource IDs on different
-clouds/tenants/generations are distinct isolated sources with distinct DB
-rows, watermarks, advisory locks, and Tasks; legacy dedup stays global.
+clouds/tenants are distinct isolated spaces with distinct DB
+rows, watermarks, advisory locks, and Tasks; the same space re-fetched
+after a reconnect dedups to handled rows with no new work, while a new
+post or edit in the same space becomes a separate current-generation Task;
+legacy dedup stays global.
 External-event Tasks never gain typed reads: `admin_origin_required`
 still rejects them before HTTP, and that restriction is kept. A stale
 OAuth reply is fenced before any Task mutation and re-fenced before the
@@ -169,11 +179,13 @@ advancing the cursor so it is neither lost
 nor auto-replied in a loop; a mixed batch still ingests unrelated
 candidates (held rows are partitioned per candidate, the pass set
 persists, and the cursor is retained rather than advanced past held
-rows). Not-yet-started intents (`pending`, or `sending` before
-`request_started_at`) hold only the same generation; already-started
-writes (`sending` with `request_started_at`, or `uncertain`) hold across
+rows). `pending` never holds another generation — even a rate-limited
+attempt that left `request_started_at` set is an explicit rejection with
+no unknown side effect; only already-started
+writes (`sending` with `request_started_at` set, or `uncertain`) hold across
 generations in the same provider resource space, so an unknown side
-effect survives reconnect until reconciled. Jira holds are per issue (a reply to one issue
+effect survives reconnect until reconciled. `sending` before
+`request_started_at` holds only its own generation. Jira holds are per issue (a reply to one issue
 never holds another), Teams holds per channel/chat, and other spaces/destinations are unaffected.
 DB or matcher errors halt ingestion and the cursor advance instead of
 treating the batch as ordinary human events.
