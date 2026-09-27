@@ -2,6 +2,11 @@
 <h1>プラグイン設定状況</h1>
 <p>各プラグインの対応操作と、設定に必要な環境変数<strong>名</strong>の一覧です。値（秘密）は表示しません。</p>
 
+<div class="admin-card">
+  <h2 style="margin-top:0">ユーザー委任OAuth接続（Jira・Teams）</h2>
+  <p>ここに並ぶ <code class="admin-env">jira</code>（service account名義）・<code class="admin-env">teams</code>（Graph application + Bot名義）のBot運用とは別に、同意した特定ユーザー名義で動くOAuth2代理運用があります。接続の開始・再接続・解除と、誰の権限で動くかの確認は <%= link_to "OAuth連携", admin_oauth_connections_path %> で行います。個人PATによる代理運用はありません。</p>
+</div>
+
 <% if !@plugins_available %>
   <div class="admin-card">
     <p><span class="admin-badge admin-badge-idle">診断不可</span>
