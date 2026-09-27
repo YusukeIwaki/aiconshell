@@ -54,18 +54,28 @@ DB 名・role 名・パスワードは運営者が決める。無関係な DB / 
    GRANT CONNECT ON DATABASE "example_db" TO "example_app";
    ```
 
-2. その利用環境の web / control / execution サービス群を用意する。
+2. ClickHouse に利用環境専用の database と制限付き user を用意する
+   （schema provisioning と runtime 読み書き資格情報の分離）。
+   運営者が operator 権限で database を作り、その database を選択して
+   `db/clickhouse/*.sql` を適用する。DDL には既存 `bin/setup-clickhouse` を
+   operator コンテキストで実行できる。アプリに恒久的な管理権限は付けない。
+   次に、その database だけに `SELECT` / `INSERT` を許可した別の user を作り
+   （operator / access-management 権限なし）、その制限付き資格情報だけを
+   当該利用環境の web / control の `CLICKHOUSE_DATABASE/USER/PASSWORD` に入れる。
+   operator 資格情報は ClickHouse 側だけに置く。
+   `execution` には ClickHouse 資格情報を渡さない。
+3. その利用環境の web / control / execution サービス群を用意する。
    新規サービスは Railway CLI / API / dashboard で設定する
    （TOML への自動 opt-in は無い。既存 TOML 互換設定の注意は
    [docs/deployment.md](deployment.md) §7 どおり）。
-3. 変数を設定する（前節の表）。管理者接続・他環境の秘密を混ぜない。
-4. マイグレーションは web の predeploy（`./bin/rails db:prepare`）で1回だけ。
+4. 変数を設定する（前節の表）。管理者接続・他環境の秘密を混ぜない。
+5. マイグレーションは web の predeploy（`./bin/rails db:prepare`）で1回だけ。
    worker 起動時には実行しない。
-5. control / execution の `/data` volume を既存 runbook
+6. control / execution の `/data` volume を既存 runbook
    （[docs/deployment.md](deployment.md) §7「初回だけ volume の所有者を設定する」）
    どおりに初期化し、一時設定を外して UID 1000 に戻す。
-6. worker を通常 Start Command（control / execution の queue config）に戻して起動する。
-7. 確認: 接続先 DB 名・current user、両 worker の共有 DB 登録、
+7. worker を通常 Start Command（control / execution の queue config）に戻して起動する。
+8. 確認: 接続先 DB 名・current user、両 worker の共有 DB 登録、
    Web ヘルスチェックと管理画面認証、ClickHouse schema / search を
    read-only に確認する。実 AI や外部投稿は確認に使わない。
 

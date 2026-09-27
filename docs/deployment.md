@@ -332,7 +332,7 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 | --- | --- |
 | `DATABASE_URL` | 3 サービスにその利用環境の専用 role 接続文字列。管理者接続（`${{Postgres.DATABASE_URL}}`）をそのまま使わない。複数環境は [docs/railway-environments.md](railway-environments.md) |
 | `CLICKHOUSE_URL` | web / control に `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
-| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
+| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に利用環境専用の制限付き ClickHouse database / user 資格情報。operator 資格情報は ClickHouse 側だけに置き、アプリには渡さない |
 | `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値（利用環境ごとに別の値） |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
 | `ADMIN_API_TOKEN` | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値（未設定は fail closed。UI 認証とは別。`docs/task-requests.md`） |
