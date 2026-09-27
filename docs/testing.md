@@ -70,6 +70,9 @@ RBENV_VERSION=3.4.9 rbenv exec ruby bin/rails zeitwerk:check
 だけを起動する。アプリ本体やAI CLIのコンテナをbuildする必要はない。
 以下はローカル専用の合成パスワードを使う例。tagを担当Issueにし、未使用のportを選ぶ。
 同じDBで並列にintegration suiteを動かさない（fixtureはrollback以外の実commitも使う）。
+空きportの確認は `docker ps --format '{{.Names}} {{.Ports}}'` などで行う。
+他プロジェクトのcontainerの `Config.Env` やホストの全環境変数を列挙して接続情報を探さず、
+自分で作ったテストサービスの明示的な `TEST_*` 接続だけを使う。
 
 ```sh
 export AICONSHELL_TEST_TAG=aiconshell-issue-N
