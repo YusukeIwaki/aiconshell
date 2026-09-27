@@ -62,7 +62,8 @@ DB 名・role 名・パスワードは運営者が決める。無関係な DB / 
    次に、その database だけに `SELECT` / `INSERT` を許可した別の user を作り
    （operator / access-management 権限なし）、その制限付き資格情報だけを
    当該利用環境の web / control の `CLICKHOUSE_DATABASE/USER/PASSWORD` に入れる。
-   operator 資格情報は ClickHouse 側だけに置く。
+   operator 資格情報は平常時 ClickHouse 側だけに置く。初期化用コンテナへ一時的に
+   渡した場合は、完了後にそのコンテナと一時設定を削除する。
    `execution` には ClickHouse 資格情報を渡さない。
 3. その利用環境の web / control / execution サービス群を用意する。
    新規サービスは Railway CLI / API / dashboard で設定する
