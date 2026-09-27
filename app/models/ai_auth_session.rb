@@ -4,6 +4,11 @@
 # provider and worker role (partial unique index); double submits return the
 # existing active row instead of creating a second one.
 #
+# Single-worker contract (issue 20): new operations use execution only.
+# The control role stays valid here so legacy rows can be revoked
+# (RequestService#revoke_legacy_control!); new control requests are
+# rejected by RequestService and never run.
+#
 # Short-term secrets (challenge URL/user code, submitted auth code) are stored
 # only as ciphertext in encrypted_challenge/encrypted_input_code and are
 # cleared on every terminal transition. Long-lived tokens never touch this
@@ -11,6 +16,7 @@
 class AiAuthSession < ApplicationRecord
   PROVIDERS = %w[claude codex muse].freeze
   WORKER_ROLES = %w[control execution].freeze
+  EXECUTION_ROLE = "execution"
   OPERATIONS = %w[login status_check].freeze
   ACTIVE_STATUSES = %w[queued running waiting].freeze
   TERMINAL_STATUSES = %w[succeeded failed cancelled expired].freeze

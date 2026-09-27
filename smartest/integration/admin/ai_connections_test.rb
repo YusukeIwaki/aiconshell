@@ -8,27 +8,43 @@ test("ai connections index requires admin auth") do |http:|
     http.get "/admin/ai_connections"
     expect(http.last_response.status).to eq(401)
 
-    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "control" }
+    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "execution" }
     expect(http.last_response.status).to eq(401)
 
-    http.post "/admin/ai_connections/status_check", { provider: "claude", worker_role: "control" }
+    http.post "/admin/ai_connections/status_check", { provider: "claude", worker_role: "execution" }
     expect(http.last_response.status).to eq(401)
   end
 end
 
-test("ai connections index lists all six provider and role pairs in Japanese") do |http:|
+test("ai connections index lists three providers on the shared execution worker") do |http:|
   AdminTestSupport.as_admin(http) do
     http.get "/admin/ai_connections"
 
     expect(http.last_response.status).to eq(200)
     body = http.last_response.body
+    # Provider sections are real rows, not description text: one header per
+    # provider, each bound to the execution worker only.
+    expect(body.scan("Claude × execution worker").size).to eq(1)
+    expect(body.scan("Codex × execution worker").size).to eq(1)
+    expect(body.scan("Muse Code × execution worker").size).to eq(1)
     %w[claude codex muse].each do |provider|
-      expect(body.include?(provider)).to eq(true)
+      expect(body.scan("provider: <code class=\"admin-env\">#{provider}</code>").size).to eq(1)
     end
-    %w[control execution].each do |role|
-      expect(body.include?(role)).to eq(true)
+    expect(body.scan("provider: <code class=\"admin-env\">").size).to eq(3)
+    expect(body.scan("worker: <code class=\"admin-env\">execution</code>").size).to eq(3)
+    expect(body.include?("worker: <code class=\"admin-env\">control</code>")).to eq(false)
+    # Each provider owns login/status forms for execution; no control forms exist.
+    %w[claude codex muse].each do |provider|
+      login_form = body[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=#{provider}(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+      expect(login_form.nil?).to eq(false)
+      status_form = body[/<form[^>]*action="\/admin\/ai_connections\/status_check\?provider=#{provider}(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+      expect(status_form.nil?).to eq(false)
     end
-    expect(body.include?("別の永続volume")).to eq(true)
+    expect(body.scan(/worker_role=control/).size).to eq(0)
+    # Single-worker contract: no per-role rows, no control worker display.
+    expect(body.include?("control worker")).to eq(false)
+    expect(body.include?("別の永続volume")).to eq(false)
+    expect(body.include?("1回の provider ログイン")).to eq(true)
     expect(body.include?("対話層")).to eq(true)
     expect(body.include?("整理層")).to eq(true)
     expect(body.include?("実行層")).to eq(true)
@@ -71,17 +87,17 @@ end
 
 test("login start creates one session and one role job, double submit reuses it") do |http:|
   AdminTestSupport.as_admin(http) do
-    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "control" }
+    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "execution" }
     expect(http.last_response.status).to eq(302)
 
-    first = AiAuthSession.active.find_by(provider: "claude", worker_role: "control")
+    first = AiAuthSession.active.find_by(provider: "claude", worker_role: "execution")
     expect(first.nil?).to eq(false)
     expect(first.operation).to eq("login")
-    expect(SolidQueue::Job.where(class_name: "AiAuthJob", queue_name: "ai_auth_control").count).to eq(1)
+    expect(SolidQueue::Job.where(class_name: "AiAuthJob", queue_name: "ai_auth_execution").count).to eq(1)
 
-    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "control" }
+    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "execution" }
     expect(http.last_response.status).to eq(302)
-    expect(AiAuthSession.active.where(provider: "claude", worker_role: "control").count).to eq(1)
+    expect(AiAuthSession.active.where(provider: "claude", worker_role: "execution").count).to eq(1)
     expect(SolidQueue::Job.where(class_name: "AiAuthJob").count).to eq(1)
 
     http.get "/admin/ai_connections"
@@ -105,7 +121,7 @@ end
 
 test("status check and login are rejected for unknown provider or role") do |http:|
   AdminTestSupport.as_admin(http) do
-    http.post "/admin/ai_connections/login", { provider: "gpt", worker_role: "control" }
+    http.post "/admin/ai_connections/login", { provider: "gpt", worker_role: "execution" }
     expect(http.last_response.status).to eq(302)
     expect(AiAuthSession.count).to eq(0)
 
@@ -147,7 +163,7 @@ end
 
 test("code input renders once, keeps #state, then shows received") do |http:|
   needing = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_login(provider: "claude", worker_role: "control")
+    .request_login(provider: "claude", worker_role: "execution")
   needing.update_columns(
     status: "waiting",
     encrypted_challenge: AiAuth::SecretBox.default.encrypt(
@@ -194,7 +210,7 @@ end
 
 test("cancel from the UI finishes queued rows so restart works") do |http:|
   session = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_login(provider: "muse", worker_role: "control")
+    .request_login(provider: "muse", worker_role: "execution")
 
   AdminTestSupport.as_admin(http) do
     http.post "/admin/ai_connections/#{session.uuid}/cancel"
@@ -202,15 +218,15 @@ test("cancel from the UI finishes queued rows so restart works") do |http:|
     expect(session.reload.status).to eq("cancelled")
 
     # The slot is free: a fresh login starts a new session.
-    http.post "/admin/ai_connections/login", { provider: "muse", worker_role: "control" }
+    http.post "/admin/ai_connections/login", { provider: "muse", worker_role: "execution" }
     expect(http.last_response.status).to eq(302)
-    expect(AiAuthSession.active.find_by(provider: "muse", worker_role: "control").nil?).to eq(false)
+    expect(AiAuthSession.active.find_by(provider: "muse", worker_role: "execution").nil?).to eq(false)
   end
 end
 
 test("cancel flags running rows and hides input immediately") do |http:|
   session = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_login(provider: "claude", worker_role: "control")
+    .request_login(provider: "claude", worker_role: "execution")
   session.update_columns(
     status: "waiting",
     claim_token: SecureRandom.uuid,
@@ -256,7 +272,7 @@ end
 
 test("terminal failure without snapshot still shows safe guidance and retry") do |http:|
   session = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_status(provider: "muse", worker_role: "control")
+    .request_status(provider: "muse", worker_role: "execution")
   session.update_columns(status: "failed", result_state: nil,
                          result_error_code: "runtime_unavailable",
                          finished_at: Time.current, updated_at: Time.current)
@@ -291,9 +307,9 @@ test("cancelled terminal stays visible with retry actions") do |http:|
 end
 
 test("snapshot states and safe errors render in Japanese, raw text never leaks") do |http:|
-  AiConnection.create!(provider: "claude", worker_role: "control",
+  AiConnection.create!(provider: "claude", worker_role: "execution",
                        state: "connected", checked_at: Time.current)
-  AiConnection.create!(provider: "codex", worker_role: "control",
+  AiConnection.create!(provider: "codex", worker_role: "execution",
                        state: "unavailable", error_code: "raw stderr SECRET-999",
                        checked_at: Time.current)
 
@@ -344,11 +360,11 @@ end
 
 test("CSRF: connections POST without token is rejected") do |http:|
   session = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_login(provider: "claude", worker_role: "control")
+    .request_login(provider: "claude", worker_role: "execution")
 
   AdminTestSupport.as_admin(http) do
     AdminTestSupport.with_forgery_protection do
-      http.post "/admin/ai_connections/login", { provider: "codex", worker_role: "control" }
+      http.post "/admin/ai_connections/login", { provider: "codex", worker_role: "execution" }
       expect(http.last_response.status).to eq(422)
 
       http.post "/admin/ai_connections/#{session.uuid}/cancel"
@@ -364,16 +380,77 @@ test("CSRF: connections POST with form token succeeds") do |http:|
       http.get "/admin/ai_connections"
       body = http.last_response.body
       # Per-form tokens are tied to the action URL, so extract the token from
-      # the exact claude/control login form we are about to submit.
+      # the exact claude/execution login form we are about to submit.
       form = body[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=claude[^"]*"[^>]*>.*?<\/form>/m, 0]
       expect(form.nil?).to eq(false)
       token = form[/name="authenticity_token" value="([^"]+)"/, 1]
       expect(token.nil?).to eq(false)
 
-      http.post "/admin/ai_connections/login?provider=claude&worker_role=control",
+      http.post "/admin/ai_connections/login?provider=claude&worker_role=execution",
         { authenticity_token: token }
       expect(http.last_response.status).to eq(302)
-      expect(AiAuthSession.active.find_by(provider: "claude", worker_role: "control").nil?).to eq(false)
+      expect(AiAuthSession.active.find_by(provider: "claude", worker_role: "execution").nil?).to eq(false)
     end
+  end
+end
+
+test("control-targeted login and status are rejected without rows or jobs") do |http:|
+  AdminTestSupport.as_admin(http) do
+    http.post "/admin/ai_connections/login", { provider: "claude", worker_role: "control" }
+    expect(http.last_response.status).to eq(302)
+    http.post "/admin/ai_connections/status_check", { provider: "codex", worker_role: "control" }
+    expect(http.last_response.status).to eq(302)
+
+    expect(AiAuthSession.where(worker_role: "control").count).to eq(0)
+    expect(SolidQueue::Job.where(class_name: "AiAuthJob").count).to eq(0)
+
+    http.follow_redirect!
+    expect(http.last_response.body.include?("役割が不正")).to eq(true)
+  end
+end
+
+test("legacy control snapshots are kept but never shown as current connections") do |http:|
+  # claude has only a legacy control snapshot; codex has divergent snapshots
+  # (control says connected, execution says disconnected).
+  AiConnection.create!(provider: "claude", worker_role: "control",
+                       state: "connected", checked_at: Time.current)
+  AiConnection.create!(provider: "codex", worker_role: "control",
+                       state: "connected", checked_at: Time.current)
+  AiConnection.create!(provider: "codex", worker_role: "execution",
+                       state: "disconnected", checked_at: Time.current)
+
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/ai_connections"
+
+    expect(http.last_response.status).to eq(200)
+    body = http.last_response.body
+    claude_at = body.index("Claude × execution worker")
+    codex_at = body.index("Codex × execution worker")
+    muse_at = body.index("Muse Code × execution worker")
+    expect(claude_at.nil?).to eq(false)
+    expect(codex_at.nil?).to eq(false)
+    expect(muse_at.nil?).to eq(false)
+    expect(claude_at < codex_at).to eq(true)
+    expect(codex_at < muse_at).to eq(true)
+    claude_card = body[claude_at...codex_at]
+    codex_card = body[codex_at...muse_at]
+    # The claude execution row has no snapshot: unknown, not connected.
+    expect(claude_card.include?("未確認")).to eq(true)
+    expect(claude_card.include?("接続済み")).to eq(false)
+    expect(claude_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
+    # The codex row follows its execution snapshot, not the legacy control one.
+    expect(codex_card.include?("未連携")).to eq(true)
+    expect(codex_card.include?("接続済み")).to eq(false)
+    expect(codex_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
+    codex_login = codex_card[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=codex(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+    expect(codex_login.nil?).to eq(false)
+    # No row renders a control snapshot as current.
+    expect(body.include?("接続済み")).to eq(false)
+    expect(body.include?("control worker")).to eq(false)
+    expect(body.scan(/worker_role=control/).size).to eq(0)
+    # History is preserved in the database.
+    expect(AiConnection.find_by(provider: "claude", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution").state).to eq("disconnected")
   end
 end

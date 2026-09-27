@@ -3,20 +3,30 @@
 require "db_helper"
 require_relative "ai_auth_test_support"
 
-def request_login(provider: "claude", role: "control")
+def request_login(provider: "claude", role: "execution")
   AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
     .request_login(provider: provider, worker_role: role)
 end
 
-def request_status(provider: "codex", role: "control")
+def request_status(provider: "codex", role: "execution")
   AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
     .request_status(provider: provider, worker_role: role)
 end
 
+# Legacy control rows predate the single-worker switch (issue 20). The
+# request service rejects new control operations, so these rows are built
+# directly; the model still accepts them for revocation.
+def legacy_control_session(provider: "claude", operation: "login")
+  AiAuthSession.create!(
+    uuid: SecureRandom.uuid, provider: provider, worker_role: "control",
+    operation: operation, status: "queued", expires_at: 10.minutes.from_now
+  )
+end
+
 test("status check records a worker-confirmed snapshot and clears no secrets") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_status(provider: "codex", role: "control")
+  with_worker_role("execution") do
+    session = request_status(provider: "codex", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
     )
@@ -26,7 +36,7 @@ test("status check records a worker-confirmed snapshot and clears no secrets") d
 
     expect(result.ok).to eq(true)
     expect(session.reload.status).to eq("succeeded")
-    snapshot = AiConnection.find_by(provider: "codex", worker_role: "control")
+    snapshot = AiConnection.find_by(provider: "codex", worker_role: "execution")
     expect(snapshot.state).to eq("connected")
     expect(snapshot.checked_at.nil?).to eq(false)
     expect(snapshot.error_code).to eq(nil)
@@ -55,8 +65,8 @@ end
 
 test("login consumes a submitted code exactly once and wipes secrets") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     # Full flow in one thread: the fake publishes a challenge, the ops
     # service submits the code like the admin UI, then the worker consumes
     # it exactly once through the input callback.
@@ -92,7 +102,7 @@ test("login consumes a submitted code exactly once and wipes secrets") do |db:|
     # Second consumption is impossible: the code was cleared atomically.
     expect(reloaded.consume_input_code!).to eq(nil)
 
-    snapshot = AiConnection.find_by(provider: "claude", worker_role: "control")
+    snapshot = AiConnection.find_by(provider: "claude", worker_role: "execution")
     expect(snapshot.state).to eq("connected")
   end
 end
@@ -115,8 +125,8 @@ end
 
 test("cancel during login reports cancelled and wipes secrets without snapshot") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "muse", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "muse", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
         on_challenge.call({
@@ -139,14 +149,14 @@ test("cancel during login reports cancelled and wipes secrets without snapshot")
     expect(reloaded.status).to eq("cancelled")
     expect(reloaded.encrypted_challenge).to eq(nil)
     expect(reloaded.encrypted_input_code).to eq(nil)
-    expect(AiConnection.find_by(provider: "muse", worker_role: "control")).to eq(nil)
+    expect(AiConnection.find_by(provider: "muse", worker_role: "execution")).to eq(nil)
   end
 end
 
 test("duplicate delivery never double-runs a claimed session") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_status(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_status(provider: "claude", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "claude" => { "state" => "connected", "error_code" => nil } }
     )
@@ -162,10 +172,10 @@ test("duplicate delivery never double-runs a claimed session") do |db:|
   end
 end
 
-test("role mismatch fails safe without running the runtime") do |db:|
+test("legacy control sessions fail safe without running the runtime") do |db:|
   expect(db.transaction_open?).to eq(true)
   with_worker_role("execution") do
-    session = request_login(provider: "claude", role: "control")
+    session = legacy_control_session(provider: "claude")
     runner = AiAuthTestSupport::FakeAuthRunner.immediate
 
     result = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
@@ -176,13 +186,31 @@ test("role mismatch fails safe without running the runtime") do |db:|
     expect(session.reload.status).to eq("failed")
     expect(session.result_error_code).to eq("role_mismatch")
     expect(AiConnection.find_by(provider: "claude", worker_role: "control")).to eq(nil)
+    # Control state is never copied to the execution snapshot.
+    expect(AiConnection.find_by(provider: "claude", worker_role: "execution")).to eq(nil)
+  end
+end
+
+test("execution sessions reject the wrong worker without running the runtime") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_login(provider: "claude", role: "execution")
+    runner = AiAuthTestSupport::FakeAuthRunner.immediate
+
+    result = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
+
+    expect(result.ok).to eq(false)
+    expect(result.code).to eq(:role_mismatch)
+    expect(runner.login_calls.size).to eq(0)
+    expect(session.reload.status).to eq("failed")
+    expect(session.result_error_code).to eq("role_mismatch")
   end
 end
 
 test("missing worker role fails safe without running the runtime") do |db:|
   expect(db.transaction_open?).to eq(true)
   with_worker_role(nil) do
-    session = request_status(provider: "claude", role: "control")
+    session = request_status(provider: "claude", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "claude" => { "state" => "connected", "error_code" => nil } }
     )
@@ -197,8 +225,8 @@ end
 
 test("expired sessions never run the runtime") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     session.update_columns(expires_at: 1.second.ago, updated_at: Time.current)
     runner = AiAuthTestSupport::FakeAuthRunner.immediate
 
@@ -212,21 +240,21 @@ end
 
 test("old jobs cannot overwrite a newer snapshot (fencing)") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    first = request_status(provider: "codex", role: "control")
+  with_worker_role("execution") do
+    first = request_status(provider: "codex", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
     )
     service = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new)
     expect(service.call(first.uuid).ok).to eq(true)
-    expect(AiConnection.find_by(provider: "codex", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution").state).to eq("connected")
 
-    second = request_status(provider: "codex", role: "control")
+    second = request_status(provider: "codex", role: "execution")
     failing = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "failed", "error_code" => "provider_error" } }
     )
     expect(AiAuth::WorkerService.new(runner: failing, event_sink: WorkflowFakes::FakeEventSink.new).call(second.uuid).ok).to eq(true)
-    expect(AiConnection.find_by(provider: "codex", worker_role: "control").state).to eq("failed")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution").state).to eq("failed")
 
     # Replay the old claim directly: fencing must refuse the stale write.
     stale = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new)
@@ -234,14 +262,14 @@ test("old jobs cannot overwrite a newer snapshot (fencing)") do |db:|
                         status: "succeeded", result_state: "connected",
                         result_error: nil, snapshot: true)
     expect(replay.code).to eq(:duplicate_delivery)
-    expect(AiConnection.find_by(provider: "codex", worker_role: "control").state).to eq("failed")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution").state).to eq("failed")
   end
 end
 
 test("invalid challenge URLs are rejected and the session fails safe") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     bad = AiAuthTestSupport::FakeAuthRunner.new(
       login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
         begin
@@ -258,7 +286,7 @@ test("invalid challenge URLs are rejected and the session fails safe") do |db:|
     expect(result.ok).to eq(false)
     expect(session.reload.status).to eq("failed")
     expect(session.encrypted_challenge).to eq(nil)
-    snapshot = AiConnection.find_by(provider: "claude", worker_role: "control")
+    snapshot = AiConnection.find_by(provider: "claude", worker_role: "execution")
     expect(snapshot.state).to eq("failed")
     expect(snapshot.error_code).to eq("callback_failed")
   end
@@ -266,8 +294,8 @@ end
 
 test("runtime exceptions become a sanitized failure, never raw text") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     exploding = AiAuthTestSupport::FakeAuthRunner.new(
       login_behavior: ->(*) { raise StandardError, "cli blew up with token=SECRET-123" }
     )
@@ -284,8 +312,8 @@ end
 
 test("missing runtime fails as unavailable without a production stub") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_status(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_status(provider: "claude", role: "execution")
 
     result = AiAuth::WorkerService.new(runner_proc: -> { nil },
                                        event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
@@ -298,8 +326,8 @@ end
 
 test("heartbeat writes are throttled to one per 10 seconds") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     base = Time.current
     fake_clock = Class.new do
       attr_accessor :now_time
@@ -329,8 +357,8 @@ end
 
 test("settle converts stale connected to cancelled when cancel lands just before write") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
         # Simulate a cancel arriving after the runtime produced connected
@@ -349,14 +377,14 @@ test("settle converts stale connected to cancelled when cancel lands just before
     expect(reloaded.result_state).to eq("cancelled")
     expect(reloaded.encrypted_challenge).to eq(nil)
     expect(reloaded.encrypted_input_code).to eq(nil)
-    expect(AiConnection.find_by(provider: "claude", worker_role: "control")).to eq(nil)
+    expect(AiConnection.find_by(provider: "claude", worker_role: "execution")).to eq(nil)
   end
 end
 
 test("settle converts stale connected to expired when deadline lands just before write") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "codex", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "codex", role: "execution")
     base = Time.current
     fake_clock = Class.new do
       attr_accessor :now_time
@@ -380,14 +408,14 @@ test("settle converts stale connected to expired when deadline lands just before
     reloaded = session.reload
     expect(reloaded.status).to eq("expired")
     expect(reloaded.encrypted_challenge).to eq(nil)
-    expect(AiConnection.find_by(provider: "codex", worker_role: "control")).to eq(nil)
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution")).to eq(nil)
   end
 end
 
 test("settle re-evaluates now after the row lock, so lock-wait expiry wins") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     token = SecureRandom.uuid
     base = Time.current
     session.update_columns(status: "running", claim_token: token,
@@ -423,14 +451,14 @@ test("settle re-evaluates now after the row lock, so lock-wait expiry wins") do 
     reloaded = session.reload
     expect(reloaded.status).to eq("expired")
     expect(reloaded.encrypted_challenge).to eq(nil)
-    expect(AiConnection.find_by(provider: "claude", worker_role: "control")).to eq(nil)
+    expect(AiConnection.find_by(provider: "claude", worker_role: "execution")).to eq(nil)
   end
 end
 
 test("unknown error codes collapse to provider_error and never persist raw text") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_status(provider: "muse", role: "control")
+  with_worker_role("execution") do
+    session = request_status(provider: "muse", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "muse" => { "state" => "failed", "error_code" => "secret_sentinel_abc" } }
     )
@@ -440,7 +468,7 @@ test("unknown error codes collapse to provider_error and never persist raw text"
     expect(result.ok).to eq(true)
     reloaded = session.reload
     expect(reloaded.result_error_code).to eq("provider_error")
-    snapshot = AiConnection.find_by(provider: "muse", worker_role: "control")
+    snapshot = AiConnection.find_by(provider: "muse", worker_role: "execution")
     expect(snapshot.error_code).to eq("provider_error")
     expect(snapshot.error_code.include?("sentinel")).to eq(false)
   end
@@ -448,8 +476,8 @@ end
 
 test("input consume keeps submitted stamp while clearing ciphertext once") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_login(provider: "claude", role: "control")
+  with_worker_role("execution") do
+    session = request_login(provider: "claude", role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
         on_challenge.call({
@@ -481,26 +509,26 @@ end
 
 test("snapshot fencing refuses an old write after a newer result") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    first = request_status(provider: "codex", role: "control")
+  with_worker_role("execution") do
+    first = request_status(provider: "codex", role: "execution")
     connected = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
     )
     expect(AiAuth::WorkerService.new(runner: connected, event_sink: WorkflowFakes::FakeEventSink.new).call(first.uuid).ok).to eq(true)
 
-    second = request_status(provider: "codex", role: "control")
+    second = request_status(provider: "codex", role: "execution")
     failing = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "failed", "error_code" => "spawn_failed" } }
     )
     expect(AiAuth::WorkerService.new(runner: failing, event_sink: WorkflowFakes::FakeEventSink.new).call(second.uuid).ok).to eq(true)
-    snapshot = AiConnection.find_by(provider: "codex", worker_role: "control")
+    snapshot = AiConnection.find_by(provider: "codex", worker_role: "execution")
     expect(snapshot.state).to eq("failed")
     expect(snapshot.last_session_id).to eq(second.id)
 
     # A delayed write from the older session must not overwrite.
     service = AiAuth::WorkerService.new(runner: connected, event_sink: WorkflowFakes::FakeEventSink.new)
     service.send(:update_snapshot, first.reload, "connected", nil, Time.current)
-    after = AiConnection.find_by(provider: "codex", worker_role: "control")
+    after = AiConnection.find_by(provider: "codex", worker_role: "execution")
     expect(after.state).to eq("failed")
     expect(after.last_session_id).to eq(second.id)
   end
@@ -575,17 +603,8 @@ test("concurrent first inserts from separate connections do not raise and fence 
   end
 end
 
-test("worker emits use coordination for control and execution for execution") do |db:|
+test("worker emits use the execution layer; legacy control emits nothing") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
-    session = request_status(provider: "claude", role: "control")
-    sink = WorkflowFakes::FakeEventSink.new
-    runner = AiAuthTestSupport::FakeAuthRunner.new(
-      status_results: { "claude" => { "state" => "connected", "error_code" => nil } }
-    )
-    AiAuth::WorkerService.new(runner: runner, event_sink: sink).call(session.uuid)
-    expect(sink.events.last[:layer]).to eq("coordination")
-  end
   with_worker_role("execution") do
     session = request_status(provider: "claude", role: "execution")
     sink = WorkflowFakes::FakeEventSink.new
@@ -594,5 +613,15 @@ test("worker emits use coordination for control and execution for execution") do
     )
     AiAuth::WorkerService.new(runner: runner, event_sink: sink).call(session.uuid)
     expect(sink.events.last[:layer]).to eq("execution")
+  end
+  with_worker_role("execution") do
+    legacy = legacy_control_session(provider: "codex", operation: "status_check")
+    sink = WorkflowFakes::FakeEventSink.new
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
+    )
+    result = AiAuth::WorkerService.new(runner: runner, event_sink: sink).call(legacy.uuid)
+    expect(result.code).to eq(:role_mismatch)
+    expect(sink.events.empty?).to eq(true)
   end
 end

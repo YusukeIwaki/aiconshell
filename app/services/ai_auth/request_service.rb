@@ -18,7 +18,11 @@ module AiAuth
     MAX_CODE_CHARS = MAX_CODE_BYTES
 
     PROVIDERS = %w[claude codex muse].freeze
-    WORKER_ROLES = %w[control execution].freeze
+    # Single-worker contract (issue 20): new auth operations run only on
+    # the shared execution worker. Legacy control rows may still exist in
+    # the database and are revoked via revoke_legacy_control!, never run.
+    WORKER_ROLES = %w[execution].freeze
+    LEGACY_CONTROL_QUEUE = "ai_auth_control"
 
     def initialize(event_sink: WorkflowEvents, clock: Time, job_class: nil)
       @event_sink = event_sink
@@ -103,6 +107,35 @@ module AiAuth
         end
         session
       end
+    end
+
+    # Idempotent cutover entry for the single-execution-worker switch
+    # (issue 20). Revokes in-flight legacy control sessions and discards
+    # stranded ai_auth_control jobs. Run only AFTER the old control worker
+    # is stopped: a stopped worker can never settle afterwards, and any
+    # late settle from a still-running worker lands on a terminal row and
+    # is refused by claim fencing. Never touches execution sessions,
+    # Task/TaskRun, LayerPolicy, or non-auth queues. Never copies a
+    # control snapshot to execution. Safe to run repeatedly; returns the
+    # revoked-session and discarded-job counts.
+    def revoke_legacy_control!
+      revoked = 0
+      AiAuthSession.where(worker_role: "control", status: AiAuthSession::ACTIVE_STATUSES).find_each do |session|
+        session.with_lock do
+          next unless session.active? && session.worker_role == "control"
+
+          now_time = now
+          if session.expired_due?(now_time)
+            close_as(session, "expired", "expired", "expired", now_time,
+                     kind: "auth.expired", message: "旧control認証操作が期限切れになりました")
+          else
+            close_as(session, "cancelled", "cancelled", "cancelled", now_time,
+                     kind: "auth.cancelled", message: "旧control認証操作を取り消しました")
+          end
+          revoked += 1
+        end
+      end
+      { revoked: revoked, discarded_jobs: discard_legacy_control_jobs }
     end
 
     # Mark expired and stale-writer sessions terminal so the next operation
@@ -197,7 +230,27 @@ module AiAuth
 
     def enqueue(session)
       job = @job_class || AiAuthJob
-      job.set(queue: "ai_auth_#{session.worker_role}").perform_later(session.uuid)
+      job.set(queue: "ai_auth_execution").perform_later(session.uuid)
+    end
+
+    # Discard only stranded legacy auth jobs. Scoped to AiAuthJob rows on
+    # the legacy control queue; business jobs and other queues are never
+    # matched. Execution rows referencing those jobs are removed first so
+    # no orphan executions keep the queue alive.
+    def discard_legacy_control_jobs
+      job_ids = SolidQueue::Job.where(class_name: "AiAuthJob", queue_name: LEGACY_CONTROL_QUEUE).pluck(:id)
+      return 0 if job_ids.empty?
+
+      [
+        SolidQueue::ReadyExecution,
+        SolidQueue::ClaimedExecution,
+        SolidQueue::ScheduledExecution,
+        SolidQueue::FailedExecution,
+        SolidQueue::BlockedExecution
+      ].each do |execution_class|
+        execution_class.where(job_id: job_ids).delete_all
+      end
+      SolidQueue::Job.where(id: job_ids).delete_all
     end
 
     # Web-originated ops intents use the interaction layer (valid Envelope
