@@ -25,6 +25,10 @@ Rails の運用サービスは `Oauth::AuthService` / `Oauth::TokenService` /
 `Oauth::CredentialProvider`、永続モデルは `OauthConnection` /
 `OauthAuthAttempt` である。`lib/aiconshell` は Zeitwerk 管理外であり、
 各ファイルが明示 `require` する（`docs/architecture.md` の Ruby ポート契約）。
+OAuth 定数を要するファイルは完全な root（`aiconshell/oauth`）を無条件に
+require し、部分ファイルの `defined?` ガードで済ませない。1 定数が定義済みでも
+State / Pkce / TokenSet / SecretBox / PROVIDERS まで読み込み済みとは限らないため、
+通常 Rails boot と pure plugin 入口のどちらから入っても公開ポートが揃う。
 
 ```ruby
 require "aiconshell/oauth"

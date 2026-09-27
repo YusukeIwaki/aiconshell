@@ -2,7 +2,7 @@
 
 require "json"
 require_relative "plugin_access"
-require_relative "oauth_context" unless defined?(Interaction::OauthContext)
+require_relative "oauth_context"
 
 module Interaction
   # Sole safe on-demand read path from Coordination to plugin operations.

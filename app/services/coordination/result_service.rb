@@ -93,6 +93,13 @@ module Coordination
           return reject(task_id, :feedback_required) unless pending.exists?
         end
 
+        # One verified binding per OAuth plugin, fixed here and reused
+        # for every create below: validate-plus-create never re-resolves
+        # (a second lookup could observe a replaced connection and store
+        # an unchecked or foreign snapshot). A disconnect/replacement
+        # between the typed read and this result rejects instead of
+        # continuing as another principal.
+        verified_bindings = {}
         actions.each_with_index do |action, index|
           verdict = @validator.validate(plugin: action["plugin"], operation: action["operation"], input: action["input"])
           unless verdict.ok?
@@ -100,10 +107,14 @@ module Coordination
             return Result.new(ok: false, code: verdict.code, action_index: index)
           end
           if Interaction::OauthContext.oauth_plugin?(action["plugin"].to_s)
-            binding_result = oauth_binding_for(action["plugin"].to_s, oauth_bindings)
-            unless binding_result[:ok]
-              emit_rejected(task.id, binding_result[:code], action_index: index, action_count: actions.size)
-              return Result.new(ok: false, code: binding_result[:code], action_index: index)
+            plugin_name = action["plugin"].to_s
+            unless verified_bindings.key?(plugin_name)
+              binding_result = oauth_binding_for(plugin_name, oauth_bindings)
+              unless binding_result[:ok]
+                emit_rejected(task.id, binding_result[:code], action_index: index, action_count: actions.size)
+                return Result.new(ok: false, code: binding_result[:code], action_index: index)
+              end
+              verified_bindings[plugin_name] = binding_result[:binding]
             end
           end
         end
@@ -117,8 +128,8 @@ module Coordination
             delivery_batch_key: batch_key, status: "pending", task: task
           }
           if Interaction::OauthContext.oauth_plugin?(action["plugin"].to_s)
-            stored = oauth_binding_for(action["plugin"].to_s, oauth_bindings)[:binding]
-            attrs[:oauth_binding] = stored if OutboundAction.column_names.include?("oauth_binding")
+            stored = verified_bindings[action["plugin"].to_s]
+            attrs[:oauth_binding] = stored if OutboundAction.column_names.include?("oauth_binding") && !stored.nil?
           end
           OutboundAction.create!(attrs)
         end

@@ -34,19 +34,22 @@ module Interaction
     # True when an in-flight/uncertain action covers the same connection
     # and destination as a poll candidate, so the candidate must be held
     # (not ingested as new work and not skipped via cursor advance).
+    # The connection match stays generation-pinned (send permission):
+    # another connection's poll never holds for this action, and this
+    # action never holds another connection's poll.
     def hold_candidate?(event, action, poll_binding: nil)
       return false unless event.is_a?(Hash) && action.respond_to?(:plugin)
       return false unless event["plugin"].to_s == action.plugin.to_s
       return false unless %w[pending sending uncertain].include?(action.status.to_s)
       return false unless binding_matches?(action, poll_binding)
 
-      poll_destination = poll_destination_for(event)
-      action_destination = action_destination_for(action)
-      return false if poll_destination.nil? || action_destination.nil?
-
-      poll_destination == action_destination
+      hold_keys_match?(hold_key_for_event(event), hold_key_for_action(action), event)
     end
 
+    # Generation-pinned connection match for send permission and
+    # in-flight holds: connection id, generation, provider, principal,
+    # and tenant/cloud must all agree. A disconnect/replacement fails
+    # closed instead of sending or holding as another principal.
     def binding_matches?(action, poll_binding)
       return true if poll_binding.nil? && action.oauth_binding.nil?
       return false if poll_binding.nil? || action.oauth_binding.nil?
@@ -57,6 +60,31 @@ module Interaction
       %w[connection_id generation provider principal tenant cloud].all? do |key|
         get.call(stored, key).to_s == get.call(poll, key).to_s &&
           !(key == "provider" && get.call(stored, key).to_s.empty?)
+      end
+    end
+
+    # Generation-independent receipt scope: the same provider resource
+    # space (provider plus the fixed tenant/cloud). Reconnecting (new
+    # generation, connection id, or even principal) never changes it, so
+    # a pre-reconnect app post re-fetched after a cursor reset is still
+    # recognized as the same external echo. A different cloud, tenant,
+    # or unknown scope never matches, so same numeric ids on other
+    # resources are never suppressed. Receipt identity (resource plus
+    # external id plus actually sent content) is checked separately by
+    # self_post?; this is only the scope gate in front of it.
+    def receipt_scope_matches?(action, poll_binding)
+      return false if action.nil? || poll_binding.nil?
+      return false unless action.respond_to?(:oauth_binding)
+
+      stored = action.oauth_binding.is_a?(Hash) ? action.oauth_binding : {}
+      poll = poll_binding.is_a?(Hash) ? poll_binding : {}
+      get = ->(hash, key) { hash[key.to_s].nil? ? hash[key.to_sym] : hash[key.to_s] }
+      provider = get.call(poll, "provider").to_s
+      return false if provider.empty?
+      return false unless get.call(stored, "provider").to_s == provider
+
+      %w[tenant cloud].all? do |key|
+        normalize_scope(get.call(stored, key)) == normalize_scope(get.call(poll, key))
       end
     end
 
@@ -124,6 +152,68 @@ module Interaction
       else
         false
       end
+    end
+
+    # -- hold keys (per-connection-plus-destination) -----------------------
+    #
+    # Jira holds are per issue, never per project: a pending reply to
+    # issue:PROJ-1 must not hold poll candidates for issue:PROJ-2. A
+    # pending create_issue (whose issue key is unknowable before the
+    # write) holds its project instead. Teams holds stay at channel/chat
+    # granularity. These keys are for hold scoping only; operator
+    # allowlist checks keep using PluginAccess.destination.
+    def hold_key_for_event(event)
+      case event["plugin"].to_s
+      when "jira_oauth"
+        resource = event["resource_id"].to_s
+        return resource if /\Aissue:[A-Za-z][A-Za-z0-9_]*-\d+\z/.match?(resource)
+
+        nil
+      when "teams_oauth"
+        poll_destination_for(event)
+      else
+        nil
+      end
+    end
+
+    def hold_key_for_action(action)
+      case action.plugin.to_s
+      when "jira_oauth"
+        input = action.input.is_a?(Hash) ? action.input.transform_keys(&:to_s) : {}
+        if action.operation.to_s == "reply"
+          resource = input["resource_id"].to_s
+          return resource if /\Aissue:[A-Za-z][A-Za-z0-9_]*-\d+\z/.match?(resource)
+
+          nil
+        else
+          scope = input["scope"].to_s
+          return "project:#{scope.upcase}" if /\A[A-Za-z][A-Za-z0-9_]*\z/.match?(scope)
+
+          nil
+        end
+      when "teams_oauth"
+        action_destination_for(action)
+      else
+        nil
+      end
+    end
+
+    def hold_keys_match?(event_key, action_key, event)
+      return false if event_key.nil? || action_key.nil?
+      return true if event_key == action_key
+
+      # A pending create_issue covers its whole project: any polled
+      # issue event in that project is held with it.
+      if action_key.start_with?("project:")
+        match = /\Aissue:([A-Za-z][A-Za-z0-9_]*)-\d+\z/.match(event["resource_id"].to_s)
+        return !match.nil? && "project:#{match[1].upcase}" == action_key
+      end
+
+      false
+    end
+
+    def normalize_scope(value)
+      value.nil? ? nil : value.to_s
     end
 
     # -- destinations for hold scoping ---------------------------------

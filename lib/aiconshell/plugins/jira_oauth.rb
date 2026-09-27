@@ -5,10 +5,11 @@ require_relative "errors"
 require_relative "schemas"
 require_relative "http"
 require_relative "jira"
-require_relative "../oauth/errors"
-require_relative "../oauth/binding"
-require_relative "../oauth/config"
-require_relative "../oauth/atlassian"
+# Explicit full OAuth root (not partial files): constants such as State,
+# Pkce, TokenSet, SecretBox, PROVIDERS, and ErrorCodes must be loaded even
+# when this adapter file is required before anything else. A defined?
+# guard on one constant (Binding, Atlassian, ...) would hide the rest.
+require_relative "../oauth"
 
 module Aiconshell
   module Plugins

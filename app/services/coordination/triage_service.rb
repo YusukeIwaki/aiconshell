@@ -131,8 +131,17 @@ module Coordination
               task.update!(next_action_at: now)
               task.touch(time: now)
             else
-              task = Task.create!(title: title_from(event), description: body_from(event), status: "inbox", priority: 0,
-                                  source_plugin: event.plugin, source_resource_id: event.resource_id)
+              # The new Task keeps the event's fetch-time source binding
+              # (never the current connection): a later reply is fenced
+              # against the connection that produced the event. An
+              # existing open Task keeps the binding it was created with.
+              attrs = { title: title_from(event), description: body_from(event), status: "inbox", priority: 0,
+                        source_plugin: event.plugin, source_resource_id: event.resource_id }
+              if Task.column_names.include?("oauth_binding") && event.respond_to?(:oauth_binding) &&
+                  !event.oauth_binding.nil?
+                attrs[:oauth_binding] = event.oauth_binding
+              end
+              task = Task.create!(attrs)
             end
             event.update!(task: task, processed_at: now, last_error: nil)
             count += 1
@@ -519,25 +528,32 @@ module Coordination
     end
 
     # External-event Task → reply fencing: an OAuth reply proceeds only
-    # when the triage-start snapshot still matches the current connection.
-    # A disconnect/replacement in between stops instead of sending as
-    # another principal. The snapshot is stored for enqueue→delivery fencing.
-    def oauth_reply_current?(task, oauth_bindings)
+    # when the Task's own fetch-time source binding still matches the
+    # current connection. The binding was fixed when the poll fetched
+    # the event and stored on the Task at creation; it is never re-taken
+    # at triage start, so a disconnect/replacement between fetch and
+    # reply stops instead of sending as another principal. Each Task is
+    # fenced by its own binding: same-provider Tasks from different
+    # generations never mix through one plugin-wide snapshot.
+    # The triage-start snapshot argument is kept for the admin-result
+    # path; replies ignore it.
+    def oauth_reply_current?(task, _oauth_bindings = nil)
       plugin = task.source_plugin.to_s
       return true unless Interaction::OauthContext.oauth_plugin?(plugin)
+      return false unless Task.column_names.include?("oauth_binding")
 
-      expected = oauth_bindings.is_a?(Hash) ? oauth_bindings[plugin] : nil
-      return false if expected.nil?
-      return false unless oauth_snapshots_current?({ plugin => expected })
+      stored = task.oauth_binding
+      return false unless stored.is_a?(Hash)
 
       begin
         current = Interaction::OauthContext.snapshot_binding(plugin, credential_provider: oauth_provider)
       rescue StandardError
         return false
       end
-      bound = Aiconshell::Oauth::Binding.from_h(expected)
       current_hash = current.is_a?(Hash) ? current : current.to_h
-      bound.matches?(current_hash)
+      Aiconshell::Oauth::Binding.from_h(stored).matches?(current_hash)
+    rescue StandardError
+      false
     end
 
     def create_reply_action(task, reply, version, oauth_bindings = nil)
@@ -545,10 +561,12 @@ module Coordination
         input: { "resource_id" => task.source_resource_id, "body" => reply.fetch("body") },
         idempotency_key: "triage-#{task.id}-#{version}", status: "pending" }
       if Interaction::OauthContext.oauth_plugin?(task.source_plugin.to_s)
-        expected = oauth_bindings.is_a?(Hash) ? oauth_bindings[task.source_plugin.to_s] : nil
-        return false if expected.nil?
+        # The enqueue-time snapshot is the Task's fetch-time binding so
+        # delivery fences against the connection that produced the event.
+        stored = task.oauth_binding
+        return false unless stored.is_a?(Hash)
 
-        attrs[:oauth_binding] = expected if OutboundAction.column_names.include?("oauth_binding")
+        attrs[:oauth_binding] = stored if OutboundAction.column_names.include?("oauth_binding")
       end
       OutboundAction.create!(attrs)
       true

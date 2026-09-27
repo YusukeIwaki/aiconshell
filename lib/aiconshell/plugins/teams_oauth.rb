@@ -4,10 +4,14 @@ require "date"
 require "json"
 require "time"
 require "uri"
-require_relative "../oauth/errors" unless defined?(Aiconshell::Oauth::BindingMismatch)
-require_relative "../oauth/binding" unless defined?(Aiconshell::Oauth::Binding)
-require_relative "../oauth/config" unless defined?(Aiconshell::Oauth::Config)
-require_relative "../oauth/microsoft" unless defined?(Aiconshell::Oauth::Microsoft)
+require_relative "base"
+require_relative "errors"
+require_relative "schemas"
+# Explicit full OAuth root (not partial files): constants such as State,
+# Pkce, TokenSet, SecretBox, PROVIDERS, and ErrorCodes must be loaded even
+# when this adapter file is required before anything else. A defined?
+# guard on one constant (Binding, Microsoft, ...) would hide the rest.
+require_relative "../oauth"
 
 module Aiconshell
   module Plugins

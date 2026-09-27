@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
-require "aiconshell/oauth" unless defined?(Aiconshell::Oauth::SecretBox)
+# Explicit full root (no defined? guard): a pre-defined SecretBox never
+# implies the whole entry (State, Pkce, TokenSet, Binding, PROVIDERS) is
+# loaded.
+require "aiconshell/oauth"
 
 module Oauth
   # Rails key management for the OAuth foundation. The encryption key is

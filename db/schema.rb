@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_050000) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_060000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -101,6 +101,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_050000) do
     t.bigint "task_id"
     t.string "source_fingerprint"
     t.datetime "source_updated_at"
+    t.jsonb "oauth_binding"
     t.index ["plugin", "event_id", "fingerprint"], name: "index_external_events_on_plugin_event_fingerprint", unique: true
     t.index ["plugin", "resource_id"], name: "index_external_events_on_plugin_resource"
     t.index ["processed_at"], name: "index_external_events_on_processed_at"
@@ -432,6 +433,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_050000) do
     t.text "work_plan", default: "", null: false
     t.jsonb "coordination_result"
     t.string "delivery_batch_key"
+    t.jsonb "oauth_binding"
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"

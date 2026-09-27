@@ -96,7 +96,15 @@ module Interaction
       # or advances another connection's cursor.
       if OauthContext.oauth_plugin?(plugin_name) &&
           !OauthContext.snapshot_current?(oauth_snapshot, plugin_name, credential_provider: oauth_provider)
-        cursor.with_lock { |row| row.update!(lease_token: nil, lease_expires_at: nil) rescue nil }
+        # A stale poll releases only its own lease token: a successor poll
+        # may already hold the cursor, and its lease must never be cleared
+        # here. Update failures propagate to the outer rescue, which
+        # records the error without advancing the cursor.
+        cursor.with_lock do
+          if cursor.lease_token == token
+            cursor.update!(lease_token: nil, lease_expires_at: nil)
+          end
+        end
         return result(false, :stale_binding, retryable: true)
       end
 
@@ -139,7 +147,7 @@ module Interaction
           end
         end
 
-        inserted = persist_events(rows)
+        inserted = persist_events(rows, plugin_name, oauth_snapshot)
         # Source locks (including a concurrent triage row lock) may outlive
         # the lease. Roll back every event/watermark write before acknowledging.
         raise ActiveRecord::Rollback unless cursor.lease_active?(now)
@@ -214,31 +222,70 @@ module Interaction
       nil
     end
 
+    # True when any candidate overlaps a pending/sending/uncertain
+    # action for the same connection and destination. DB or matcher
+    # errors propagate (never coerce to false): the outer rescue then
+    # halts ingestion and the cursor advance instead of treating the
+    # batch as ordinary human events.
     def hold_for_inflight?(rows, plugin, snapshot)
       return false if rows.empty?
 
-      destinations = rows.filter_map { |row| SelfPostMatcher.poll_destination_for(row) }.uniq
-      return false if destinations.empty?
+      actions = OutboundAction.where(plugin: plugin, status: %w[pending sending uncertain]).to_a
+      return false if actions.empty?
 
-      destinations.any? do |destination|
-        OutboundAction.where(plugin: plugin, status: %w[pending sending uncertain]).any? do |action|
-          next false unless SelfPostMatcher.binding_matches?(action, snapshot)
-
-          SelfPostMatcher.action_destination_for(action) == destination
-        end
+      rows.any? do |row|
+        actions.any? { |action| SelfPostMatcher.hold_candidate?(row, action, poll_binding: snapshot) }
       end
-    rescue StandardError
-      false
     end
 
+    # Suppresses only durable self-post echoes. Receipts are scoped in
+    # the database to this plugin, confirmed sends, and the same
+    # provider resource space (provider plus tenant/cloud, never the
+    # numeric id alone), newest first, with no row cap: a confirmed
+    # self-post at position 501+ still matches no matter how many older
+    # receipts other destinations or past connections left behind.
+    # Generation is deliberately not part of the scope, so a
+    # pre-reconnect post re-fetched after a cursor reset is still
+    # recognized; send permission itself stays generation-pinned
+    # elsewhere. DB errors propagate and halt the poll (see above).
     def suppress_self_posts(rows, plugin, snapshot)
-      receipts = OutboundAction.where(plugin: plugin, status: "sent").where.not(external_id: nil).limit(500).to_a
-        .select { |action| SelfPostMatcher.binding_matches?(action, snapshot) }
+      receipts = sent_receipts_for(plugin, snapshot)
       return rows if receipts.empty?
 
       rows.reject do |row|
         receipts.any? { |action| SelfPostMatcher.self_post?(row, action) }
       end
+    end
+
+    def sent_receipts_for(plugin, snapshot)
+      query = OutboundAction.where(plugin: plugin.to_s, status: "sent").where.not(external_id: nil)
+      query = scope_receipts_to_provider_space(query, snapshot)
+      return [] if query.nil?
+
+      query.order(id: :desc).to_a.select do |action|
+        SelfPostMatcher.receipt_scope_matches?(action, snapshot)
+      end
+    end
+
+    # Narrows the receipt lookup to the same provider resource space
+    # before Ruby matching. Returns nil when the poll binding is
+    # missing: with no trusted scope, nothing is suppressed (fail open
+    # toward human review instead of hiding posts behind an unknown
+    # scope).
+    def scope_receipts_to_provider_space(query, snapshot)
+      return nil unless snapshot.is_a?(Hash)
+
+      get = ->(key) do
+        value = snapshot[key.to_s]
+        value.nil? ? snapshot[key.to_sym] : value
+      end
+      provider = get.call("provider").to_s
+      return nil if provider.empty?
+
+      query = query.where("oauth_binding ->> 'provider' = ?", provider)
+      query = query.where("oauth_binding ->> 'tenant' IS NOT DISTINCT FROM ?", get.call("tenant")&.to_s)
+      query = query.where("oauth_binding ->> 'cloud' IS NOT DISTINCT FROM ?", get.call("cloud")&.to_s)
+      query
     end
 
     def emit_hold(plugin)
@@ -248,7 +295,12 @@ module Interaction
       nil
     end
 
-    def persist_events(rows)
+    # Every persisted row keeps the trusted binding that fetched it
+    # (first-observed-wins; a later generation never rewrites it), so
+    # triage can fence the later Task reply against the fetch-time
+    # connection instead of the current one.
+    def persist_events(rows, plugin = nil, snapshot = nil)
+      stamp_binding!(rows, plugin, snapshot)
       snapshots, events = rows.partition { |row| snapshot_row?(row) }
       # A source can appear through multiple cursors. Serialize its first insert
       # as well as later revisions. Stable lock order avoids cross-batch deadlocks.
@@ -288,6 +340,14 @@ module Interaction
         end
       end
       inserted
+    end
+
+    def stamp_binding!(rows, plugin, snapshot)
+      return if rows.empty?
+      return unless OauthContext.oauth_plugin?(plugin.to_s) && snapshot.is_a?(Hash)
+      return unless ExternalEvent.column_names.include?("oauth_binding")
+
+      rows.each { |row| row["oauth_binding"] = snapshot }
     end
 
     def snapshot_row?(row)

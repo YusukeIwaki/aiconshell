@@ -126,25 +126,39 @@ binding just-in-time and never re-select the current user or fall back to
 service-account credentials. Binding/provider values never enter AI
 input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
 `teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
-delegated variant. Typed-read snapshots are reused for the following result,
-external-event snapshots for the following reply, and enqueue snapshots for
+delegated variant. Typed-read snapshots are reused for the following
+result, fetch-time external-event snapshots (stored on each
+`external_events` row and copied to its `tasks` row at creation,
+first-observed-wins) for the following reply, and enqueue snapshots for
 delivery; a disconnect/replacement in between stops with `stale_binding` /
-`not_connected` instead of continuing as another principal. Refresh never
-changes the generation. Cursors are isolated per connection
-(`integration_cursors.oauth_binding`): a changed connection restarts from no
-cursor and never reuses another site's cursor. Callback/refresh/send races
-discard stale results instead of reviving or sending with a new user's token.
+`not_connected` instead of continuing as another principal, and each Task
+is fenced by its own stored binding so same-provider Tasks from different
+generations never mix. Refresh never changes the generation. Cursors are
+isolated per connection (`integration_cursors.oauth_binding`): a changed
+connection restarts from no cursor and never reuses another site's cursor.
+Callback/refresh/send races discard stale results instead of reviving or
+sending with a new user's token. A stale poll releases only its own cursor
+lease token, never a successor's.
 
 Self-post receipts are the sent `outbound_actions` themselves (provider
 resource, `external_id`, and the actually sent body persisted on `sent` even
-when Interaction drafting rewrote it). A poll candidate matching the same
-connection, resource, external id, and content is the app echo and is not
-ingested; a different id, a different resource (same numeric ids on different
-resources never suppress), edited content, or a later human edit of the app
-post stays eligible. While a matching `pending` / `sending` / `uncertain`
-action exists (send started but receipt not yet stored, or outcome unknown),
-the candidate is held without advancing the cursor so it is neither lost nor
-auto-replied in a loop; other connections/destinations are unaffected.
+when Interaction drafting rewrote it). Receipt identity is
+generation-independent: a poll candidate matching the same provider
+resource space (provider plus fixed tenant/cloud), resource, external id,
+and content is the app echo and is not ingested, even after a reconnect
+with a cursor reset; send permission itself stays generation-pinned. A
+different id, a different resource (same numeric ids on different
+resources, clouds, or tenants never suppress), edited content, or a later
+human edit of the app post stays eligible. The receipt lookup is scoped in
+the database (newest first, no row cap) so a confirmed self-post still
+matches past any number of older receipts. While a matching `pending` /
+`sending` / `uncertain` action exists for the same connection and
+destination (send started but receipt not yet stored, or outcome unknown),
+the candidate is held without advancing the cursor so it is neither lost
+nor auto-replied in a loop; Jira holds are per issue (a reply to one issue
+never holds another), and other connections/destinations are unaffected.
+DB or matcher errors halt ingestion and the cursor advance instead of
+treating the batch as ordinary human events.
 
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a

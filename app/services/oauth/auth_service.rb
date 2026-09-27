@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
 require "securerandom"
-require "aiconshell/oauth" unless defined?(Aiconshell::Oauth::Atlassian)
-require "aiconshell/plugins" unless defined?(Aiconshell::Plugins::Registry)
+# Explicit full roots (no defined? guards): a single pre-defined constant
+# (Atlassian, Binding, ...) never implies the whole entry (State, Pkce,
+# TokenSet, SecretBox, PROVIDERS, all adapters) is loaded.
+require "aiconshell/oauth"
+require "aiconshell/plugins"
 
 module Oauth
   # Operator-facing OAuth connect/disconnect orchestration (issue #22).

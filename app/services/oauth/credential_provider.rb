@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
-require "aiconshell/oauth" unless defined?(Aiconshell::Oauth::Binding)
+# Explicit full root (no defined? guard): a pre-defined Binding never
+# implies the whole entry (State, Pkce, TokenSet, SecretBox, PROVIDERS) is
+# loaded.
+require "aiconshell/oauth"
 
 module Oauth
   # Public credential contract for later lanes (issues #24/#25/#26).

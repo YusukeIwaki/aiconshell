@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
-require "aiconshell/oauth" unless defined?(Aiconshell::Oauth::ErrorCodes)
+# Explicit full root (no defined? guard): a pre-defined ErrorCodes never
+# implies the whole entry (State, Pkce, TokenSet, Binding, PROVIDERS) is
+# loaded.
+require "aiconshell/oauth"
 
 module Admin
   # Presentation adapter for user-delegated OAuth connections (issue #23).

@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
-require "aiconshell/oauth" unless defined?(Aiconshell::Oauth::ErrorCodes)
+# Explicit full root (no defined? guard): a pre-defined ErrorCodes never
+# implies the whole entry (State, Pkce, TokenSet, Binding, PROVIDERS) is
+# loaded.
+require "aiconshell/oauth"
 
 # One short-lived OAuth authorization attempt. Only the SHA256 digest of the
 # high-entropy state (bound to the browser session digest) is stored; the
