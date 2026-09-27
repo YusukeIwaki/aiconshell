@@ -7,6 +7,15 @@ require "securerandom"
 module Interaction
   # A leased outbound intent. Only explicit rate-limit rejections are retried
   # automatically after a request starts; ambiguous delivery requires review.
+  #
+  # Delegated OAuth writes (issue #26) use the binding snapshot fixed at
+  # enqueue time (stored on the action, never from user/AI input). Delivery
+  # fences it against the current connection before any external write: a
+  # disconnect/replacement fails closed instead of sending as a different
+  # principal or reviving with a stale result. Already-started HTTP cannot
+  # be cancelled; ambiguous writes stay `uncertain` and are never
+  # auto-resent. The actually sent body is persisted with the receipt so
+  # self-post matching ties content to the external id.
   class OutboundService
     Result = Struct.new(:ok, :code, keyword_init: true)
     DRAFT_SCHEMA = {
@@ -15,8 +24,10 @@ module Interaction
     }.freeze
 
     def initialize(registry: Aiconshell::Plugins::Registry.default,
-                   ai_runner: Aiconshell::Ai::Runner.new, event_sink: WorkflowEvents, clock: Time)
+                   ai_runner: Aiconshell::Ai::Runner.new, event_sink: WorkflowEvents, clock: Time,
+                   oauth_credential_provider: nil)
       @registry, @ai_runner, @event_sink, @clock = registry, ai_runner, event_sink, clock
+      @oauth_credential_provider = oauth_credential_provider
     end
 
     def call(action_id)
@@ -26,12 +37,21 @@ module Interaction
       token, snapshot = claimed
       request_started = false
       input = snapshot.fetch(:input).transform_keys(&:to_s)
+      stored_binding = snapshot[:oauth_binding]
       scope = PluginAccess.destination(snapshot[:plugin], snapshot[:operation], input)
       unless WorkflowSettings.scope_allowed?(snapshot[:plugin], scope)
         return settle(action_id, token, status: "failed", code: :scope_not_allowed)
       end
       if snapshot[:plugin] == "jira" && PluginAccess.self_actor_ids("jira").empty?
         return settle(action_id, token, status: "failed", code: :self_actor_not_configured)
+      end
+      if OauthContext.oauth_plugin?(snapshot[:plugin])
+        if stored_binding.nil? || stored_binding.empty?
+          return settle(action_id, token, status: "failed", code: :binding_missing)
+        end
+        unless OauthContext.snapshot_current?(stored_binding, snapshot[:plugin], credential_provider: oauth_provider)
+          return settle(action_id, token, status: "failed", code: :stale_binding)
+        end
       end
       validator = ActionValidator.new(registry: @registry)
       checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
@@ -48,18 +68,43 @@ module Interaction
         return Result.new(ok: false, code: :stale_delivery)
       end
       request_started = true
+      # Re-fence after drafting (AI drafting takes time): a replacement
+      # during drafting still fails before any external write.
+      if OauthContext.oauth_plugin?(snapshot[:plugin]) &&
+          !OauthContext.snapshot_current?(stored_binding, snapshot[:plugin], credential_provider: oauth_provider)
+        return settle(action_id, token, status: "failed", code: :stale_binding)
+      end
+      context = if OauthContext.oauth_plugin?(snapshot[:plugin])
+        PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry).merge(
+          "oauth_binding" => stored_binding, "oauth_credential_provider" => oauth_provider
+        )
+      else
+        PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry)
+      end
       output = @registry.invoke(plugin: snapshot[:plugin], operation: snapshot[:operation],
-        input: input, context: PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry))
+        input: input, context: context)
       unless Aiconshell::Plugins::Schemas.error_details(operation["output_schema"], output).empty? &&
           output.is_a?(Hash) && output["external_id"].is_a?(String) && output["external_id"].present? &&
           (output["url"].nil? || output["url"].is_a?(String))
         return settle(action_id, token, status: "uncertain", code: :invalid_delivery_response)
       end
       settle(action_id, token, status: "sent", code: :ok,
-        external_id: output["external_id"], url: output["url"])
+        external_id: output["external_id"], url: output["url"], sent_input: input)
     rescue Aiconshell::Plugins::RateLimited => error
       delay = [[error.retry_after.to_i, 30].max, 21_600].min
       settle(action_id, token, status: "pending", code: :rate_limited, retry_after: delay)
+    rescue Aiconshell::Oauth::BindingMismatch
+      settle(action_id, token, status: "failed", code: :stale_binding)
+    rescue Oauth::CredentialProvider::NotConnected
+      settle(action_id, token, status: "failed", code: :not_connected)
+    rescue Aiconshell::Oauth::RefreshBusy
+      settle(action_id, token, status: "pending", code: :refresh_busy, retry_after: 30)
+    rescue Aiconshell::Oauth::ProviderError => error
+      if error.code.to_s == "invalid_grant"
+        settle(action_id, token, status: "failed", code: :not_connected)
+      else
+        settle(action_id, token, status: "pending", code: :oauth_unavailable, retry_after: 60)
+      end
     rescue StandardError => error
       # Never persist provider/transport error text (it can echo credentials).
       rejected = error.class.name.match?(/Unknown|Unsupported|InputInvalid|CredentialsMissing|PermissionDenied|HostRejected/)
@@ -89,6 +134,10 @@ module Interaction
 
     def now = @clock.respond_to?(:current) ? @clock.current : @clock.now
 
+    def oauth_provider
+      @oauth_credential_provider ||= Oauth::CredentialProvider.new(event_sink: @event_sink)
+    end
+
     def claim(id)
       OutboundAction.transaction do
         action = OutboundAction.lock.find_by(id: id)
@@ -103,7 +152,8 @@ module Interaction
         action.update!(status: "sending", attempts: action.attempts + 1, last_attempt_at: now,
           lease_token: token, lease_expires_at: now + WorkflowSettings.ai_timeout_seconds + 120,
           request_started_at: nil, next_attempt_at: nil)
-        [token, { plugin: action.plugin, operation: action.operation, input: action.input.deep_dup }]
+        [token, { plugin: action.plugin, operation: action.operation, input: action.input.deep_dup,
+                  oauth_binding: action.respond_to?(:oauth_binding) ? action.oauth_binding : nil }]
       end
     end
 
@@ -117,7 +167,7 @@ module Interaction
       end
     end
 
-    def settle(id, token, status:, code:, external_id: nil, url: nil, retry_after: nil)
+    def settle(id, token, status:, code:, external_id: nil, url: nil, retry_after: nil, sent_input: nil)
       return Result.new(ok: false, code: code) unless token.is_a?(String)
 
       OutboundAction.transaction do
@@ -127,11 +177,16 @@ module Interaction
         if status == "pending" && action.attempts >= WorkflowSettings.max_action_attempts
           status, code = "failed", :attempts_exhausted
         end
-        action.update!(status: status, external_id: external_id, url: url,
+        attrs = { status: status, external_id: external_id, url: url,
           error_code: code == :ok ? nil : code.to_s,
           error: code == :ok ? nil : "Outbound delivery: #{code}",
           lease_token: nil, lease_expires_at: nil,
-          next_attempt_at: status == "pending" ? now + (retry_after || 60) : nil)
+          next_attempt_at: status == "pending" ? now + (retry_after || 60) : nil }
+        # Persist the actually sent body with the receipt (the draft may
+        # have rewritten it). Self-post matching ties this content to the
+        # external id; edited revisions with different content stay eligible.
+        attrs[:input] = sent_input.deep_stringify_keys if status == "sent" && sent_input.is_a?(Hash)
+        action.update!(attrs)
         @event_sink.emit(layer: "interaction", kind: "outbound.#{status}",
           message: "Outbound action #{status}", task_id: action.task_id,
           data: { action_id: action.id, code: code.to_s })

@@ -131,8 +131,11 @@ test("jira_oauth catalog uses independent scopes and env without registering def
   expect(ops["latest_events"]["input_schema"]["additionalProperties"]).to eq(false)
   expect(ops["latest_events"]["input_schema"]["properties"].keys.sort).to eq(%w[cursor scope])
 
-  # Business wiring (#26) owns default registration; this lane does not.
-  expect(JoPlugins::Registry.default.catalog.map { |item| item["id"] }.sort).to eq(%w[github jira teams])
+  # Business wiring (#26) registers the delegated adapters in the default
+  # registry with pure-Ruby instances (no Rails provider held).
+  expect(JoPlugins::Registry.default.catalog.map { |item| item["id"] }.sort).to eq(
+    %w[github jira jira_oauth teams teams_oauth]
+  )
   transport.assert_consumed!
 end
 

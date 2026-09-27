@@ -85,7 +85,9 @@ HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検�
 
 GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
 
-ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。この基盤だけでは旧 default registry へ委任 plugin を登録しない（管理画面・adapter・業務統合は後続 Issue）。
+ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。委任版 `jira_oauth` / `teams_oauth` は default registry へ登録済み（#26）であり、pure Ruby の登録と Rails の credential provider 注入を分離する。`catalog.configured` は `OAUTH_*` 設定の有無のみを示し、接続成功との区別は管理画面・業務統合が表示する。AI/Plugin の JSON Schema に credential や接続権限は含めない。
+
+運用名義は (1) 既存サービスアカウント/Bot 名義の Bot 運用（`jira` service account / `teams` Graph application + Bot を維持）と (2) 同意した特定ユーザー名義の OAuth2 代理運用（`jira_oauth` / `teams_oauth`）の2種類である。個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT fallback は追加しない。`jira` / `jira_oauth`、`teams` / `teams_oauth` の allowlist は別 namespace であり、旧許可を委任版へ自動転用しない。poll/query/outbound は同じ信頼された `oauth_binding` / `oauth_credential_provider` 境界を使い、binding をユーザー/AI が指定できない。接続 ID・世代・principal・tenant/cloud の snapshot は信頼されたアプリ側で固定し、refresh では世代を変えない。callback/refresh/送信の競合は fencing で扱い、既に開始した HTTP は取り消せないため成功不明の書込は `uncertain` として再送しない。自己投稿は確定 receipt（provider resource・外部 ID・実際に送った内容）の永続照合でのみ抑制し、手動発言は対象とする。詳細は [workflow](workflow.md) を参照。
 
 ### 管理依頼の read / result / receipt
 

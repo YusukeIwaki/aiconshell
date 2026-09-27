@@ -214,7 +214,12 @@ token = creds.access_token(binding.to_h) # 直前の外部書込のためだけ�
   `Bearer` 先が検証済み固定 origin に閉じることを各 adapter が保証する。
 - 業務統合（#26）は接続 ID・世代・principal・tenant / cloud の snapshot を
   信頼されたアプリ側で固定し、解除・置換と処理の競合を fencing で扱う。
-  この基盤の `default registry` への登録は #26 が行う。
+  委任版 `jira_oauth` / `teams_oauth` の `default registry` への登録は #26
+  で実施済みであり、pure Ruby の登録と Rails credential provider の注入を
+  分離する。poll/query/outbound は同じ信頼された境界を使い、cursor は接続
+  範囲で隔離し、自己投稿は確定 receipt の永続照合でのみ抑制する。詳細は
+  [workflow](workflow.md) と [architecture](architecture.md#plugins) を参照。
+  OAuth 管理画面の往復（#23）は別レーンであり、この文書の基盤契約は変えない。
 
 公式仕様:
 

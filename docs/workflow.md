@@ -114,7 +114,37 @@ Only known bots/self actors are pre-processed to prevent echo loops; other
 system events are retained as coordination context. Set
 `AICONSHELL_SELF_ACTOR_IDS=plugin:id,...` (or `JIRA_SERVICE_ACCOUNT_ID` for Jira).
 Jira outbound writes fail with `self_actor_not_configured` without a known self
-account identity.
+account identity. Delegated `jira_oauth` / `teams_oauth` never suppress by
+actor: the consenting user's manual posts stay eligible and only durable sent
+receipts suppress the app's own echo (see below).
+
+Delegated OAuth polling, typed reads, and outbound delivery share one trusted
+boundary (issue #26). The application fixes the secret-free `oauth_binding`
+(connection id, generation, provider, principal, tenant/cloud) with the
+`oauth_credential_provider` in the invoke context; adapters resolve the same
+binding just-in-time and never re-select the current user or fall back to
+service-account credentials. Binding/provider values never enter AI
+input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
+`teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
+delegated variant. Typed-read snapshots are reused for the following result,
+external-event snapshots for the following reply, and enqueue snapshots for
+delivery; a disconnect/replacement in between stops with `stale_binding` /
+`not_connected` instead of continuing as another principal. Refresh never
+changes the generation. Cursors are isolated per connection
+(`integration_cursors.oauth_binding`): a changed connection restarts from no
+cursor and never reuses another site's cursor. Callback/refresh/send races
+discard stale results instead of reviving or sending with a new user's token.
+
+Self-post receipts are the sent `outbound_actions` themselves (provider
+resource, `external_id`, and the actually sent body persisted on `sent` even
+when Interaction drafting rewrote it). A poll candidate matching the same
+connection, resource, external id, and content is the app echo and is not
+ingested; a different id, a different resource (same numeric ids on different
+resources never suppress), edited content, or a later human edit of the app
+post stays eligible. While a matching `pending` / `sending` / `uncertain`
+action exists (send started but receipt not yet stored, or outcome unknown),
+the candidate is held without advancing the cursor so it is neither lost nor
+auto-replied in a loop; other connections/destinations are unaffected.
 
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a
@@ -127,6 +157,8 @@ crash after a remote request started becomes `uncertain` and is not automaticall
 resent. Interrupted local drafting can return to pending after backoff. Remote
 providers do not offer an end-to-end exactly-once guarantee; operators must
 reconcile uncertain sends before deciding whether another action is needed.
+Already-started HTTP cannot be cancelled: a write whose remote acceptance is
+unknown stays `uncertain` and is never auto-resent.
 
 ## Typed admin reads and results (issue #11)
 

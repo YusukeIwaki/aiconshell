@@ -49,6 +49,9 @@ class IntegrationPollScheduleJob < ApplicationJob
 
   def concrete_poll_scope?(plugin, scope)
     # Glob characters and encoded/whitespace destinations are never expanded.
+    # `jira:` and `jira_oauth:` (likewise `teams:` / `teams_oauth:`) are
+    # separate allowlist namespaces: a legacy entry never authorizes the
+    # delegated variant.
     return false unless scope.is_a?(String) && !scope.empty? && !scope.match?(/[\s*?\[\]{}\\%]/)
 
     case plugin
@@ -58,9 +61,21 @@ class IntegrationPollScheduleJob < ApplicationJob
         scope.split("/").none? { |part| %w[. ..].include?(part) }
     when "jira"
       Aiconshell::Plugins::Jira::PROJECT_PATTERN.match?(scope)
+    when "jira_oauth"
+      # Delegated Jira polls a concrete project key only; `*` is rejected
+      # by the adapter before any I/O and is never scheduled here.
+      Aiconshell::Plugins::Jira::PROJECT_PATTERN.match?(scope)
     when "teams"
       match = Aiconshell::Plugins::Teams::SCOPE_PATTERN.match(scope)
       match && [match[:team], match[:channel]].none? { |part| %w[. ..].include?(part) }
+    when "teams_oauth"
+      channel = Aiconshell::Plugins::TeamsOauth::CHANNEL_POLL_PATTERN.match(scope)
+      if channel
+        [channel[:team], channel[:channel]].none? { |part| %w[. ..].include?(part) }
+      else
+        chat = Aiconshell::Plugins::TeamsOauth::CHAT_POLL_PATTERN.match(scope)
+        chat && ![chat[:chat]].include?(".") && ![chat[:chat]].include?("..")
+      end
     else
       true
     end

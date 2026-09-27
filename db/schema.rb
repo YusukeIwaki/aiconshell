@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_040002) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_050000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -118,6 +118,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_040002) do
     t.integer "consecutive_failures", default: 0, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.jsonb "oauth_binding"
     t.index ["plugin", "scope"], name: "index_integration_cursors_on_plugin_scope", unique: true
   end
 
@@ -200,6 +201,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_040002) do
     t.datetime "request_started_at"
     t.datetime "next_attempt_at"
     t.string "delivery_batch_key"
+    t.jsonb "oauth_binding"
     t.index ["delivery_batch_key"], name: "index_outbound_actions_on_delivery_batch_key"
     t.index ["idempotency_key"], name: "index_outbound_actions_on_idempotency_key", unique: true
     t.index ["lease_expires_at"], name: "index_outbound_actions_on_lease_expires_at"

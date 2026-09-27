@@ -261,10 +261,13 @@ muse login     # または公式フロー
 
 `GITHUB_PRIVATE_KEY_FILE`・`JIRA_API_TOKEN_FILE`・
 `TEAMS_CLIENT_SECRET_FILE`・`TEAMS_BOT_APP_PASSWORD_FILE`・
+`OAUTH_ATLASSIAN_CLIENT_SECRET_FILE`・`OAUTH_MICROSOFT_CLIENT_SECRET_FILE`・
 `TEAMS_BOT_TARGETS_FILE` はコンテナ内パスだけを環境変数で渡す。
 実ファイルの内容は compose・Railway・イメージ・Git のいずれにも
 入れない。プラグインは値（`GITHUB_PRIVATE_KEY` 等）とファイルの
 どちらか片方があれば動き、両方空なら「未設定」として実行時失敗する。
+委任 OAuth（`OAUTH_*`）も同じ扱いであり、値とファイルの混在・転用はしない。
+個人 PAT の運用・PAT 入力 UI・PAT 専用 plugin は提供しない。
 
 Compose ではホストの private ファイルを対象サービスへ read-only で
 bind マウントする（`migrate`・`clickhouse-init` には付けない）。
@@ -379,8 +382,9 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 | `TEAMS_BOT_TARGETS_FILE` | execution の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |
 | `AICONSHELL_EXECUTION_ROOT` | execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
 | ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は web / execution に同じ値 |
-| 連携資格情報 | execution / web。AI CLI 子プロセスには継承させない（`ChildEnv` の契約） |
-| 自アクタ ID | execution に `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID` |
+| 連携資格情報 | execution / web（`GITHUB_*`・`JIRA_*`・`TEAMS_*`・委任 OAuth `OAUTH_*`）。AI CLI 子プロセスには継承させない（`ChildEnv` の契約）。`migrate` には付けない |
+| 委任 OAuth | execution / web に `OAUTH_ATLASSIAN_*`・`OAUTH_MICROSOFT_*`（`bin/check-compose` が検証）。運用名義は Bot 運用と OAuth2 代理運用の2種類のみで PAT 運用はなし |
+| 自アクタ ID | execution に `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID`（委任 OAuth の自己投稿抑制は receipt 照合であり actor ではない） |
 | `CLAUDE_CONFIG_DIR` | execution に `/data/auth/claude` |
 | `CODEX_HOME` | execution に `/data/auth/codex` |
 | `AICONSHELL_MUSE_HOME` | execution に `/data/auth/muse` |

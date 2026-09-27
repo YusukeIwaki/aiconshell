@@ -103,6 +103,21 @@ x-integration-credentials: &integration-credentials
   # committed and never baked into the image. Same read-only-mount pattern
   # applies to the other *_FILE credential paths above.
   TEAMS_BOT_TARGETS_FILE: ${TEAMS_BOT_TARGETS_FILE:-}
+  # User-delegated OAuth (issue #26): consented-user operation alongside the
+  # service-account/Bot operation above. Independent OAUTH_* variables; never
+  # mixed or reused. No PAT operation is provided. Web needs them for admin
+  # diagnostics; the worker's Rails parent needs them for delegated
+  # polling/delivery. NEVER on migrate. AI CLI children never inherit them.
+  OAUTH_ATLASSIAN_CLIENT_ID: ${OAUTH_ATLASSIAN_CLIENT_ID:-}
+  OAUTH_ATLASSIAN_CLIENT_SECRET: ${OAUTH_ATLASSIAN_CLIENT_SECRET:-}
+  OAUTH_ATLASSIAN_CLIENT_SECRET_FILE: ${OAUTH_ATLASSIAN_CLIENT_SECRET_FILE:-}
+  OAUTH_ATLASSIAN_CLOUD_ID: ${OAUTH_ATLASSIAN_CLOUD_ID:-}
+  OAUTH_ATLASSIAN_REDIRECT_URI: ${OAUTH_ATLASSIAN_REDIRECT_URI:-}
+  OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
+  OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
+  OAUTH_MICROSOFT_CLIENT_SECRET_FILE: ${OAUTH_MICROSOFT_CLIENT_SECRET_FILE:-}
+  OAUTH_MICROSOFT_TENANT_ID: ${OAUTH_MICROSOFT_TENANT_ID:-}
+  OAUTH_MICROSOFT_REDIRECT_URI: ${OAUTH_MICROSOFT_REDIRECT_URI:-}
 
 # Self-actor filtering for polling/outbound (control queue only, consumed
 # by the unified execution worker's control pool). Web never reads these,
