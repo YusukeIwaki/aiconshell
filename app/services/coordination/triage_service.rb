@@ -255,8 +255,15 @@ module Coordination
         "allowed_targets" => @query_service.allowed_targets.flat_map do |plugin, scopes|
           scopes.map do |scope|
             teams = plugin == "teams" && %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
+            discord = plugin == "discord" && %r{\Achannel/([^/]+)\z}.match(scope)
             { "plugin" => plugin, "permission_scope" => scope,
-              "input_scope" => teams ? "channel:#{teams[1]}/#{teams[2]}" : scope }
+              "input_scope" => if teams
+                                 "channel:#{teams[1]}/#{teams[2]}"
+                               elsif discord
+                                 "channel:#{discord[1]}"
+                               else
+                                 scope
+                               end }
           end
         end
       }
@@ -286,6 +293,8 @@ module Coordination
         transition to inbox before a later result can be applied.
         Use only supported write schemas and operator-allowed destinations. Teams
         send_message uses input_scope channel:team/channel, not its permission_scope.
+        Discord send_message and reply bodies are limited to 2000 characters;
+        Discord send_message uses channel:<channelId> for both its permission and input scopes.
         waiting_delivery is server-owned and cannot be requested or changed by AI.
         Allowed transitions: #{JSON.generate(Task::TRANSITIONS)}
         Return only JSON matching the supplied schema.

@@ -3,7 +3,8 @@
 # Schedule this no-argument control job every five minutes in Solid Queue.
 # It only enumerates AICONSHELL_ALLOWED_SCOPES; it never discovers or expands
 # destinations remotely. Concrete poll scopes are github:owner/repo,
-# jira:PROJECT, and teams:team/<teamId>/channel/<channelId>.
+# jira:PROJECT, teams:team/<teamId>/channel/<channelId>, and
+# discord:channel/<channelId>.
 # Registered custom plugins may declare other concrete scope formats through
 # their latest_events input schema, which is checked before every enqueue.
 #
@@ -61,6 +62,9 @@ class IntegrationPollScheduleJob < ApplicationJob
     when "teams"
       match = Aiconshell::Plugins::Teams::SCOPE_PATTERN.match(scope)
       match && [match[:team], match[:channel]].none? { |part| %w[. ..].include?(part) }
+    when "discord"
+      match = Aiconshell::Plugins::Discord::SCOPE_PATTERN.match(scope)
+      match && Aiconshell::Plugins::Discord.valid_snowflake?(match[:channel])
     else
       true
     end

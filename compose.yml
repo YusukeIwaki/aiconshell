@@ -76,6 +76,7 @@ x-event-log: &event-log
 # to the worker's Rails parent only: AI CLI child processes receive a
 # controlled env without them (lib/aiconshell/ai/child_env.rb).
 x-integration-credentials: &integration-credentials
+  DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
   GITHUB_APP_ID: ${GITHUB_APP_ID:-}
   GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
   GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}

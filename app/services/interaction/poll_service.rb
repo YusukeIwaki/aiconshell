@@ -9,7 +9,7 @@ module Interaction
   # final atomic inbox insert + cursor acknowledgement; stale polls write neither.
   class PollService
     Result = Struct.new(:ok, :code, :ingested, :skipped, :retryable, keyword_init: true)
-    SNAPSHOT_TYPES = %w[github.issue jira.issue teams.message teams.reply].freeze
+    SNAPSHOT_TYPES = %w[github.issue jira.issue teams.message teams.reply discord.message].freeze
 
     def initialize(registry: Aiconshell::Plugins::Registry.default, event_sink: WorkflowEvents, clock: Time)
       @registry, @event_sink, @clock = registry, event_sink, clock

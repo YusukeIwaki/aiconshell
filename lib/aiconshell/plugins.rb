@@ -23,6 +23,7 @@ require_relative "plugins/registry"
 require_relative "plugins/github"
 require_relative "plugins/jira"
 require_relative "plugins/teams"
+require_relative "plugins/discord"
 
 module Aiconshell
   module Plugins

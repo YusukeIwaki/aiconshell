@@ -190,11 +190,18 @@ module Aiconshell
         end
 
         # Parse a Retry-After value (delay seconds or HTTP date) into seconds.
+        # Fractional delay seconds (for example Discord's decimal
+        # Retry-After) are rounded up; non-finite values are ignored.
         def parse_retry_after(value, clock: Time)
           return nil if value.nil? || value.to_s.strip.empty?
 
           text = value.to_s.strip
-          return text.to_i if text.match?(/\A\d+\z/)
+          if text.match?(/\A\d+(?:\.\d+)?\z/)
+            seconds = text.to_f
+            return seconds.ceil if seconds.finite?
+
+            return nil
+          end
 
           begin
             delta = Time.httpdate(text) - clock.now

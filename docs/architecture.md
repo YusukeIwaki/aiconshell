@@ -6,7 +6,7 @@ Web とバックグラウンドワーカーは PostgreSQL を共有する。Soli
 
 ```mermaid
 flowchart TB
-  Human[人間 / Teams / Jira / GitHub / 管理画面] <--> I[Interaction: 取得・正規化・対話]
+  Human[人間 / Teams / Jira / GitHub / Discord / 管理画面] <--> I[Interaction: 取得・正規化・対話]
   I <--> C[Coordination: 整理・優先度・状態・dispatch]
   C <--> E[Execution: lease・隔離 workspace・AI CLI]
   I --> O[EventLog outbox]
@@ -66,7 +66,7 @@ registry.invoke(plugin: "github", operation: "latest_events",
                 context: { "scopes" => ["github:read"] })
 ```
 
-`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
+`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams と Discord は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
 
 `latest_events` の入力: `{"scope": "...", "cursor": null または object}`。
 返却: `{"events": [...], "cursor": object}`。
@@ -81,7 +81,7 @@ HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検�
 
 `Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
 
-GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write、Discord は Bot token（`DISCORD_BOT_TOKEN` のみ）。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
 
 ### 管理依頼の read / result / receipt
 

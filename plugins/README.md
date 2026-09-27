@@ -1,7 +1,7 @@
 # 外部サービスプラグインの追加
 
 組み込みプラグインの設定は [GitHub](github/README.md)、[Teams](teams/README.md)、
-[Jira](jira/README.md) を参照してください。必要な環境変数の名前は管理画面にも表示されます。
+[Jira](jira/README.md)、[Discord](discord/README.md) を参照してください。必要な環境変数の名前は管理画面にも表示されます。
 値や認証情報はリポジトリに保存しません。
 
 プラグインは信頼された Ruby コードとして登録します。MCP のように操作一覧と入出力スキーマを

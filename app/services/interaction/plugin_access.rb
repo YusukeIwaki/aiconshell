@@ -27,6 +27,9 @@ module Interaction
       when "teams"
         match = /\A(?:message|channel):([^\/]+)\/([^\/]+)(?:\/[^\/]+)?\z/.match(target)
         match ? "team/#{match[1]}/channel/#{match[2]}" : target
+      when "discord"
+        match = /\A(?:message|channel):([^\/]+)(?:\/[^\/]+)?\z/.match(target)
+        match ? "channel/#{match[1]}" : target
       else
         target # custom plugins can use an exact operator-allowlisted resource
       end

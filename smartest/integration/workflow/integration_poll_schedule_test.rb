@@ -22,6 +22,7 @@ def poll_schedule_registry(env)
   registry.register(Aiconshell::Plugins::Github.new)
   registry.register(Aiconshell::Plugins::Jira.new)
   registry.register(Aiconshell::Plugins::Teams.new)
+  registry.register(Aiconshell::Plugins::Discord.new)
   [registry, transport]
 end
 
@@ -37,24 +38,26 @@ end
 
 test("poll scheduler queues each configured concrete scope through the real plugin catalog") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_workflow_env(scopes: "github:owner/repo,github:owner/.github,github:owner/repo,jira:PROJECT,teams:team/team-id/channel/19:channel@thread.tacv2") do
+  with_workflow_env(scopes: "github:owner/repo,github:owner/.github,github:owner/repo,jira:PROJECT,teams:team/team-id/channel/19:channel@thread.tacv2,discord:channel/130000000000000001") do
     # Presence-only diagnostic fixtures; not usable credentials. The transport
     # raises if any code accidentally tries to poll while scheduling.
     registry, transport = poll_schedule_registry(
       "GITHUB_APP_ID" => "fixture-app", "GITHUB_INSTALLATION_ID" => "fixture-installation", "GITHUB_PRIVATE_KEY" => "not-a-private-key",
       "JIRA_EMAIL" => "fixture@example.invalid", "JIRA_API_TOKEN" => "not-a-token", "JIRA_SITE_URL" => "https://jira.example.invalid",
-      "TEAMS_TENANT_ID" => "fixture-tenant", "TEAMS_CLIENT_ID" => "fixture-client", "TEAMS_CLIENT_SECRET" => "not-a-secret"
+      "TEAMS_TENANT_ID" => "fixture-tenant", "TEAMS_CLIENT_ID" => "fixture-client", "TEAMS_CLIENT_SECRET" => "not-a-secret",
+      "DISCORD_BOT_TOKEN" => "not-a-token"
     )
     # Disabling interaction AI drafting must not stop deterministic ingestion.
     LayerPolicy.create!(layer: "interaction", provider: "codex", enabled: false)
     prior_ids = SolidQueue::Job.where(class_name: "InteractionPollJob").pluck(:id)
 
-    expect(poll_schedule_job(registry).perform_now).to eq(4)
+    expect(poll_schedule_job(registry).perform_now).to eq(5)
 
     jobs = poll_schedule_rows(prior_ids)
     expect(jobs.map { |job| job.arguments.fetch("arguments") }).to eq([
       ["github", "owner/repo"], ["github", "owner/.github"], ["jira", "PROJECT"],
-      ["teams", "team/team-id/channel/19:channel@thread.tacv2"]
+      ["teams", "team/team-id/channel/19:channel@thread.tacv2"],
+      ["discord", "channel/130000000000000001"]
     ])
     expect(jobs.all? { |job| job.queue_name == "control" && job.ready_execution.present? }).to eq(true)
     expect(transport.calls).to eq([])
@@ -72,6 +75,9 @@ test("poll scheduler skips wildcards malformed destinations unknown and unconfig
     "jira:*", "jira:project", "jira:issue:PROJECT-1", "jira:PROJECT",
     "teams:team/*/channel/channel-id", "teams:channel:team-id/channel-id",
     "teams:conversation:channel-id", "teams:team/team-id/channel/channel-id",
+    "discord:channel/*", "discord:channel:not-an-id", "discord:channel:130000000000000001",
+    "discord:message:130000000000000001/130000000000000002",
+    "discord:channel/130000000000000001/extra", "discord:https://discord.com/channels/1/2",
     "unknown:owner/repo"
   ].join(",")
   with_workflow_env(scopes: scopes) do

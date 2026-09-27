@@ -27,6 +27,7 @@ module Aiconshell
           registry.register(Github.new)
           registry.register(Jira.new)
           registry.register(Teams.new)
+          registry.register(Discord.new)
           registry
         end
       end

@@ -16,6 +16,12 @@ test("Retry-After parses delay seconds, HTTP dates, and garbage") do |clock:|
 
   past = (clock.now - 10).httpdate
   expect(Http.parse_retry_after(past, clock: clock)).to eq(0)
+
+  expect(Http.parse_retry_after("1.5", clock: clock)).to eq(2)
+  expect(Http.parse_retry_after("0.2", clock: clock)).to eq(1)
+  expect(Http.parse_retry_after("30.0", clock: clock)).to eq(30)
+  expect(Http.parse_retry_after("1e3", clock: clock)).to eq(nil)
+  expect(Http.parse_retry_after("-5", clock: clock)).to eq(nil)
 end
 
 test("sanitize_url strips query and fragment, tolerates garbage") do
