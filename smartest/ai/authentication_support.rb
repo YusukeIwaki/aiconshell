@@ -14,7 +14,7 @@ module AuthenticationTestSupport
 
   CODEX_CODE = "TEST-CODE1"
   MUSE_CODE = "DEMO01X9"
-  PASTE_CODE = "UNIT-TEST-PASTE-0"
+  PASTE_CODE = "UNIT-TEST-PASTE-0#TEST-STATE"
 
   module_function
 
@@ -25,7 +25,7 @@ module AuthenticationTestSupport
       factory = FakeSessionFactory.new(Array(sessions))
       runner = Aiconshell::Ai::Authentication::Runner.new(
         config: config,
-        process_runner: process_runner || FakeProcessRunner.new,
+        process_runner: process_runner || FakeProcessRunner.new([FakeProcessRunner.ok(stdout: JSON.generate({"loggedIn"=>true,"authMethod"=>"claude.ai","apiProvider"=>"firstParty"}))]),
         session_factory: factory,
         clock: clock || FakeClock.new
       )

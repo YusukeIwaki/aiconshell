@@ -24,9 +24,10 @@ module Aiconshell
 
         def initialize(argv:, env:, cwd:)
           validate!(argv, env, cwd)
-          stdin_read, stdin_write = IO.pipe
-          stdout_read, stdout_write = IO.pipe
-          stderr_read, stderr_write = IO.pipe
+          opened = []
+          stdin_read, stdin_write = IO.pipe.tap { |pair| opened.concat(pair) }
+          stdout_read, stdout_write = IO.pipe.tap { |pair| opened.concat(pair) }
+          stderr_read, stderr_write = IO.pipe.tap { |pair| opened.concat(pair) }
           @pid = spawn_child!(
             argv, env, cwd,
             stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write
@@ -38,6 +39,34 @@ module Aiconshell
           @stderr_eof = false
           @reaped = false
           @status = nil
+        rescue Exception
+          opened&.each { |io| close_quietly(io) }
+          raise
+        end
+
+        # Close stdin first so official servers can persist and exit normally.
+        # Always clean the process group, even if its parent has already exited.
+        def self.cleanup(session, grace:, clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
+          return unless session
+
+          begin
+            session.close_stdin
+            deadline = clock.call + [grace, 0.25].min
+            while session.alive? && clock.call < deadline
+              session.wait_output(0.02)
+              session.read_available
+            end
+          rescue StandardError
+            nil
+          ensure
+            begin
+              session.terminate(grace: grace)
+            ensure
+              session.close
+            end
+          end
+        rescue StandardError
+          nil
         end
 
         # True while the child is still running. Reaps on exit.
@@ -108,11 +137,24 @@ module Aiconshell
 
         # Writes to child stdin. Raises IOError/Errno::EPIPE when the child
         # has closed stdin; the caller maps that to a fixed classification.
-        def write_stdin(data)
+        def write_stdin(data, timeout: 2)
           raise IOError, "stdin is closed" if @stdin_write.nil? || @stdin_write.closed?
 
-          @stdin_write.write(data)
-          @stdin_write.flush
+          deadline = monotonic + timeout
+          bytes = data.b
+          offset = 0
+          while offset < bytes.bytesize
+            remaining = deadline - monotonic
+            raise IOError, "stdin write timed out" if remaining <= 0
+
+            count = @stdin_write.write_nonblock(bytes.byteslice(offset..), exception: false)
+            if count == :wait_writable
+              IO.select(nil, [@stdin_write], nil, [remaining, 0.05].min)
+            else
+              offset += count
+            end
+          end
+          offset
         end
 
         def close_stdin

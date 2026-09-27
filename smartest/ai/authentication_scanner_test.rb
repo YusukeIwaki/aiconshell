@@ -110,9 +110,9 @@ end
 
 # --- Scanner: codes and prompts ---
 
-test("scanner never mistakes url query values for user codes") do
+test("scanner does not treat unrelated query values as user codes") do
   scanner = Auth::Scanner.new("muse")
-  scanner.feed("open https://auth.meta.com/oauth/device/?code=QUERY-VALUE9\n")
+  scanner.feed("open https://auth.meta.com/oauth/device/?state=QUERY-VALUE9\n")
   expect(scanner.challenge["user_code"]).to be_nil
 end
 
@@ -126,11 +126,11 @@ test("scanner extracts device codes by provider rules") do
   expect(hyphenless.challenge["user_code"]).to be_nil
 
   muse = Auth::Scanner.new("muse")
-  muse.feed("Visit #{Support::MUSE_URL}\nYour code is #{Support::MUSE_CODE}\n")
+  muse.feed("Visit https://auth.meta.com/oauth/device/\nYour code is #{Support::MUSE_CODE}\n")
   expect(muse.challenge["user_code"]).to eq(Support::MUSE_CODE)
 
   plain_word = Auth::Scanner.new("muse")
-  plain_word.feed("Visit #{Support::MUSE_URL}\nApprove the code in your browser soon\n")
+  plain_word.feed("Visit https://auth.meta.com/oauth/device/\nApprove the code in your browser soon\n")
   expect(plain_word.challenge["user_code"]).to be_nil
 
   claude = Auth::Scanner.new("claude")

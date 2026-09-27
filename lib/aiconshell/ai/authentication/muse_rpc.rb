@@ -29,24 +29,29 @@ module Aiconshell
 
         module_function
 
-        def check(session_factory:, executable:, env:, cwd:, clock:, timeout:, max_output_bytes:, kill_grace_seconds:)
+        def check(session_factory:, executable:, env:, cwd:, clock:, timeout:, max_output_bytes:, kill_grace_seconds:, cancelled: -> { false })
           session = session_factory.spawn(
             argv: [executable, *SERVE_ARGV], env: env, cwd: cwd
           )
-          run(session, clock: clock, timeout: timeout, max_output_bytes: max_output_bytes)
+          run(session, clock: clock, timeout: timeout, max_output_bytes: max_output_bytes, cancelled: cancelled)
         rescue SystemCallError, IOError, ArgumentError
           Result.result("failed", "spawn_failed")
         ensure
-          close_session(session, kill_grace_seconds)
+          Session.cleanup(session, grace: kill_grace_seconds, clock: clock)
         end
 
-        def run(session, clock:, timeout:, max_output_bytes:)
+        def run(session, clock:, timeout:, max_output_bytes:, cancelled:)
           send_message(session, { "jsonrpc" => "2.0", "id" => 1, "method" => "initialize", "params" => INITIALIZE_PARAMS })
           deadline = clock.call + timeout
           buffer = +""
           bytes = 0
           phase = :initialize
           loop do
+            begin
+              return Result.result("cancelled", nil) if cancelled.call
+            rescue StandardError
+              return Result.result("failed", "cancel_check_failed")
+            end
             now = clock.call
             return Result.result("failed", "timeout") if now >= deadline
 
@@ -126,6 +131,10 @@ module Aiconshell
           payload = message["result"]
           return Result.result("failed", "unexpected_output") unless payload.is_a?(Hash)
 
+          unless [true, false].include?(payload["credentialRequired"])
+            return Result.result("failed", "unexpected_output")
+          end
+
           case payload["state"]
           when "accountLogin" then Result.result("connected", nil)
           when "loggedOut" then Result.result("disconnected", nil)
@@ -149,20 +158,6 @@ module Aiconshell
           session.write_stdin("#{JSON.generate(object)}\n")
         end
 
-        def close_session(session, kill_grace_seconds)
-          return if session.nil?
-
-          begin
-            session.terminate(grace: kill_grace_seconds) if session.alive?
-          rescue StandardError
-            nil
-          end
-          begin
-            session.close
-          rescue StandardError
-            nil
-          end
-        end
       end
     end
   end

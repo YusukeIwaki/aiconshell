@@ -4,7 +4,7 @@ module Aiconshell
   module Ai
     # Worker-side subscription authentication for the official AI CLIs.
     #
-    # Runs `claude auth login --claudeai`, `codex login --device-auth` and
+    # Runs `claude auth login --claudeai`, Codex app-server device login and
     # `muse login` plus their status probes inside the worker, so the web
     # tier never handles CLIs or long-lived tokens. Normal AI inference and
     # task execution stay independent of this operations-only surface.
@@ -31,4 +31,5 @@ require_relative "authentication/url_policy"
 require_relative "authentication/scanner"
 require_relative "authentication/session"
 require_relative "authentication/muse_rpc"
+require_relative "authentication/codex_rpc"
 require_relative "authentication/runner"

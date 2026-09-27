@@ -9,7 +9,7 @@ module Aiconshell
       # Runs official CLI login flows and status probes inside the worker.
       #
       # - `status(provider:)` reports the subscription state without any
-      #   browser round-trip (Claude/Codex via one-shot CLI status commands,
+      #   browser round-trip (Claude via its CLI status command, Codex via app-server,
       #   Muse via the official MSP `account/read` probe).
       # - `login(provider:, timeout:, on_challenge:, input:, cancelled:)`
       #   drives an interactive login: challenges (verification URL plus an
@@ -33,14 +33,9 @@ module Aiconshell
         DEFAULT_LOGIN_TIMEOUT = 900
         STATUS_TIMEOUT = 60
         POLL_INTERVAL = 0.2
-        MAX_CODE_CHARS = 256
+        MAX_CODE_BYTES = 4096
 
         DEFAULT_CLOCK = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }.freeze
-
-        CODEX_LOGIN_OVERRIDES = [
-          "-c", 'forced_login_method="chatgpt"',
-          "-c", 'cli_auth_credentials_store="file"'
-        ].freeze
 
         def initialize(config: Config.default, registry: nil, process_runner: ProcessRunner.new,
           session_factory: Session, clock: DEFAULT_CLOCK)
@@ -82,6 +77,10 @@ module Aiconshell
             )
           end
 
+          if provider == "codex"
+            return codex_rpc(executable, env, dir, timeout: STATUS_TIMEOUT).call
+          end
+
           check_oneshot(provider, executable, env, dir)
         rescue StandardError
           Result.unknown_fallback
@@ -114,11 +113,38 @@ module Aiconshell
           return early unless early.nil?
 
           env = ChildEnv.build(provider: provider, config: @config)
+          if provider == "codex"
+            return codex_rpc(executable, env, dir, timeout: timeout,
+                             on_challenge: on_challenge, cancelled: cancelled).call
+          end
+
+          deadline = @clock.call + timeout
           session = spawn_session(login_argv(provider, executable), env, dir)
           return Result.result("failed", "spawn_failed") if session.nil?
 
-          drive_login(provider, session, timeout,
+          outcome = drive_login(provider, session, timeout,
             on_challenge: on_challenge, input: input, cancelled: cancelled)
+          return outcome unless outcome["state"] == "connected"
+
+          # A successful CLI exit is only provisional. Verify the stored
+          # subscription mode through the official status interface.
+          decision = preflight_cancelled(cancelled)
+          return decision if decision
+          remaining = deadline - @clock.call
+          return Result.result("expired", nil) if remaining <= 0
+          outcome = if provider == "muse"
+            MuseRpc.check(session_factory: @session_factory, executable: executable,
+              env: env, cwd: dir, clock: @clock, timeout: [remaining, STATUS_TIMEOUT].min,
+              max_output_bytes: @config.max_output_bytes,
+              kill_grace_seconds: @config.kill_grace_seconds, cancelled: cancelled)
+          else
+            check_oneshot(provider, executable, env, dir, timeout: [remaining, STATUS_TIMEOUT].min)
+          end
+          decision = preflight_cancelled(cancelled)
+          return decision if decision
+          return Result.result("expired", nil) if @clock.call >= deadline
+
+          outcome
         rescue StandardError
           Result.unknown_fallback
         end
@@ -138,7 +164,10 @@ module Aiconshell
 
         def prepare_dir(provider)
           dir = @config.auth_dir_for(provider)
-          FileUtils.mkdir_p(dir)
+          [dir, @config.controlled_home].each do |path|
+            FileUtils.mkdir_p(path, mode: 0o700)
+            File.chmod(0o700, path)
+          end
           dir
         rescue SystemCallError
           nil
@@ -148,8 +177,6 @@ module Aiconshell
           case provider
           when "claude"
             [executable, "auth", "login", "--claudeai"]
-          when "codex"
-            [executable, "login", "--device-auth", *CODEX_LOGIN_OVERRIDES]
           when "muse"
             [executable, "login"]
           end
@@ -159,8 +186,6 @@ module Aiconshell
           case provider
           when "claude"
             [executable, "auth", "status", "--json"]
-          when "codex"
-            [executable, "login", "status", *CODEX_LOGIN_OVERRIDES]
           end
         end
 
@@ -179,11 +204,17 @@ module Aiconshell
           Result.result("failed", "cancel_check_failed")
         end
 
-        def check_oneshot(provider, executable, env, dir)
+        def codex_rpc(executable, env, dir, **options)
+          CodexRpc.new(session_factory: @session_factory, executable: executable,
+            env: env, cwd: dir, clock: @clock, max_output_bytes: @config.max_output_bytes,
+            kill_grace_seconds: @config.kill_grace_seconds, **options)
+        end
+
+        def check_oneshot(provider, executable, env, dir, timeout: STATUS_TIMEOUT)
           child = @process_runner.call(
             argv: status_argv(provider, executable),
             env: env, cwd: dir, stdin_data: nil,
-            timeout: STATUS_TIMEOUT,
+            timeout: timeout,
             max_output_bytes: @config.max_output_bytes,
             kill_grace_seconds: @config.kill_grace_seconds
           )
@@ -192,52 +223,32 @@ module Aiconshell
             return Result.result("failed", "output_capped")
           end
 
-          if provider == "claude"
-            parse_claude_status(child.stdout)
-          else
-            parse_codex_status("#{child.stdout}\n#{child.stderr}")
-          end
+          parse_claude_status(child.stdout, child.exit_status)
         rescue SystemCallError, IOError
           Result.result("failed", "spawn_failed")
         end
 
-        # `claude auth status --json` prints {"loggedIn": bool, ...} (exit 1
-        # when logged out). The body is authoritative; only the subscription
-        # signal is extracted, never paths or raw text.
-        def parse_claude_status(stdout)
+        def parse_claude_status(stdout, exit_status)
           parsed = JSON.parse(stdout.to_s.strip)
           return Result.result("failed", "unexpected_output") unless parsed.is_a?(Hash)
-
-          case parsed["loggedIn"]
-          when true
-            method = parsed["authMethod"]
-            if method.is_a?(String) && method.match?(/api[\s_-]?key|access[\s_-]?token|\bconsole\b/i)
-              Result.result("failed", "auth_rejected")
-            else
-              Result.result("connected", nil)
-            end
-          when false
-            Result.result("disconnected", nil)
+          unless [true, false].include?(parsed["loggedIn"]) &&
+                 parsed["authMethod"].is_a?(String) && parsed["apiProvider"].is_a?(String)
+            return Result.result("failed", "unexpected_output")
+          end
+          if parsed["loggedIn"] == false && parsed["authMethod"] == "none" &&
+              parsed["apiProvider"] == "firstParty" && [0, 1].include?(exit_status)
+            return Result.result("disconnected", nil)
+          end
+          unless parsed["authMethod"] == "claude.ai" && parsed["apiProvider"] == "firstParty"
+            return Result.result("failed", "auth_rejected")
+          end
+          if parsed["loggedIn"] == true && exit_status == 0
+            Result.result("connected", nil)
           else
             Result.result("failed", "unexpected_output")
           end
         rescue JSON::ParserError
           Result.result("failed", "unexpected_output")
-        end
-
-        # `codex login status` prints human text ("Not logged in" with exit 1
-        # when logged out). API-key selections are rejected, never connected.
-        def parse_codex_status(text)
-          if text.match?(/api[\s_-]?key|access[\s_-]?token|--with-api-key|--with-access-token/i) ||
-              text.match?(/OPENAI_API_KEY|CODEX_(API_KEY|ACCESS_TOKEN)/)
-            Result.result("failed", "auth_rejected")
-          elsif text.match?(/not\s+logged\s+in/i) || text.match?(/\blogged\s+out\b/i)
-            Result.result("disconnected", nil)
-          elsif text.match?(/chatgpt/i) || text.match?(/\blogged\s+in\b/i) || text.match?(/\bsigned\s+in\b/i)
-            Result.result("connected", nil)
-          else
-            Result.result("failed", "unexpected_output")
-          end
         end
 
         def drive_login(provider, session, timeout, on_challenge:, input:, cancelled:)
@@ -372,8 +383,8 @@ module Aiconshell
           return nil unless code.is_a?(String)
 
           cleaned = code.strip
-          return nil if cleaned.empty? || cleaned.length > MAX_CODE_CHARS
-          return nil if cleaned.match?(/[\x00-\x1F\x7F]/)
+          return nil if cleaned.empty? || cleaned.bytesize > MAX_CODE_BYTES
+          return nil if cleaned.match?(/[[:cntrl:]]/)
 
           cleaned
         end
@@ -439,20 +450,8 @@ module Aiconshell
         end
 
         def close_session(session)
-          return if session.nil?
-
-          begin
-            session.terminate(grace: @config.kill_grace_seconds) if session.alive?
-          rescue StandardError
-            nil
-          end
-          begin
-            session.close
-          rescue StandardError
-            nil
-          end
+          Session.cleanup(session, grace: @config.kill_grace_seconds, clock: @clock)
         end
-
       end
     end
   end

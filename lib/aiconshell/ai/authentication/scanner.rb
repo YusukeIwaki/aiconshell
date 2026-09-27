@@ -114,7 +114,10 @@ module Aiconshell
         end
 
         def api_key_hit?
-          API_KEY_MARKERS.any? { |pattern| pattern.match?(@text) }
+          # Official OAuth scopes can legitimately contain api_key. Only
+          # explanatory text outside URLs is a mode-change signal.
+          text = @text.gsub(URL_PATTERN, " ")
+          API_KEY_MARKERS.any? { |pattern| pattern.match?(text) }
         end
 
         def input_required?
@@ -174,9 +177,22 @@ module Aiconshell
         def current_code
           case @provider
           when "codex" then hyphen_code
-          when "muse" then hyphen_code || token_code
+          when "muse" then muse_url_code || hyphen_code || token_code
           else nil
           end
+        end
+
+        def muse_url_code
+          value = passing_urls.first
+          return nil unless value
+
+          codes = URI.decode_www_form(URI(value).query.to_s).select { |key, _| key == "code" }
+          return nil unless codes.size == 1
+
+          code = codes.first.last
+          code.match?(/\A[A-Za-z0-9-]{1,64}\z/) ? code : nil
+        rescue ArgumentError, URI::InvalidURIError
+          nil
         end
 
         # Code-bearing lines with URL substrings blanked, so opaque query

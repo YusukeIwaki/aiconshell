@@ -1,137 +1,128 @@
-# AI auth protocol (worker-side subscription login)
+# Worker subscription authentication
 
-Worker-only Ruby port that starts official CLI subscription logins and reads
-their status, so the admin UI can connect Claude / Codex / Muse Code accounts
-without the web tier ever handling CLIs or long-lived tokens. Normal AI
-inference and task execution stay independent of this operations surface.
+The web tier records operations requests. Workers run the official CLIs and
+retain long-lived credentials in private volumes. Authentication is separate
+from business task execution; there is no arbitrary command or terminal API.
 
-Ownership (issue #16): `lib/aiconshell/ai/authentication.rb` and its
-subdirectory, the `require` line in `lib/aiconshell/ai.rb`,
-`smartest/ai/authentication_*`, and this document. Rails models,
-controllers, jobs, views and queue configuration belong to another issue.
-
-All challenge URLs, query values and user codes in fixtures and in this
-document are placeholders (`PLACEHOLDER`, `TEST-…`, `DEMO…`): only the
-official host/path shapes are real. Real transcripts must never be recorded.
-
-## Contract
+## Ruby contract
 
 ```ruby
-runner = Aiconshell::Ai::Authentication::Runner.new(
-  config: Aiconshell::Ai::Config.default, # registry:, process_runner:,
-  session_factory:, clock: also injectable
-)
+runner = Aiconshell::Ai::Authentication::Runner.new(config: config)
 runner.status(provider: "codex")
-# => {"state" => "connected", "error_code" => nil}
-runner.login(provider: "muse", timeout: 900,
-             on_challenge: ->(challenge) { ... },
-             input: -> { ... }, cancelled: -> { false })
+# {"state"=>"connected", "error_code"=>nil}
+runner.login(provider: "claude", timeout: 900,
+  on_challenge: ->(challenge) { ... },
+  input: -> { nil }, cancelled: -> { false })
 ```
 
-Both methods always return a schema-validated string-key Hash and never raise
-for operational failures: unknown providers, bad inputs, spawn errors,
-unexpected CLI output and callback failures map to fixed classifications.
-Raw stdout/stderr, tokens, secret file contents and exception text never
-leave the boundary.
+`config`, executable registry, process runner, interactive session factory and
+monotonic clock are injectable. All results and challenges crossing this
+boundary are validated against JSON Schema. Raw provider output, account
+identifiers, exception text and credentials never leave it.
 
-States: `connected`, `disconnected`, `unavailable` (CLI executable missing),
-`failed`. `login` additionally returns `cancelled` (cancel callback fired)
-and `expired` (deadline passed, or the CLI reported an expired code).
-`error_code` is null unless state is `failed`:
+Status states are `connected`, `disconnected`, `unavailable`, `failed`. Login
+also returns `cancelled` or `expired`. Failure codes are the fixed allowlist in
+`Authentication::Result::ERROR_CODES`; unknown exceptions become `unknown`.
+A missing executable is `unavailable`, not connected. A connected status
+identifies the CLI's stored subscription-account mode; it does not prove a
+live token, entitlement, available quota or successful AI inference.
 
-| `error_code` | Meaning |
-| --- | --- |
-| `invalid_provider` | provider is not `claude`, `codex` or `muse` |
-| `invalid_argument` | bad timeout or non-callable callback |
-| `spawn_failed` | auth dir or child process could not start |
-| `timeout` | status probe exceeded its internal deadline |
-| `unexpected_output` | unparseable or unrecognized CLI output |
-| `output_capped` | output exceeded `max_output_bytes` |
-| `challenge_rejected` | verification URL failed the provider policy |
-| `auth_rejected` | CLI reports auth failure, or an API-key/access-token lane was detected |
-| `callback_failed` | `on_challenge` raised |
-| `input_failed` | `input` raised or returned a malformed code |
-| `cancel_check_failed` | `cancelled` raised |
-| `interrupted` | child I/O failed mid-session (broken pipe, …) |
-| `unknown` | last-resort guard; carries no detail |
-
-`on_challenge` receives only schema-validated challenges (emitted on first
-sight and on material change — code arrival, prompt appearance):
+`on_challenge` receives exactly:
 
 ```json
-{"verification_uri": "https://…", "user_code": "string or null", "input_required": false}
+{"verification_uri":"https://official-provider/path", "user_code":null, "input_required":false}
 ```
 
-The URI keeps its query (the flow needs it) and must match the provider's
-official HTTPS host/path exactly; userinfo, non-443 ports, control
-characters, fragments and unlisted hosts/paths are rejected and fail the
-attempt with `challenge_rejected`. `user_code` is transient guidance and may
-be null.
+Real URLs and user codes are temporary secrets. Examples/tests use synthetic
+values. Only HTTPS with the provider's exact host/path is permitted; userinfo,
+non-443 ports, fragments and control characters are rejected. Allowed paths:
 
-`input.call` is consulted for Claude only, after the `Paste code here if
-prompted` stdin prompt appears: nil while empty, the authorization code
-String once. The code is written to the child stdin pipe (never argv) and
-stdin is then closed. `cancelled.call` is polled about every 0.2s with the
-deadline; cancel, timeout, callback failure and child exit all terminate the
-child process group and close FDs in finite time.
+- Claude: `https://claude.com/cai/oauth/authorize`
+- Codex: `https://auth.openai.com/codex/device`
+- Muse: `https://auth.meta.com/oauth/device/`
 
-## Provider commands
+Queries are preserved for the official flow. OAuth scopes containing
+`api_key` do not imply an API-key login; subscription mode is verified through
+the official status interface. Muse's short user code is extracted from the
+single `code` query parameter only after URL validation.
 
-Children run with an argv array (no shell), the `ChildEnv` allowlist env (no
-DB/integration/API-key variables) and the provider auth dir on the private
-volume as dedicated cwd. No arbitrary commands, no generic terminal, no
-custom OAuth client.
+Claude's `input` callback is polled after the CLI stdin prompt. It returns nil
+until a code is submitted, then a printable single line of at most 4096 bytes,
+including the full `authorizationCode#state`. It is written to stdin once,
+never argv. The UI consumes the encrypted input before this write. A crash
+between consumption and write requires a fresh login; it cannot replay codes.
 
-| Provider | Login | Status |
-| --- | --- | --- |
-| Claude Code | `claude auth login --claudeai` (subscription; never `--console`) | `claude auth status --json` → `{"loggedIn": bool, …}` |
-| Codex | `codex login --device-auth -c forced_login_method="chatgpt" -c cli_auth_credentials_store="file"` (never `--with-api-key` / `--with-access-token`) | `codex login status` with the same `-c` overrides → human text |
-| Muse Code | `muse login` (browser code approval, polled) | no CLI status: MSP `account/read` over `muse serve --no-session-log --disable-write --disable-shell` |
+## Provider protocols
 
-Status mapping: Claude `loggedIn` true/false decides, except an explicit
-API-key/Console/token `authMethod` is `auth_rejected`. Codex `Not logged
-in`/`logged out` is disconnected, ChatGPT/logged-in/signed-in text is
-connected, API-key/access-token text is `auth_rejected`, anything else is
-`unexpected_output`. MSP `accountLogin` alone is connected, `loggedOut` is
-disconnected, `envKey`/`apiKey` are `auth_rejected`, and unknown future
-states fail safe — only the `state` member is read, labels/avatars/keys are
-never extracted, and the serve child is reaped once answered.
+### Claude Code
 
-Login mapping: child exit 0 is connected; nonzero is classified from
-patterns (expiry → `expired`, auth failure → `auth_rejected`, else
-`unexpected_output`). API-key markers anywhere in login output abort
-immediately with `auth_rejected`.
+`claude auth login --claudeai` runs with pipes and waits for the operator's
+browser approval and pasted code. After exit zero,
+`claude auth status --json` must report `loggedIn: true`,
+`authMethod: "claude.ai"`, `apiProvider: "firstParty"` and exit zero.
+`none` plus `loggedIn: false` is disconnected. API-key, helper, token and
+third-party modes are rejected; incomplete/unknown shapes fail closed.
 
-Official URL allowlist (query preserved, shown here with placeholders):
+### Codex
 
-- Claude: `https://claude.com/cai/oauth/authorize?…`
-- Codex: `https://auth.openai.com/codex/device` (optional query preserved)
-- Muse: `https://auth.meta.com/oauth/device/?…`
+Run `codex -c forced_login_method='"chatgpt"'
+-c cli_auth_credentials_store='"file"' app-server --listen stdio://` using an
+argv array. The stdio protocol is newline JSON **without** a `jsonrpc` member:
 
-## Verification
+1. `initialize` with clientInfo and `experimentalApi: false`; wait for its
+   correlated response, then send `initialized`.
+2. Status: `account/read` with `refreshToken: false`.
+3. Login: `account/login/start` with `type: "chatgptDeviceCode"`; validate the
+   correlated result's type, loginId, verificationUrl and userCode.
+4. Wait for `account/login/completed` with the **same loginId**, success true
+   and no error. An `account/updated` notification alone is insufficient.
+5. Read the account again: only `account.type: "chatgpt"`, a string planType
+   and the required account/read shape count as connected. Null account is
+   disconnected; API-key, Bedrock and unknown modes are rejected. Optional
+   account metadata and future extra fields are not surfaced.
+6. Cancellation/error sends `account/login/cancel` for the exact pending
+   loginId, with a bounded response wait, then closes stdin and cleans up.
 
-`bin/test unit` (339 tests incl. 56 new authentication tests) and `bin/rails
-zeitwerk:check` pass. The authentication tests use scripted fake sessions,
-fake clocks and `RbConfig.ruby` dummy subprocesses only: chunk splits (URLs,
-ANSI escapes, OSC 8 hyperlinks), success/reject/unknown outputs, forged
-URLs, API-key rejection, cancel, deadlines, output caps, stdin-only codes,
-env confinement and process-group/FD cleanup. No live account, AI inference
-or network is required.
+Notifications arriving before the start response are correlated by loginId.
+Unknown response IDs never advance the protocol. The CLI owns token exchange
+and persistence; the application never parses auth.json or JWTs.
 
-Manual probes (read-only, empty homes, no login performed): CLI
-`--help`/`--version`, `claude auth status --json` and `codex login status`
-against empty config dirs, the `muse serve` initialize/initialized/
-`account/read` exchange against an empty XDG home, and the offline
-`muse schema generate-json-schema --experimental` export that pins the
-`AccountState` shape. Local binaries were Claude 2.1.280, codex-cli 0.155.1
-and Muse Code 1.4.0 (the worker image pins 2.1.283 / 0.157.1 / 1.4.0). One
-early read-only `claude auth status` smoke run used the default config
-before the empty-home discipline was set; it recorded nothing but the
-`disconnected` state. No login command was ever executed and no host auth
-cache contents were read.
+### Muse Code
 
-Not verified here (left for post-deploy acceptance): the exact logged-in
-`authMethod` values and `login status` success texts (parsers accept the
-documented positive signals and fail safe otherwise), the precise login
-stdout layouts beyond the confirmed shapes (the scanner is defensive and the
-URL policy is strict), and any real browser-approved login.
+`muse login` starts the official device flow. Exit zero is provisional:
+subscription mode is confirmed over the official MSP endpoint using
+`muse serve --no-session-log --disable-write --disable-shell`.
+
+Exchange newline JSON-RPC 2.0: `initialize` with `experimentalApi: true`, wait
+for the response, send `initialized`, then parameter-less `account/read`.
+The result must contain a boolean `credentialRequired`. Only state
+`accountLogin` is connected; `loggedOut` is disconnected; `apiKey` and `envKey`
+are rejected. Labels, avatars and unknown metadata are never returned.
+
+## Process boundary and verification
+
+Children receive array argv, an explicit environment with no application DB,
+plugin or API-key credentials, and a dedicated provider auth cwd. Auth homes
+and neutral HOME are private (0700). Input writes and output are bounded.
+Cancellation/deadlines are checked while waiting and again after post-login
+status verification. Status checks are bounded to 60 seconds or the remaining
+login deadline. Every terminal path closes stdin/FDs and terminates the entire
+process group, including descendants whose parent already exited.
+
+Smartest tests use scripted CLI sessions, explicit synthetic JSON fixtures,
+fake transports/clocks and harmless Ruby subprocesses. They cover protocol
+ordering/correlation, malformed and non-subscription results, expiry/cancel,
+secret-free failures, code consumption, output limits, stdin backpressure and
+process/FD cleanup. No unit test needs a real account or network.
+
+Manual acceptance used empty isolated homes in the pinned worker image:
+Claude 2.1.283, Codex 0.157.1 and Muse Code 1.4.0. All three reported
+`disconnected` offline, then exposed official login challenges and cancelled
+successfully without browser approval. Real account approval, token refresh
+and AI inference require the account owner and are separate checks.
+
+Official protocol documentation:
+- https://code.claude.com/docs/en/cli-reference
+- https://learn.chatgpt.com/docs/app-server#authentication-modes
+- https://learn.chatgpt.com/docs/auth
+- Muse's installed `--help` and `schema generate-json-schema --experimental`

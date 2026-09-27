@@ -38,7 +38,7 @@ test("auth login completes claude with a pasted code over stdin only") do
       expect(received[1]).to eq(
         { "verification_uri" => Support::CLAUDE_URL, "user_code" => nil, "input_required" => true }
       )
-      expect(session.terminated?).to eq(false)
+      expect(session.terminated?).to eq(true)
       expect(session.close_count >= 1).to eq(true)
     end
   end
@@ -67,69 +67,28 @@ test("auth login reassembles a chunk-split claude url before emitting") do
   end
 end
 
-test("auth login strips ansi styling split across chunks") do
+test("auth login strips ansi styling split across chunks for claude") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
       [
         [:stdout, "Visit \e[3"],
-        [:stdout, "4m#{Support::CODEX_URL}\e[0m\nEnter code #{Support::CODEX_CODE}\n"]
+        [:stdout, "4m#{Support::CLAUDE_URL}\e[0m\nEnter code #{Support::CODEX_CODE}\n"]
       ],
       exit_status: 0, clock: clock
     )
     sink, received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "connected", "error_code" => nil })
       expect(received.last).to eq(
-        { "verification_uri" => Support::CODEX_URL, "user_code" => Support::CODEX_CODE, "input_required" => false }
+        { "verification_uri" => Support::CLAUDE_URL, "user_code" => nil, "input_required" => false }
       )
     end
   end
 end
 
-test("auth login completes codex device flow without stdin input") do
-  AiTestSupport.with_tmpdir do |root|
-    clock = FakeClock.new
-    session = FakeAuthSession.new(
-      [[:stdout, "Go to #{Support::CODEX_URL_WITH_QUERY}\nEnter code #{Support::CODEX_CODE}\nWaiting for approval\n"]],
-      exit_status: 0, clock: clock
-    )
-    sink, received = Support.challenge_sink
-    input_calls = 0
-    input = -> { input_calls += 1 }
-    cancelled_calls = 0
-    cancelled = -> { cancelled_calls += 1; false }
-    Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, factory, config|
-      result = runner.login(provider: "codex", on_challenge: sink, input: input, cancelled: cancelled)
-      expect(result).to eq({ "state" => "connected", "error_code" => nil })
-
-      spawn = factory.spawns.fetch(0)
-      expect(spawn[:argv]).to eq(
-        [spawn[:argv].first, "login", "--device-auth",
-          "-c", 'forced_login_method="chatgpt"',
-          "-c", 'cli_auth_credentials_store="file"']
-      )
-      joined = spawn[:argv].join(" ")
-      expect(joined.include?("--with-api-key")).to eq(false)
-      expect(joined.include?("--with-access-token")).to eq(false)
-      expect(spawn[:env]).to eq(Aiconshell::Ai::ChildEnv.build(provider: "codex", config: config))
-
-      expect(session.stdin_writes).to eq([])
-      expect(input_calls).to eq(0)
-      expect(cancelled_calls >= 1).to eq(true)
-      expect(received).to eq(
-        [{
-          "verification_uri" => Support::CODEX_URL_WITH_QUERY,
-          "user_code" => Support::CODEX_CODE,
-          "input_required" => false
-        }]
-      )
-    end
-  end
-end
-
-test("auth login re-emits when the muse user code arrives late") do
+test("auth login extracts the muse code from its official URL") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
@@ -140,15 +99,16 @@ test("auth login re-emits when the muse user code arrives late") do
       exit_status: 0, clock: clock
     )
     sink, received = Support.challenge_sink
-    Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, factory, _config|
+    verified = FakeAuthSession.new([
+      [:stdout, "#{JSON.generate({id: 1, result: {}})}\n"],
+      [:stdout, "#{JSON.generate({id: 2, result: {state: "accountLogin", credentialRequired: true}})}\n"]
+    ], clock: clock)
+    Support.make_auth_runner(root, sessions: [session, verified], clock: clock) do |runner, factory, _config|
       expect(runner.login(provider: "muse", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "connected", "error_code" => nil })
       expect(factory.spawns.fetch(0)[:argv][1..]).to eq(["login"])
       expect(received).to eq(
-        [
-          { "verification_uri" => Support::MUSE_URL, "user_code" => nil, "input_required" => false },
-          { "verification_uri" => Support::MUSE_URL, "user_code" => Support::MUSE_CODE, "input_required" => false }
-        ]
+        [{ "verification_uri" => Support::MUSE_URL, "user_code" => "PLACEHOLDER", "input_required" => false }]
       )
     end
   end
@@ -160,7 +120,7 @@ test("auth login connects quietly when the cli is already logged in") do
     session = FakeAuthSession.new([[:stdout, "Already signed in\n"]], exit_status: 0, clock: clock)
     sink, received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "connected", "error_code" => nil })
       expect(received).to eq([])
     end
@@ -171,15 +131,15 @@ test("auth login reads challenges from stderr too") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
-      [[:stderr, "Visit #{Support::CODEX_URL}\ncode #{Support::CODEX_CODE}\n"]],
+      [[:stderr, "Visit #{Support::CLAUDE_URL}\ncode #{Support::CODEX_CODE}\n"]],
       exit_status: 0, clock: clock
     )
     sink, received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "connected", "error_code" => nil })
       expect(received.size).to eq(1)
-      expect(received.first["verification_uri"]).to eq(Support::CODEX_URL)
+      expect(received.first["verification_uri"]).to eq(Support::CLAUDE_URL)
     end
   end
 end
@@ -187,12 +147,6 @@ end
 test("auth login rejects forged verification urls") do
   AiTestSupport.with_tmpdir do |root|
     {
-      "https://evil.example/sign-in" => "codex",
-      "http://auth.openai.com/codex/device" => "codex",
-      "https://auth.openai.com@evil.example/codex/device" => "codex",
-      "https://auth.openai.com:8443/codex/device" => "codex",
-      "https://auth.openai.com/other/path" => "codex",
-      "https://auth.openai.com/codex/device#frag" => "codex",
       "https://evil-claude.com/cai/oauth/authorize" => "claude",
       "https://auth.meta.com.evil.example/oauth/device/" => "muse"
     }.each do |forged, provider|
@@ -214,12 +168,12 @@ test("auth login rejects api-key pivots mid-flow") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
-      [[:stdout, "Visit #{Support::CODEX_URL}\nPlease sign in with an API key instead\n"]],
+      [[:stdout, "Visit #{Support::CLAUDE_URL}\nPlease sign in with an API key instead\n"]],
       exit_status: 0, clock: clock
     )
     sink, received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "auth_rejected" })
       expect(session.terminated?).to eq(true)
       expect(received).to eq([])
@@ -238,7 +192,7 @@ test("auth login classifies nonzero exits without leaking output") do
       session = FakeAuthSession.new([[:stdout, "#{text}\n"]], exit_status: 1, clock: clock)
       sink, _received = Support.challenge_sink
       Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-        result = runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false })
+        result = runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false })
         if expected == "expired"
           expect(result).to eq({ "state" => "expired", "error_code" => nil })
         else
@@ -290,11 +244,11 @@ test("auth login maps callback failures to fixed classifications") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
-      [[:stdout, "Visit #{Support::CODEX_URL}\n"]], keep_alive: true, clock: clock
+      [[:stdout, "Visit #{Support::CLAUDE_URL}\n"]], keep_alive: true, clock: clock
     )
     sink, _received = Support.challenge_sink(raise_on: 1)
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "callback_failed" })
       expect(session.terminated?).to eq(true)
     end
@@ -312,7 +266,7 @@ test("auth login maps callback failures to fixed classifications") do
       expect(prompt.terminated?).to eq(true)
     end
 
-    [123, "", "  ", "bad\0code", "x" * 257].each do |bad_code|
+    [123, "", "  ", "bad\0code", "x" * 4097].each do |bad_code|
       clock3 = FakeClock.new
       session3 = FakeAuthSession.new(
         [[:stdout, "Visit #{Support::CLAUDE_URL}\nPaste code here if prompted > "]],
@@ -331,7 +285,7 @@ test("auth login maps callback failures to fixed classifications") do
     sink4, _received4 = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session4], clock: clock4) do |runner, _factory, _config|
       exploding = -> { raise "cancel boom" }
-      expect(runner.login(provider: "codex", on_challenge: sink4, input: -> { nil }, cancelled: exploding))
+      expect(runner.login(provider: "claude", on_challenge: sink4, input: -> { nil }, cancelled: exploding))
         .to eq({ "state" => "failed", "error_code" => "cancel_check_failed" })
     end
   end
@@ -359,7 +313,7 @@ test("auth login enforces the output cap") do
     session = FakeAuthSession.new([[:stdout, "y" * 5000]], keep_alive: true, clock: clock)
     sink, _received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock, max_output_bytes: 1024) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "output_capped" })
       expect(session.terminated?).to eq(true)
     end
@@ -373,12 +327,12 @@ test("auth login validates provider, timeout and callbacks without spawning") do
       expect(runner.login(provider: "nope", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "invalid_provider" })
       ["x", -1, 0, Float::NAN, Float::INFINITY].each do |timeout|
-        expect(runner.login(provider: "codex", timeout: timeout, on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+        expect(runner.login(provider: "claude", timeout: timeout, on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
           .to eq({ "state" => "failed", "error_code" => "invalid_argument" })
       end
-      expect(runner.login(provider: "codex", on_challenge: nil, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: nil, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "invalid_argument" })
-      expect(runner.login(provider: "codex", on_challenge: sink, input: "code", cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: "code", cancelled: -> { false }))
         .to eq({ "state" => "failed", "error_code" => "invalid_argument" })
       expect(factory.spawns).to eq([])
     end
@@ -397,30 +351,30 @@ test("auth login reports unavailable and spawn failure") do
     end
 
     factory = FakeSessionFactory.new { |_spawn| raise Errno::ENOENT, "gone" }
-    bin2 = AiTestSupport.make_bin(root, %w[codex])
+    bin2 = AiTestSupport.make_bin(root, %w[claude])
     config2 = AiTestSupport.make_config(root, bin: bin2)
     AiTestSupport.with_env("PATH" => bin2) do
       runner = Auth::Runner.new(config: config2, session_factory: factory)
       sink, _received = Support.challenge_sink
-      result = runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false })
+      result = runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false })
       expect(result).to eq({ "state" => "failed", "error_code" => "spawn_failed" })
       expect(result.inspect.include?("gone")).to eq(false)
     end
   end
 end
 
-test("auth login truncates codex challenge urls at sentence punctuation") do
+test("auth login truncates claude challenge urls at sentence punctuation") do
   AiTestSupport.with_tmpdir do |root|
     clock = FakeClock.new
     session = FakeAuthSession.new(
-      [[:stdout, "(see #{Support::CODEX_URL}.)\ncode #{Support::CODEX_CODE}\n"]],
+      [[:stdout, "(see #{Support::CLAUDE_URL}.)\ncode #{Support::CODEX_CODE}\n"]],
       exit_status: 0, clock: clock
     )
     sink, received = Support.challenge_sink
     Support.make_auth_runner(root, sessions: [session], clock: clock) do |runner, _factory, _config|
-      expect(runner.login(provider: "codex", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
+      expect(runner.login(provider: "claude", on_challenge: sink, input: -> { nil }, cancelled: -> { false }))
         .to eq({ "state" => "connected", "error_code" => nil })
-      expect(received.first["verification_uri"]).to eq(Support::CODEX_URL)
+      expect(received.first["verification_uri"]).to eq(Support::CLAUDE_URL)
     end
   end
 end

@@ -8,7 +8,7 @@ Auth = Aiconshell::Ai::Authentication unless defined?(Auth)
 
 test("auth status maps claude logged-in JSON to connected") do
   AiTestSupport.with_tmpdir do |root|
-    body = JSON.generate({ "loggedIn" => true, "authMethod" => "oauth", "configDirectory" => "/private/x" })
+    body = JSON.generate({ "loggedIn" => true, "authMethod" => "claude.ai", "apiProvider" => "firstParty", "configDirectory" => "/private/x" })
     process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: body)])
     AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, _config|
       expect(runner.status(provider: "claude")).to eq({ "state" => "connected", "error_code" => nil })
@@ -18,7 +18,7 @@ end
 
 test("auth status maps claude logged-out JSON to disconnected") do
   AiTestSupport.with_tmpdir do |root|
-    body = JSON.generate({ "loggedIn" => false, "authMethod" => "none" })
+    body = JSON.generate({ "loggedIn" => false, "authMethod" => "none", "apiProvider" => "firstParty" })
     process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: body, exit_status: 1)])
     AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, _config|
       expect(runner.status(provider: "claude")).to eq({ "state" => "disconnected", "error_code" => nil })
@@ -29,7 +29,7 @@ end
 test("auth status rejects claude api-key and console methods") do
   AiTestSupport.with_tmpdir do |root|
     %w[apiKey API_KEY console].each do |method|
-      body = JSON.generate({ "loggedIn" => true, "authMethod" => method })
+      body = JSON.generate({ "loggedIn" => true, "authMethod" => method, "apiProvider" => "firstParty" })
       process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: body)])
       AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, _config|
         expect(runner.status(provider: "claude")).to eq({ "state" => "failed", "error_code" => "auth_rejected" })
@@ -53,7 +53,7 @@ end
 
 test("auth status spawns claude with fixed argv, allowlist env and auth cwd") do
   AiTestSupport.with_tmpdir do |root|
-    body = JSON.generate({ "loggedIn" => false })
+    body = JSON.generate({ "loggedIn" => false, "authMethod" => "none", "apiProvider" => "firstParty" })
     process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: body, exit_status: 1)])
     AiTestSupport.with_env("DATABASE_URL" => "postgres://secret/db", "OPENAI_API_KEY" => "sk-secret") do
       AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, config|
@@ -67,53 +67,6 @@ test("auth status spawns claude with fixed argv, allowlist env and auth cwd") do
         expect(call[:cwd]).to eq(config.auth_dir_for("claude"))
         expect(call[:stdin_data]).to be_nil
       end
-    end
-  end
-end
-
-# --- status: codex ---
-
-test("auth status maps codex login text") do
-  AiTestSupport.with_tmpdir do |root|
-    {
-      "Not logged in" => "disconnected",
-      "logged out" => "disconnected",
-      "Logged in with ChatGPT as Demo User" => "connected",
-      "Signed in with ChatGPT" => "connected",
-      "Logged in using API key" => "auth_rejected",
-      "Authenticated with access token" => "auth_rejected",
-      "totally unfamiliar banner" => "unexpected_output"
-    }.each do |text, expected|
-      process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: "#{text}\n")])
-      AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, _config|
-        result = runner.status(provider: "codex")
-        if expected == "connected" || expected == "disconnected"
-          expect(result).to eq({ "state" => expected, "error_code" => nil })
-        else
-          expect(result).to eq({ "state" => "failed", "error_code" => expected })
-        end
-        expect(result.inspect.include?(text)).to eq(false)
-      end
-    end
-  end
-end
-
-test("auth status forces codex chatgpt file login and never api flags") do
-  AiTestSupport.with_tmpdir do |root|
-    process = FakeProcessRunner.new([FakeProcessRunner.ok(stdout: "Not logged in\n", exit_status: 1)])
-    AuthenticationTestSupport.make_auth_runner(root, process_runner: process) do |runner, _factory, config|
-      runner.status(provider: "codex")
-      call = process.calls.fetch(0)
-      expect(call[:argv]).to eq(
-        [call[:argv].first, "login", "status",
-          "-c", 'forced_login_method="chatgpt"',
-          "-c", 'cli_auth_credentials_store="file"']
-      )
-      joined = call[:argv].join(" ")
-      expect(joined.include?("--with-api-key")).to eq(false)
-      expect(joined.include?("--with-access-token")).to eq(false)
-      expect(call[:env]).to eq(Aiconshell::Ai::ChildEnv.build(provider: "codex", config: config))
-      expect(call[:cwd]).to eq(config.auth_dir_for("codex"))
     end
   end
 end
@@ -225,7 +178,7 @@ test("auth status speaks initialize, initialized and account/read to muse serve"
       )
       expect(writes[1]).to eq({ "jsonrpc" => "2.0", "method" => "initialized" })
       expect(writes[2]).to eq({ "jsonrpc" => "2.0", "id" => 2, "method" => "account/read" })
-      expect(session.terminated?).to eq(false)
+      expect(session.terminated?).to eq(true)
       expect(session.close_count >= 1).to eq(true)
     end
   end
@@ -236,7 +189,7 @@ test("auth status reaps muse serve after the answer and on failure") do
     clock = FakeClock.new
     lingering = FakeAuthSession.new(
       [[:stdout, "#{JSON.generate({ "jsonrpc" => "2.0", "id" => 1, "result" => {} })}\n"],
-        [:stdout, "#{JSON.generate({ "jsonrpc" => "2.0", "id" => 2, "result" => { "state" => "loggedOut" } })}\n"]],
+        [:stdout, "#{JSON.generate({ "jsonrpc" => "2.0", "id" => 2, "result" => { "state" => "loggedOut", "credentialRequired" => true } })}\n"]],
       keep_alive: true, clock: clock
     )
     AuthenticationTestSupport.make_auth_runner(root, sessions: [lingering], clock: clock) do |runner, _factory, config|
