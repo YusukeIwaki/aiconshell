@@ -2,7 +2,7 @@
 
 ## 目的と境界
 
-Web とバックグラウンドワーカーは PostgreSQL を共有する。Solid Queue も同じデータベースに配置する。状態を持つ Rails の制御処理と、CLI を呼び出す実行処理を常駐コンテナで動かす。
+Web とバックグラウンドワーカーは PostgreSQL を共有する。Solid Queue も同じデータベースに配置する。状態を持つ Rails の制御処理と、CLI を呼び出す実行処理を常駐コンテナで動かす。1 利用環境は専用 DB（非特権 login role）+ Web / control / execution の3サービスが単位であり、同一環境の Web replica とは区別する。共有サーバー上の複数利用環境は同一 Railway environment に置く。詳細は [Railway 複数利用環境の運用](railway-environments.md)。
 
 ```mermaid
 flowchart TB

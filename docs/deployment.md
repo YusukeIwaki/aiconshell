@@ -285,6 +285,8 @@ GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
 実デプロイ・有料リソース作成・ログインは運営者作業。同一 project / environment に
 同じ repository を使う web・control・execution と、PostgreSQL・ClickHouse を配置する。
 DB / ClickHouse は private networking で接続し、公開ポートを作らない。
+1 台の PostgreSQL サーバーで独立した利用環境を複数運用する場合は
+[docs/railway-environments.md](railway-environments.md) も参照。
 
 ### サービスごとの設定とビルド
 
@@ -301,8 +303,10 @@ TOML / JSON に opt-in できない。既存利用サービスの対応期限は
 | control | `/railway.control.toml` | `./bin/jobs --config-file=config/queue_control.yml` | なし | なし |
 | execution | `/railway.execution.toml` | `./bin/jobs --config-file=config/queue_execution.yml --skip-recurring` | なし | なし |
 
-全サービスの Builder は Dockerfile、Dockerfile Path は `Dockerfile`、Root Directory は
-repository のルート。通常の Restart Policy は On Failure、最大 retry は 10。
+全サービスは repository ルートの `Dockerfile` でビルドする。Railway はこのファイルを
+自動検出するため、API の builder enum に `DOCKERFILE` を指定しない（`RAILPACK` のままでよい）。
+Dockerfile Path は `Dockerfile`、Root Directory は repository のルート。
+通常の Restart Policy は On Failure、最大 retry は 10。
 既存 Config-as-Code サービスは Settings で **サービスごとに上表の絶対 repository path を選択**する。
 設定ファイル内の値は dashboard より優先されるため、web の TOML のまま worker の
 Start Command を dashboard で上書きしても切り替わらない。
@@ -328,10 +332,10 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 
 | 変数 | 設定先と値の例 |
 | --- | --- |
-| `DATABASE_URL` | 3 サービスに `${{Postgres.DATABASE_URL}}` |
+| `DATABASE_URL` | 3 サービスにその利用環境の専用 role 接続文字列。管理者接続（`${{Postgres.DATABASE_URL}}`）をそのまま使わない。複数環境は [docs/railway-environments.md](railway-environments.md) |
 | `CLICKHOUSE_URL` | web / control に `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
-| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
-| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
+| `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に利用環境専用の制限付き ClickHouse database / user 資格情報。operator 資格情報は ClickHouse 側だけに置き、アプリには渡さない |
+| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値（利用環境ごとに別の値） |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
 | `ADMIN_API_TOKEN` | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値（未設定は fail closed。UI 認証とは別。`docs/task-requests.md`） |
 | `RAILS_ENV` | 3 サービスに `production` |
@@ -388,11 +392,14 @@ image 内の `chown` は、後から mount される Railway volume の所有権
    exit
    ```
 
-3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻す。
-   まず待機コマンドのまま再 deploy し、`railway ssh --service control -- id -u` が `1000`、
-   `railway ssh --service control -- test -w /data/workspaces` が成功することを確認する。
+3. `RAILWAY_RUN_UID` を削除して image の `USER 1000:1000` に戻し、まず待機コマンドで再 deploy する。
+   Railway の SSH shell は root で始まることがあるため、SSH の `id -u` とアプリの実行 UID を混同しない。
+   `/proc/1/status` の `Uid` が `1000` であることと、
+   `railway ssh --service control -- runuser -u rails -- test -w /data/workspaces` の成功を確認する。
    execution でもサービス名を変えて同じ確認を行う。
-4. UID 1000 の remote shell 内で、その worker が使う provider に個別ログインする。
+4. `railway ssh --service control -- runuser -u rails -- bash` で UID 1000 の shell を開き、
+   `id -u` を確認して、その worker が使う provider に個別ログインする。
+   execution でも同様に行う。root のまま認証ファイルを作らない。
    「5. AI CLI プロビジョニング」の公式 subscription login 手順を使い、Muse の対話シェルでは
    `export XDG_CONFIG_HOME="$AICONSHELL_MUSE_HOME"` を先に実行する。
    通常の token refresh はそのサービスの volume だけに保存される。
@@ -407,12 +414,12 @@ root を要するのはこの初回の filesystem 設定だけで、通常の Ra
 
 web の Pre-deploy Command は `./bin/rails db:prepare` のみ。必要な workflow env は
 pre-deploy にも渡す。worker は SQL migration 成功後に起動する。
-ClickHouse スキーマは logging availability とアプリ起動を分離し、control が稼働してから
-運営者のローカル端末で以下を実行する。コマンド本体は remote container 内で動く。
-
-```sh
-railway ssh --service control -- /rails/bin/setup-clickhouse
-```
+ClickHouse スキーマは logging availability とアプリ起動を分離し、private network 内の
+operator コンテキストで初期化する。先に利用環境専用 database を作り、その database を
+指定して `db/clickhouse/*.sql` を適用する。アプリのソースがある一時的な初期化コンテナなら
+`bin/setup-clickhouse` を使える。通常の control は `SELECT` / `INSERT` のみを持つため、
+その runtime 資格情報で DDL を実行しない。operator 資格情報を常設のアプリへ追加しない。
+詳しい権限分離は [複数利用環境の初期化手順](railway-environments.md#追加手順) を参照。
 
 `railway run` は service variables を取得して**ローカルで**実行する CLI なので、
 private DNS の ClickHouse 初期化には使わない。SSH 接続には Railway に登録済みの SSH key が必要。
@@ -420,8 +427,14 @@ private DNS の ClickHouse 初期化には使わない。SSH 接続には Railwa
 `PORT` は Railway の注入値を使い、web の公開ドメインだけを有効化する。
 [railway ssh](https://docs.railway.com/cli/ssh)・[railway run](https://docs.railway.com/cli/run)
 
-この手順の local 検証は TOML / Docker target / volume 権限に限定する。
-Railway 実環境での deploy・private DNS 到達・SSH・subscription login は運営者による別確認とする。
+SSH を使わず初期化する場合は、運営者が管理する一時 Start Command / 初期化コンテナを
+使える。volume の初期化は対象 worker の mount 済みコンテナ内で行い、完了後は
+`RAILWAY_RUN_UID` を外して UID 1000 で書き込みを確認し、通常 Start Command に戻す。
+DB 初期化用コンテナと一時的な operator 資格情報は作業後に削除する。
+ログには完了マーカーだけを出し、秘密値・環境変数一覧・認証キャッシュを出さない。
+
+ローカルの静的検証と、Railway 上のデプロイ・private DNS 到達・subscription login の
+確認結果は分けて記録する。CLI 同梱や worker 起動だけでアカウント認証済みとは扱わない。
 
 ## 8. ngrok（明示 opt-in）
 
