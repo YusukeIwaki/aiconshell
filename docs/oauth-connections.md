@@ -2,9 +2,12 @@
 
 Atlassian（Jira Cloud 3LO）と Microsoft（Entra Authorization Code + PKCE S256、
 confidential client）で「同意したユーザーとして」動くための共通基盤（#22）。
-既存の `jira`（service account）と `teams`（Graph application + Bot）は維持し、
-委任版 `jira_oauth` / `teams_oauth` プラグインは後続 Issue（#24 / #25）がこの
-基盤の上に作る。管理画面（#23）と業務フロー統合（#26）も後続である。
+運用名義は (1) 既存サービスアカウント/Bot 名義の Bot 運用（`jira` service
+account / `teams` Graph application + Bot を維持）と (2) 同意した特定ユーザー
+名義の OAuth2 代理運用（本基盤 + 後続の委任版 `jira_oauth` / `teams_oauth`）の
+2 種類である。個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth
+失敗時の PAT fallback は追加しない。委任版プラグインは後続 Issue（#24 /
+#25）がこの基盤の上に作る。管理画面（#23）と業務フロー統合（#26）も後続である。
 
 初版の範囲は 1 利用環境あたり provider（`atlassian` / `microsoft`）ごとに
 接続ユーザー 1 名。Jira Cloud は運用設定で指定した 1 cloud ID、Microsoft は
@@ -114,9 +117,17 @@ token = creds.access_token(binding.to_h) # 直前の外部書込のためだけ�
   で `expired` として拒否する。交換・検証の後、公開直前に試行の状態
   （`consumed` のみ可）・TTL・世代・設定 snapshot を再確認し、接続保存と
   試行成功を同じ transaction で行う（片方だけ成功させない）。
+- publish（接続保存）と `disconnect` は provider 単位の短い transaction
+  lock（`pg_advisory_xact_lock`）を先に取り、次に試行行（id 順）→接続行の
+  同じ順番で lock する。初回で接続行がまだない phantom を避けるため、
+  `disconnect` は行がなくても `disconnected` の tombstone を作って世代を
+  進める。TTL/lease の時刻判定は lock 取得後の clock で再確認し、lock 待ち
+  の間に失効した試行を公開しない。
 - `state` 不一致・期限切れ・同意拒否（`error=access_denied`）は試行だけを
   終端し、元の正常接続を壊さない。初回接続行がない間の callback 中に
-  `disconnect` しても、試行の終端状態を再確認するため接続は復活しない。
+  `disconnect` しても、tombstone と試行の終端状態の再確認により接続は
+  復活しない。同時に DB 保存へ進む publish/disconnect は実 PG の別
+  connection による競合テストで fence する。
 - Microsoft のみ PKCE S256 を使う（verifier は試行に暗号化保存し交換で消費）。
   Atlassian 3LO に PKCE は送らない（仕様にない対応を捏造しない）。
 - Atlassian は `audience=api.atlassian.com`、`prompt=consent`、
@@ -149,11 +160,16 @@ token = creds.access_token(binding.to_h) # 直前の外部書込のためだけ�
   途中の再接続・解除・lease 期限切れは古い結果を破棄し、新しい接続や解除を
   復活させない。`refresh_token` 欠落・復号失敗の `needs_reauth` 更新と、
   期限切れ lease の clear は commit してから例外を上げる（transaction 内
-  raise による rollback を防ぎ、実 DB reload で確認する）。
-- refresh 応答で scope が明示的に縮小した場合や、接続時から client /
+  raise による rollback を防ぎ、実 DB reload で確認する）。lease/世代の
+  時刻判定は lock 取得後の clock で再確認する。
+- 期限内 token の払い出し前と refresh HTTP の前にも現在設定
+  （client_id・固定 cloud/tenant）を照合し、不一致は型付き
+  `binding_mismatch` で HTTP 前に拒否する（HTTP 呼出ゼロ、fixture 未消費）。
+  refresh 応答で scope が明示的に縮小した場合や、接続時から client /
   tenant / cloud 設定が変わった場合は、元の検証済み binding に正常 token
   として払い出さない（省略時は仕様どおり要求 scope とみなす）。lease は
-  clear し、古い接続を上書きしない。
+  clear し、古い接続を上書きしない。別 PG connection から重なる二つの実
+  TokenService による claim 競合を明示バリアと有限 timeout で検証する。
 - rotation がサーバーで受理された後の timeout / DB 保存失敗 / プロセス停止
   では旧 refresh token の有効性を断言できない。この場合は旧行を残して
   安全に再試行し（次回 refresh が可否を証明する）、明示の `invalid_grant`

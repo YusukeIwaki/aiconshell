@@ -70,6 +70,7 @@ test("callback with the wrong browser session is rejected without consuming") do
   expect(OauthAuthAttempt.last.status).to eq("pending")
   expect(OauthConnection.count).to eq(0)
   expect(ctx[:transport].requests.size).to eq(0)
+  ctx[:transport].assert_consumed!
 end
 
 test("double callback is rejected: the second use fails") do |db:|
@@ -111,6 +112,7 @@ test("expired attempts fail without network or connection") do |db:|
   expect(OauthAuthAttempt.last.status).to eq("expired")
   expect(OauthConnection.count).to eq(0)
   expect(ctx[:transport].requests.size).to eq(0)
+  ctx[:transport].assert_consumed!
 end
 
 test("scope and cloud mismatches keep the healthy connection intact") do |db:|
@@ -162,6 +164,7 @@ test("denied consent ends the attempt without touching the connection") do |db:|
   expect(OauthConnection.find_by(provider: "microsoft").state).to eq("connected")
   expect(ctx[:transport].requests.size).to eq(2 + 0) # connect used 2; denial adds none
   expect(OauthAuthAttempt.last.status).to eq("failed")
+  ctx[:transport].assert_consumed!
 end
 
 test("authorization codes are never persisted") do |db:|
@@ -255,4 +258,6 @@ test("unconfigured providers fail safe without rows") do |db:|
   expect(status["state"]).to eq("unknown")
   expect(status["configured"]).to eq(false)
   expect(status.keys).not_to include("encrypted_access_token")
+  expect(ctx[:transport].requests.size).to eq(0)
+  ctx[:transport].assert_consumed!
 end

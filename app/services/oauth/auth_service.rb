@@ -170,16 +170,26 @@ module Oauth
     # be reused, and bumps the generation so stale callbacks and refreshes
     # are rejected. This only stops the app from using the connection;
     # revoking consent on the provider side is a separate operator action.
+    #
+    # Locking: the provider advisory xact lock is taken first, then active
+    # attempt rows (id order), then the connection row -- the same order as
+    # publish. A permanent per-provider row (tombstone) is ensured so the
+    # first-connection absence cannot be used to resurrect a connection:
+    # a disconnect with no row still creates a disconnected row and bumps
+    # the generation past any in-flight attempt.
     def disconnect(provider:)
       name = provider.to_s
       provider_module(name)
-      now_time = now
 
       connection = nil
       OauthConnection.transaction do
-        connection = OauthConnection.lock.find_by(provider: name)
-        if connection
-          connection.update!(
+        advisory_lock!(name)
+        attempts = OauthAuthAttempt.lock.where(provider: name, status: %w[pending consumed])
+                                       .order(:id).to_a
+        row = OauthConnection.lock.find_by(provider: name)
+        fresh_now = now
+        if row
+          row.update!(
             state: "disconnected",
             error_code: "disconnected_local",
             encrypted_access_token: nil,
@@ -188,14 +198,23 @@ module Oauth
             refresh_lease_token: nil,
             refresh_lease_expires_at: nil,
             refresh_lease_generation: nil,
-            generation: connection.generation + 1
+            generation: row.generation + 1
+          )
+          connection = row
+        else
+          base = attempts.map(&:generation_at_start).max || 0
+          connection = OauthConnection.create!(
+            provider: name,
+            state: "disconnected",
+            error_code: "disconnected_local",
+            generation: base + 1
           )
         end
-        OauthAuthAttempt.where(provider: name, status: %w[pending consumed]).find_each do |attempt|
+        attempts.each do |attempt|
           attempt.update!(
             status: "expired",
             error_code: "disconnected_local",
-            finished_at: now_time,
+            finished_at: fresh_now,
             encrypted_code_verifier: nil
           )
         end
@@ -347,37 +366,43 @@ module Oauth
     # is discarded instead of resurrecting anything. The first success
     # also bumps the generation so a delayed second attempt cannot
     # replace it. Failures here never touch a healthy row.
+    #
+    # Locking mirrors disconnect: provider advisory xact lock first, then
+    # the attempt row, then the connection row. TTL/lease clocks are read
+    # fresh after the locks are held so a wait in the lock queue cannot
+    # publish an attempt that expired while waiting.
     def persist_connection!(attempt, tokens, verified)
-      now_time = now
       encrypted_access = @secret_store.encrypt(tokens["access_token"])
       encrypted_refresh = tokens["refresh_token"] ? @secret_store.encrypt(tokens["refresh_token"]) : nil
       current_config = @config.provider(attempt.provider)
 
       connection = nil
       OauthConnection.transaction do
+        advisory_lock!(attempt.provider)
         attempt_row = OauthAuthAttempt.lock.find_by(id: attempt.id)
         raise Aiconshell::Oauth::StateInvalid.new("expired") if attempt_row.nil?
         raise Aiconshell::Oauth::StateInvalid.new("state_mismatch") unless attempt_row.status == "consumed"
-        if attempt_row.expired_due?(now_time)
+        row = OauthConnection.lock.find_by(provider: attempt_row.provider)
+        fresh_now = now
+        if attempt_row.expired_due?(fresh_now)
           attempt_row.update!(
             status: "expired", error_code: "expired",
-            finished_at: now_time, encrypted_code_verifier: nil
+            finished_at: fresh_now, encrypted_code_verifier: nil
           )
           raise Aiconshell::Oauth::StateInvalid.new("expired")
         end
         unless snapshot_matches_current?(attempt_row, current_config)
           attempt_row.update!(
             status: "expired", error_code: "expired",
-            finished_at: now_time, encrypted_code_verifier: nil
+            finished_at: fresh_now, encrypted_code_verifier: nil
           )
           raise Aiconshell::Oauth::StateInvalid.new("expired")
         end
 
-        row = OauthConnection.lock.find_by(provider: attempt_row.provider)
         if row && row.generation != attempt_row.generation_at_start
           attempt_row.update!(
             status: "expired", error_code: "expired",
-            finished_at: now_time, encrypted_code_verifier: nil
+            finished_at: fresh_now, encrypted_code_verifier: nil
           )
           raise Aiconshell::Oauth::StateInvalid.new("expired")
         end
@@ -396,7 +421,7 @@ module Oauth
           granted_scopes: verified["scopes"].to_s,
           encrypted_access_token: encrypted_access,
           encrypted_refresh_token: encrypted_refresh,
-          token_expires_at: now_time + tokens["expires_in"].to_i,
+          token_expires_at: fresh_now + tokens["expires_in"].to_i,
           refresh_lease_token: nil,
           refresh_lease_expires_at: nil,
           refresh_lease_generation: nil,
@@ -404,7 +429,7 @@ module Oauth
         )
         row.save!
         attempt_row.update!(
-          status: "succeeded", finished_at: now_time, error_code: nil,
+          status: "succeeded", finished_at: fresh_now, error_code: nil,
           encrypted_code_verifier: nil
         )
         connection = row
@@ -429,6 +454,19 @@ module Oauth
         nil
       end
       raise Aiconshell::Oauth::ProviderError.new("provider_error")
+    end
+
+    # Short transaction-scoped provider lock shared by publish and
+    # disconnect (and the refresh writers in TokenService). It serializes
+    # the check-then-create on the possibly-absent connection row and keeps
+    # a single lock order, so concurrent publish/disconnect cannot deadlock
+    # or resurrect through a phantom row. Never held across network calls.
+    def advisory_lock!(provider_name)
+      key = "aiconshell:oauth:#{provider_name}"
+      quoted = OauthConnection.connection.quote(key)
+      OauthConnection.connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(#{quoted}))"
+      )
     end
 
     def snapshot_matches_current?(attempt_row, current_config)

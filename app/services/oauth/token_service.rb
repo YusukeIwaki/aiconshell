@@ -46,7 +46,11 @@ module Oauth
     # Returns the access token String for a binding Hash or Binding (see
     # Aiconshell::Oauth::Binding). Raises BindingMismatch before any
     # external I/O when the binding no longer matches the stored
-    # connection; raises RefreshBusy when another refresh holds the lease.
+    # connection, when the fixed client/cloud/tenant moved since connect,
+    # or when the lease/generation is stale; raises RefreshBusy when
+    # another refresh holds the lease. A still-valid token is never issued
+    # after a configuration change, and an expired token never triggers a
+    # refresh HTTP under a changed configuration.
     def fetch(binding)
       bound = Aiconshell::Oauth::Binding.from_h(binding)
       connection = OauthConnection.find_by(id: bound.connection_id)
@@ -56,6 +60,9 @@ module Oauth
       end
       unless connection.connected?
         raise Aiconshell::Oauth::ProviderError.new(connection.error_code || "provider_error")
+      end
+      unless config_matches_connection?(connection)
+        raise Aiconshell::Oauth::BindingMismatch.new
       end
 
       now_time = now
@@ -111,11 +118,15 @@ module Oauth
     # Claims the exclusive lease. A missing/undecryptable refresh token
     # moves the connection to needs_reauth in a committed write: the
     # update is committed before raising so it is never rolled back.
+    # The fixed client/cloud/tenant is rechecked under the row lock with a
+    # fresh clock before any HTTP, so a changed configuration never sends
+    # the old refresh token externally. Shares the provider advisory lock
+    # order with publish/disconnect and never spans the network.
     def claim_lease!(connection, bound)
-      now_time = now
       claimed = nil
       needs_reauth_row = nil
       OauthConnection.transaction do
+        advisory_lock!(connection.provider)
         row = OauthConnection.lock.find_by(id: connection.id)
         raise Aiconshell::Oauth::BindingMismatch.new if row.nil?
         unless bound.matches?(row.binding_snapshot)
@@ -124,7 +135,11 @@ module Oauth
         unless row.connected?
           raise Aiconshell::Oauth::ProviderError.new(row.error_code || "provider_error")
         end
-        if row.refresh_lease_held?(now_time)
+        fresh_now = now
+        unless config_matches_connection?(row)
+          raise Aiconshell::Oauth::BindingMismatch.new
+        end
+        if row.refresh_lease_held?(fresh_now)
           raise Aiconshell::Oauth::RefreshBusy.new
         end
 
@@ -138,7 +153,7 @@ module Oauth
         token = SecureRandom.uuid
         row.update!(
           refresh_lease_token: token,
-          refresh_lease_expires_at: now_time + REFRESH_LEASE_SECONDS,
+          refresh_lease_expires_at: fresh_now + REFRESH_LEASE_SECONDS,
           refresh_lease_generation: row.generation
         )
         claimed = { lease_token: token, refresh_plaintext: refresh_plaintext, provider: row.provider }
@@ -153,8 +168,11 @@ module Oauth
     # The refresh token was rejected: the connection needs a reconnect.
     # Committed only when our lease still owns the row and the generation
     # is unchanged; otherwise the newer state wins and this result dies.
+    # Lease clocks are read fresh after the locks are held.
     def revoke_for_reauth!(connection_id, lease_token)
+      provider_name = OauthConnection.where(id: connection_id).pick(:provider) || "unknown"
       OauthConnection.transaction do
+        advisory_lock!(provider_name) unless provider_name == "unknown"
         row = OauthConnection.lock.find_by(id: connection_id)
         next if row.nil? || row.refresh_lease_token != lease_token
 
@@ -184,7 +202,9 @@ module Oauth
     end
 
     def release_lease!(connection_id, lease_token)
+      provider_name = OauthConnection.where(id: connection_id).pick(:provider)
       OauthConnection.transaction do
+        advisory_lock!(provider_name) if provider_name
         row = OauthConnection.lock.find_by(id: connection_id)
         next if row.nil? || row.refresh_lease_token != lease_token
 
@@ -208,15 +228,17 @@ module Oauth
     # scope (nil, per the Entra spec) keeps the stored scopes.
     # Lease-expiry clears are committed before raising so they persist.
     def commit_rotation!(connection_id, lease_token, rotated)
-      now_time = now
       encrypted_access = @secret_store.encrypt(rotated["access_token"])
       rotated_scope = rotated["scope"]
       rotated_refresh_raw = rotated["refresh_token"]
 
+      provider_name = OauthConnection.where(id: connection_id).pick(:provider)
       outcome = nil
       token = nil
       OauthConnection.transaction do
+        advisory_lock!(provider_name) if provider_name
         row = OauthConnection.lock.find_by(id: connection_id)
+        fresh_now = now
         if row.nil?
           outcome = :binding_mismatch
           next
@@ -225,7 +247,7 @@ module Oauth
           outcome = :stale_lease
           next
         end
-        if row.refresh_lease_expires_at && row.refresh_lease_expires_at <= now_time
+        if row.refresh_lease_expires_at && row.refresh_lease_expires_at <= fresh_now
           row.update!(
             refresh_lease_token: nil, refresh_lease_expires_at: nil,
             refresh_lease_generation: nil
@@ -278,7 +300,7 @@ module Oauth
         row.update!(
           encrypted_access_token: encrypted_access,
           encrypted_refresh_token: new_refresh_ciphertext,
-          token_expires_at: now_time + rotated["expires_in"].to_i,
+          token_expires_at: fresh_now + rotated["expires_in"].to_i,
           granted_scopes: new_scopes,
           refresh_lease_token: nil,
           refresh_lease_expires_at: nil,
@@ -299,6 +321,16 @@ module Oauth
       else
         raise Aiconshell::Oauth::ProviderError.new("provider_error")
       end
+    end
+
+    def advisory_lock!(provider_name)
+      return if provider_name.nil? || provider_name.to_s.empty?
+
+      key = "aiconshell:oauth:#{provider_name}"
+      quoted = OauthConnection.connection.quote(key)
+      OauthConnection.connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(#{quoted}))"
+      )
     end
 
     def config_matches_connection?(row)
