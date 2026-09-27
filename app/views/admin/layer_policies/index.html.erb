@@ -24,7 +24,7 @@
           <td><%= row[:policy].model %></td>
           <td><%= row[:policy].effort %></td>
         <% else %>
-          <td colspan="4"><span class="admin-badge admin-badge-warn">未設定</span></td>
+          <td colspan="5"><span class="admin-badge admin-badge-warn">未設定</span></td>
         <% end %>
         <td>
           <%= link_to "編集", edit_admin_layer_policy_path(row[:layer]) %>

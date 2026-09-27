@@ -67,8 +67,10 @@ module Admin
         return redirect_to(admin_layer_policies_path, alert: "不明な層です。")
       end
 
+      existing = AiAuthSession.active.find_by(provider: policy.provider, worker_role: role)
       session = ops.request_status(provider: policy.provider, worker_role: role)
-      redirect_to admin_ai_connections_path, notice: recheck_notice(session)
+      fresh = existing.nil? || existing.uuid != session.uuid
+      redirect_to admin_ai_connections_path, notice: recheck_notice(session, fresh: fresh)
     rescue AiAuth::RequestService::InvalidRequest => e
       redirect_to admin_layer_policies_path, alert: e.message
     end
@@ -88,9 +90,13 @@ module Admin
       AiAuth::RequestService.new
     end
 
-    def recheck_notice(session)
-      if session.status == "queued" && session.created_at && session.created_at > 10.seconds.ago
+    # Fresh means this request created the status session. A reused row
+    # (rapid recheck or an in-progress login) must not claim a new accept.
+    def recheck_notice(session, fresh:)
+      if fresh && session.operation == "status_check"
         "接続状態の再確認を受け付けました。AIアカウント連携画面で進行と結果を確認してください。"
+      elsif session.operation == "login"
+        "進行中のログインがあります。AIアカウント連携画面で進行と結果を確認してください。"
       else
         "進行中の操作があります。AIアカウント連携画面で進行と結果を確認してください。"
       end
