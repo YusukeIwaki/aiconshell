@@ -10,9 +10,50 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_020000) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_030001) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
+
+  create_table "ai_auth_sessions", force: :cascade do |t|
+    t.string "uuid", null: false
+    t.string "provider", null: false
+    t.string "worker_role", null: false
+    t.string "operation", null: false
+    t.string "status", default: "queued", null: false
+    t.datetime "expires_at", null: false
+    t.string "claim_token"
+    t.datetime "claimed_at"
+    t.datetime "heartbeat_at"
+    t.boolean "cancel_requested", default: false, null: false
+    t.text "encrypted_challenge"
+    t.datetime "challenge_updated_at"
+    t.text "encrypted_input_code"
+    t.datetime "input_updated_at"
+    t.string "result_state"
+    t.string "result_error_code"
+    t.datetime "finished_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["claim_token"], name: "index_ai_auth_sessions_on_claim_token", unique: true
+    t.index ["expires_at"], name: "index_ai_auth_sessions_on_expires_at"
+    t.index ["provider", "worker_role", "status"], name: "index_ai_auth_sessions_on_provider_role_status"
+    t.index ["provider", "worker_role"], name: "index_ai_auth_sessions_one_active_per_provider_role", unique: true, where: "((status)::text = ANY ((ARRAY['queued'::character varying, 'running'::character varying, 'waiting'::character varying])::text[]))"
+    t.index ["uuid"], name: "index_ai_auth_sessions_on_uuid", unique: true
+  end
+
+  create_table "ai_connections", force: :cascade do |t|
+    t.string "provider", null: false
+    t.string "worker_role", null: false
+    t.string "state", default: "unknown", null: false
+    t.string "error_code"
+    t.datetime "checked_at"
+    t.string "last_session_uuid"
+    t.bigint "last_session_id"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["provider", "worker_role"], name: "index_ai_connections_on_provider_and_role", unique: true
+    t.index ["state"], name: "index_ai_connections_on_state"
+  end
 
   create_table "event_deliveries", force: :cascade do |t|
     t.text "event_id", null: false
@@ -344,7 +385,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_020000) do
     t.index ["current_run_id"], name: "index_tasks_on_current_run_id"
     t.index ["next_action_at"], name: "index_tasks_on_next_action_at"
     t.index ["source_plugin", "source_resource_id"], name: "index_tasks_on_source"
-    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY ((ARRAY['inbox'::character varying, 'ready'::character varying, 'running'::character varying, 'waiting_human'::character varying, 'waiting_review'::character varying, 'waiting_delivery'::character varying, 'failed'::character varying])::text[])))"
+    t.index ["source_plugin", "source_resource_id"], name: "index_tasks_one_open_per_source", unique: true, where: "(((source_plugin)::text <> ''::text) AND ((source_resource_id)::text <> ''::text) AND ((status)::text = ANY (ARRAY[('inbox'::character varying)::text, ('ready'::character varying)::text, ('running'::character varying)::text, ('waiting_human'::character varying)::text, ('waiting_review'::character varying)::text, ('waiting_delivery'::character varying)::text, ('failed'::character varying)::text])))"
     t.index ["status"], name: "index_tasks_on_status"
   end
 

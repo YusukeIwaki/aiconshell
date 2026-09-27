@@ -1,0 +1,107 @@
+<% content_for(:title, "AIアカウント連携") %>
+<% if @has_active %>
+  <% content_for :head do %>
+    <meta http-equiv="refresh" content="5">
+  <% end %>
+<% end %>
+<h1>AIアカウント連携</h1>
+<p>Claude / Codex / Muse Code のサブスクリプションログインを、worker別に開始・確認します。control と execution は別の永続volumeを使うため、それぞれでログインが必要です。一方へのログインで他方が使えるようにはなりません。</p>
+
+<div class="admin-card">
+  <h2 style="margin-top:0">層とworkerの対応</h2>
+  <p>AIポリシーで選んだ provider は未連携でも保存でき、実行時に結果が分かります。どのworkerにログインが必要かは、使う層で決まります。</p>
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <tr><th>層</th><th>使うworker</th></tr>
+      <% ai_layer_role_rows.each do |label, layer, role| %>
+        <tr>
+          <td><strong><%= label %></strong>（<%= layer %>）</td>
+          <td><%= ai_role_label(role) %>（<%= role %>）</td>
+        </tr>
+      <% end %>
+    </table>
+  </div>
+  <p style="margin-top:12px"><%= link_to "層別AIポリシーへ戻る", admin_layer_policies_path %></p>
+</div>
+
+<% if @has_active %>
+  <div class="admin-card">
+    <p style="margin:0">進行中の操作があります。このページは5秒ごとに自動更新されます。手動で確認する場合は <%= link_to "更新する", admin_ai_connections_path %> を押してください。</p>
+  </div>
+<% end %>
+
+<% @rows.each do |row| %>
+  <% snapshot = row[:snapshot] %>
+  <% session = row[:session] %>
+  <% challenge = row[:challenge] %>
+  <% state = snapshot&.state || "unknown" %>
+  <div class="admin-card">
+    <h2 style="margin-top:0">
+      <%= ai_provider_label(row[:provider]) %> × <%= ai_role_label(row[:worker_role]) %>
+      <span class="admin-badge <%= ai_state_badge(state) %>"><%= ai_state_label(state) %></span>
+    </h2>
+    <p>
+      provider: <code class="admin-env"><%= row[:provider] %></code>
+      worker: <code class="admin-env"><%= row[:worker_role] %></code>
+    </p>
+    <% if snapshot&.checked_at %>
+      <p>確認時刻: <%= snapshot.checked_at %></p>
+    <% else %>
+      <p>確認時刻: ―（まだworkerで確認していません）</p>
+    <% end %>
+    <% if snapshot&.error_code.present? %>
+      <p>前回の確認結果: <%= ai_error_text(snapshot.error_code) %></p>
+    <% end %>
+
+    <% if session %>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <tr><th>操作</th><th>状態</th><th>期限</th></tr>
+          <tr>
+            <td><%= ai_operation_label(session.operation) %></td>
+            <td><span class="admin-badge <%= ai_session_badge(session.status) %>"><%= ai_session_label(session.status) %></span></td>
+            <td><%= session.expires_at %></td>
+          </tr>
+        </table>
+      </div>
+      <% if session.status == "queued" %>
+        <p>workerの空きを待っています。workerが停止している場合は期限までこのままになります。成功扱いにはなりません。</p>
+      <% end %>
+      <% if challenge %>
+        <p>ブラウザで次の認証ページを開き、案内に従って承認してください。</p>
+        <p><%= link_to challenge["verification_uri"], challenge["verification_uri"], target: "_blank", rel: "noopener noreferrer" %></p>
+        <% if challenge["user_code"].present? %>
+          <p>ユーザーコード: <code class="admin-env"><%= challenge["user_code"] %></code></p>
+        <% end %>
+        <% if challenge["input_required"] %>
+          <p>認証ページで表示されたコードを入力してください。コードは一度だけworkerへ渡され、保存されません。</p>
+          <%= form_with url: code_admin_ai_connection_path(session.uuid), method: :post do %>
+            <div class="admin-form-grid">
+              <label for="auth_code_<%= session.uuid %>">認証コード</label>
+              <%= text_field_tag :auth_code, "", id: "auth_code_#{session.uuid}", autocomplete: "off", maxlength: 4096 %>
+            </div>
+            <div class="admin-actions">
+              <%= submit_tag "コードを送信", class: "admin-btn" %>
+            </div>
+          <% end %>
+        <% else %>
+          <p>この手順ではコード入力は不要です。ブラウザで承認が終わるまでお待ちください。</p>
+        <% end %>
+      <% else %>
+        <% if session.operation == "login" %>
+          <p>認証案内を準備しています。表示されるまでお待ちください。</p>
+        <% else %>
+          <p>workerが公式CLIで確認しています。結果が出るまでお待ちください。</p>
+        <% end %>
+      <% end %>
+      <div class="admin-actions">
+        <%= button_to "キャンセル", cancel_admin_ai_connection_path(session.uuid), method: :post, class: "admin-btn" %>
+      </div>
+    <% else %>
+      <div class="admin-actions">
+        <%= button_to "状態確認", status_check_admin_ai_connections_path(provider: row[:provider], worker_role: row[:worker_role]), method: :post, class: "admin-btn" %>
+        <%= button_to "連携開始", login_admin_ai_connections_path(provider: row[:provider], worker_role: row[:worker_role]), method: :post, class: "admin-btn" %>
+      </div>
+    <% end %>
+  </div>
+<% end %>

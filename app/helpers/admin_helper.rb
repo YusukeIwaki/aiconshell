@@ -43,6 +43,7 @@ module AdminHelper
     [
       ["タスクボード", admin_tasks_path, "tasks"],
       ["AIポリシー", admin_layer_policies_path, "layer_policies"],
+      ["AI連携", admin_ai_connections_path, "ai_connections"],
       ["プラグイン", admin_plugins_path, "plugins"],
       ["EventLog検索", admin_event_logs_path, "event_logs"]
     ]

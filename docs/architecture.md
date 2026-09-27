@@ -137,7 +137,9 @@ ClickHouse と Teams の retry は独立。ClickHouse は event_id で重複を�
 
 ## 管理画面
 
-タスクボード・詳細・実行履歴、フィードバック、レイヤー別 AI policy、プラグイン診断、EventLog の検索。ENV の admin credential で認証し、未設定 production は fail closed。CSRF を維持する。人間が直接 run を作成する API や任意コマンド入力は公開しない。
+タスクボード・詳細・実行履歴、フィードバック、レイヤー別 AI policy、プラグイン診断、EventLog の検索、AIアカウント連携。ENV の admin credential で認証し、未設定 production は fail closed。CSRF を維持する。人間が直接 run を作成する API や任意コマンド入力は公開しない。
+
+AIアカウント連携（`/admin/ai_connections`）は業務 Task/TaskRun とは独立した運用管理である。controller は運用サービスへ intent を渡すだけで、業務 worker を直接呼ばず task lifecycle を変えない。provider × worker role の接続 snapshot と、認証・状態確認の要求 session を共有 PostgreSQL に持つ。同じ provider/role の同時ログインは partial unique 制約で1件にし、二重 submit は既存 active を返す。job の claim と snapshot の fencing で二重実行と古い上書きを防ぐ。認証 URL/コードは `SECRET_KEY_BASE` 由来キーで暗号化し、終端で削除する。queue は `ai_auth_control` / `ai_auth_execution` を各 worker の別1スレッド pool で処理し、`AICONSHELL_WORKER_ROLE` の一致を検証する。Web に CLI・認証 volume・worker role を付けない。
 
 ## EventLog 保存先の判断
 

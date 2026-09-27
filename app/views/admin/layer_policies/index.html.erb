@@ -1,7 +1,7 @@
 <% content_for(:title, "層別AIポリシー") %>
 <h1>層別AIポリシー</h1>
 <p>各層が使う provider / model / effort / 仕事の指示です。未設定の provider も選択・保存でき、設定不足は実行時にエラーになります。秘密情報はここに保存しません。</p>
-<p>設定状態の表示はこの Web プロセス上での診断であり、ワーカーでの利用可否を保証しません（CLI がワーカーにだけ入っている場合があります）。</p>
+<p>設定状態の表示はこの Web プロセス上での診断であり、ワーカーでの利用可否を保証しません（CLI がワーカーにだけ入っている場合があります）。workerでのログインと接続確認は <%= link_to "AIアカウント連携", admin_ai_connections_path %> から行ってください。</p>
 
 <div class="admin-table-wrap">
   <table class="admin-table">

@@ -7,6 +7,7 @@
   <% if @diagnosis && @diagnosis[:available] && !@diagnosis[:configured] %>
     <p>この provider は未設定ですが保存できます。不足分（CLI・認証配置）は実行前に整備してください。</p>
   <% end %>
+  <p>workerでのログインと接続確認は <%= link_to "AIアカウント連携", admin_ai_connections_path %> から行ってください。</p>
   <%= form_with model: @policy, url: admin_layer_policy_path(@layer), method: :patch, scope: :layer_policy do |form| %>
     <div class="admin-form-grid">
       <%= form.label :provider, "provider" %>

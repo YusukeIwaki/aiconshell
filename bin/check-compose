@@ -6,7 +6,8 @@
 #   ruby bin/check-compose
 #
 # Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
-# separated control/execution queues, no integration credentials on the
+# separated control/execution queues plus dedicated 1-thread ai_auth pools,
+# explicit worker roles, no integration credentials on the
 # execution worker, explicit workflow settings on every Rails process,
 # the EventLog channel default on every emitting Rails process, Teams
 # targets path on web/control only, recurring schedules on control only,
@@ -196,13 +197,40 @@ check(failures, "control worker runs queue control, execution runs queue executi
   assert(!control_cmd.include?("--skip-recurring"), "control must keep the recurring scheduler")
 end
 
-check(failures, "queue configs bind workers to a single queue each") do
+check(failures, "queue configs bind workers to role queues plus a 1-thread auth pool") do
   control_q = YAML.load_file(File.join(ROOT, "config/queue_control.yml"))
   execution_q = YAML.load_file(File.join(ROOT, "config/queue_execution.yml"))
-  control_queues = Array(control_q.dig("workers", 0, "queues")).map(&:to_s)
-  execution_queues = Array(execution_q.dig("workers", 0, "queues")).map(&:to_s)
-  assert(control_queues == ["control"], "queue_control workers: #{control_queues.inspect}")
-  assert(execution_queues == ["execution"], "queue_execution workers: #{execution_queues.inspect}")
+  control_workers = Array(control_q["workers"])
+  execution_workers = Array(execution_q["workers"])
+  assert(control_workers.size == 2, "queue_control must declare 2 worker pools, got #{control_workers.size}")
+  assert(execution_workers.size == 2, "queue_execution must declare 2 worker pools, got #{execution_workers.size}")
+  control_main = control_workers[0]
+  control_auth = control_workers[1]
+  execution_main = execution_workers[0]
+  execution_auth = execution_workers[1]
+  assert(Array(control_main["queues"]).map(&:to_s) == ["control"], "queue_control main: #{control_main["queues"].inspect}")
+  assert(Array(execution_main["queues"]).map(&:to_s) == ["execution"], "queue_execution main: #{execution_main["queues"].inspect}")
+  assert(Array(control_auth["queues"]).map(&:to_s) == ["ai_auth_control"], "queue_control auth: #{control_auth["queues"].inspect}")
+  assert(Array(execution_auth["queues"]).map(&:to_s) == ["ai_auth_execution"], "queue_execution auth: #{execution_auth["queues"].inspect}")
+  assert(control_auth["threads"].to_i == 1, "ai_auth_control pool must be 1 thread")
+  assert(execution_auth["threads"].to_i == 1, "ai_auth_execution pool must be 1 thread")
+  assert(control_main["threads"].to_i >= 1, "control pool must keep its threads")
+  assert(execution_main["threads"].to_i >= 1, "execution pool must keep its threads")
+end
+
+check(failures, "workers carry explicit roles, web/migrate carry none") do
+  assert(env_of.call("control")["AICONSHELL_WORKER_ROLE"] == "control", "control role")
+  assert(env_of.call("execution")["AICONSHELL_WORKER_ROLE"] == "execution", "execution role")
+  %w[web migrate clickhouse-init].each do |name|
+    env = services.dig(name, "environment") || {}
+    assert(!env.transform_keys(&:to_s).key?("AICONSHELL_WORKER_ROLE"), "#{name} must not carry AICONSHELL_WORKER_ROLE")
+  end
+  job_file = File.join(ROOT, "app/jobs/ai_auth_job.rb")
+  assert(File.file?(job_file), "missing app/jobs/ai_auth_job.rb for the auth queues")
+  job_source = File.read(job_file)
+  assert(job_source.include?("queue_as :ai_auth_control"), "AiAuthJob must declare queue_as :ai_auth_control")
+  request_source = File.read(File.join(ROOT, "app/services/ai_auth/request_service.rb"))
+  assert(request_source.include?("ai_auth_"), "RequestService must reserve the ai_auth role queue")
 end
 
 check(failures, "recurring schedules wire all control jobs in development and production") do

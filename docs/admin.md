@@ -7,6 +7,7 @@
 - 層別 AI ポリシー (`/admin/layer_policies`)：provider/model/effort/指示 + 設定診断
 - プラグイン (`/admin/plugins`)：対応操作・必要 env 名・設定済み表示（値なし）
 - EventLog 検索 (`/admin/event_logs`)：層・種別・タスク・期間・キーワード
+- AIアカウント連携 (`/admin/ai_connections`)：provider × worker role の状態確認・連携開始・認証案内・コード入力・キャンセル（[ai-connections.md](ai-connections.md)）
 
 ## 所有ファイル（このレーン）
 

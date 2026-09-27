@@ -231,9 +231,9 @@ services:
       start_period: 60s
 
   # Control plane: interaction polling, coordination dispatch, outbound and
-  # EventLog delivery, recurring scheduler. Queue `control` only. Also runs
-  # coordination AI (triage), so it takes the ai image and AI auth homes
-  # just like execution.
+  # EventLog delivery, recurring scheduler. Queues `control` plus the
+  # 1-thread `ai_auth_control` pool. Also runs coordination AI (triage), so
+  # it takes the ai image and AI auth homes just like execution.
   control:
     build:
       context: .
@@ -247,6 +247,7 @@ services:
         condition: service_healthy
     environment:
       <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *control-only, *ai-auth]
+      AICONSHELL_WORKER_ROLE: "control"
     volumes:
       - claude_auth:/private/claude
       - codex_auth:/private/codex
@@ -254,7 +255,8 @@ services:
       - ai_workspaces:/workspaces
     command: ["./bin/jobs", "--config-file=config/queue_control.yml"]
 
-  # Execution plane: AI CLI subprocess runs on queue `execution` only.
+  # Execution plane: AI CLI subprocess runs on queue `execution` plus the
+  # 1-thread `ai_auth_execution` pool.
   # Receives the database, workflow settings, the EventLog channel default
   # (a non-credential `channel:<team>/<channel>` name, blank by default),
   # AI auth homes, and the workspaces volume — and NOTHING ELSE: no
@@ -273,6 +275,7 @@ services:
         condition: service_healthy
     environment:
       <<: [*app-database, *workflow, *event-log, *ai-auth]
+      AICONSHELL_WORKER_ROLE: "execution"
     volumes:
       - claude_auth:/private/claude
       - codex_auth:/private/codex

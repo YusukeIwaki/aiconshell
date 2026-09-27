@@ -9,8 +9,8 @@ worker / PostgreSQL / ClickHouse）を使うための手順書。全体設計は
 | サービス | 役割 | キュー | 環境変数 |
 | --- | --- | --- | --- |
 | `web` | 管理画面 | — | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報 |
-| `control` | ポーリング・振分・配信・定期実行・coordination AI | `control` のみ | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報・自アクタ・AI auth |
-| `execution` | AI CLI 実行（隔離 workspace） | `execution` のみ | DB・ワークフロー設定・EventLog 既定チャネル・AI auth のみ |
+| `control` | ポーリング・振分・配信・定期実行・coordination AI | `control` + 別1スレッド `ai_auth_control` | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報・自アクタ・AI auth・`AICONSHELL_WORKER_ROLE=control` |
+| `execution` | AI CLI 実行（隔離 workspace） | `execution` + 別1スレッド `ai_auth_execution` | DB・ワークフロー設定・EventLog 既定チャネル・AI auth のみ・`AICONSHELL_WORKER_ROLE=execution` |
 | `migrate` | SQL マイグレーション専用（使い捨て） | — | DB・ワークフロー設定・EventLog 既定チャネル |
 | `clickhouse-init` | ClickHouse スキーマ適用（使い捨て・独立） | — | ClickHouse のみ |
 | `db` | PostgreSQL 17（Solid Queue 同居） | — | — |
