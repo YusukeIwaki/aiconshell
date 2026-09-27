@@ -44,6 +44,8 @@ module TeamsOauthCases
   end
 
   # Same binding_for/access_token ports as the Rails CredentialProvider.
+  # Accepts Binding objects or hashes; compares by secret-free to_h so the
+  # adapter may pass the normalized Binding like the Jira lane.
   class FakeOauthProvider
     attr_reader :received
 
@@ -58,10 +60,32 @@ module TeamsOauthCases
       @received << binding
       raise @error if @error
 
-      unless binding == @expected_binding
+      actual = binding.respond_to?(:to_h) ? binding.to_h : binding
+      expected = @expected_binding.respond_to?(:to_h) ? @expected_binding.to_h : @expected_binding
+      unless actual == expected
         raise Aiconshell::Oauth::BindingMismatch.new
       end
 
+      @token
+    end
+
+    def received_hashes
+      @received.map { |binding| binding.respond_to?(:to_h) ? binding.to_h : binding }
+    end
+  end
+
+  # Lenient provider that returns a token for any binding. Used to prove
+  # that incomplete bindings are rejected before any Graph I/O.
+  class LenientOauthProvider
+    attr_reader :calls
+
+    def initialize(token: TOKEN)
+      @token = token
+      @calls = 0
+    end
+
+    def access_token(_binding)
+      @calls += 1
       @token
     end
   end
@@ -168,7 +192,7 @@ test("teams_oauth channel poll reads messages plus all replies with paging") do
   expect(graph_calls.map { |r| r[:headers]["Authorization"] }.uniq).to eq([expected_auth])
   expect(graph_calls.any? { |r| r[:url].include?("$filter") }).to eq(false)
   # The trusted binding is resolved as-is; the adapter never re-selects it.
-  expect(provider.received).to eq([TeamsOauthCases::BINDING])
+  expect(provider.received_hashes).to eq([TeamsOauthCases::BINDING])
   transport.assert_consumed!
 end
 
@@ -475,7 +499,7 @@ test("teams_oauth requires binding and provider before any HTTP") do
   rescue Aiconshell::Plugins::CredentialsMissing => e
     expect(e.missing).to eq(["oauth_binding"])
   end
-  expect(provider.received).to eq([])
+  expect(provider.received_hashes).to eq([])
   expect(transport.requests).to eq([])
   transport.assert_consumed!
 end
@@ -491,8 +515,8 @@ test("teams_oauth rejects replaced bindings and foreign providers without I/O") 
                     input: { "scope" => "channel:team-1/chan-1", "body" => "x" },
                     context: oauth_ctx(TeamsOauthCases::WRITE_SCOPES, provider, binding: stale))
     raise "expected binding rejection"
-  rescue Aiconshell::Plugins::CredentialsMissing => e
-    expect(e.missing.first).to match(/oauth_binding/)
+  rescue Aiconshell::Oauth::BindingMismatch => e
+    expect(e.code).to eq("binding_mismatch")
   end
 
   atlassian = TeamsOauthCases::BINDING.merge("provider" => "atlassian")
@@ -508,22 +532,30 @@ test("teams_oauth rejects replaced bindings and foreign providers without I/O") 
   transport.assert_consumed!
 end
 
-test("teams_oauth surfaces provider failures without falling back") do
-  transport = oauth_transport
-  failing = oauth_provider(TeamsOauthCases::BINDING,
-                           error: Aiconshell::Oauth::ProviderError.new("timeout"))
-  registry = oauth_registry(transport, failing)
-
-  begin
-    registry.invoke(plugin: "teams_oauth", operation: "latest_events",
-                    input: { "scope" => TeamsOauthCases.channel_scope },
-                    context: oauth_ctx(TeamsOauthCases::READ_SCOPES, failing))
-    raise "expected provider failure"
-  rescue Aiconshell::Plugins::CredentialsMissing => e
-    expect(e.missing.first).to match(/oauth_binding/)
+test("teams_oauth preserves typed OAuth failures without Graph I/O") do
+  failures = {
+    "timeout" => Aiconshell::Oauth::ProviderError.new("timeout"),
+    "rate_limited" => Aiconshell::Oauth::ProviderError.new("rate_limited"),
+    "refresh_busy" => Aiconshell::Oauth::RefreshBusy.new,
+    "binding_mismatch" => Aiconshell::Oauth::BindingMismatch.new,
+    "not_connected" => Aiconshell::Oauth::ProviderError.new("not_connected")
+  }
+  failures.each do |code, error|
+    transport = oauth_transport
+    failing = oauth_provider(TeamsOauthCases::BINDING, error: error)
+    registry = oauth_registry(transport, failing)
+    begin
+      registry.invoke(plugin: "teams_oauth", operation: "latest_events",
+                      input: { "scope" => TeamsOauthCases.channel_scope },
+                      context: oauth_ctx(TeamsOauthCases::READ_SCOPES, failing))
+      raise "expected provider failure for #{code}"
+    rescue Aiconshell::Oauth::Error => e
+      expect(e.code).to eq(error.code)
+      expect(e.message).not_to include(TeamsOauthCases::TOKEN)
+    end
+    expect(transport.requests).to eq([])
+    transport.assert_consumed!
   end
-  expect(transport.requests).to eq([])
-  transport.assert_consumed!
 end
 
 test("teams_oauth rejects an invalid token with a single call and no replay") do
@@ -611,8 +643,13 @@ test("teams_oauth rejects malformed and traversal scopes before I/O") do
     ["latest_events", { "scope" => "team/../channel/chan-1" }, read_ctx],
     ["latest_events", { "scope" => "chat/ch at-1" }, read_ctx],
     ["latest_events", { "scope" => "channel:team-1/chan-1" }, read_ctx],
+    ["latest_events", { "scope" => "team/team%2Fevil/channel/chan-1" }, read_ctx],
+    ["latest_events", { "scope" => "chat/chat%252Fevil" }, read_ctx],
+    ["latest_events", { "scope" => "team/team-1/channel/.." }, read_ctx],
     ["send_message", { "scope" => "message:team-1/chan-1/root-1", "body" => "x" }, write_ctx],
-    ["send_message", { "scope" => "chat:../secret", "body" => "x" }, write_ctx]
+    ["send_message", { "scope" => "chat:../secret", "body" => "x" }, write_ctx],
+    ["send_message", { "scope" => "channel:team-1/chan%2F1", "body" => "x" }, write_ctx],
+    ["send_message", { "scope" => "chat:chat%25evil", "body" => "x" }, write_ctx]
   ].each do |operation, input, ctx|
     begin
       registry.invoke(plugin: "teams_oauth", operation: operation, input: input, context: ctx)
@@ -635,7 +672,7 @@ test("teams_oauth rejects malformed and traversal scopes before I/O") do
       nil
     end
   end
-  expect(provider.received).to eq([])
+  expect(provider.received_hashes).to eq([])
   expect(transport.requests).to eq([])
   transport.assert_consumed!
 end
@@ -657,7 +694,7 @@ test("teams_oauth rejects invalid cursors and remote timestamps before advancing
     end
   end
   expect(transport.requests).to eq([])
-  expect(provider.received).to eq([])
+  expect(provider.received_hashes).to eq([])
   transport.assert_consumed!
 
   transport2 = oauth_transport
@@ -749,8 +786,123 @@ test("teams_oauth accepts a constructor-injected provider from context-less call
                         input: { "scope" => "chat/chat-7" },
                         context: { "oauth_binding" => TeamsOauthCases::BINDING })
   expect(out["events"]).to eq([])
-  expect(provider.received).to eq([TeamsOauthCases::BINDING])
+  expect(provider.received_hashes).to eq([TeamsOauthCases::BINDING])
   transport.assert_consumed!
+end
+
+test("teams_oauth rejects incomplete bindings before HTTP even with a lenient provider") do
+  incomplete = [
+    TeamsOauthCases::BINDING.merge("provider" => nil),
+    TeamsOauthCases::BINDING.merge("provider" => "atlassian"),
+    TeamsOauthCases::BINDING.merge("principal" => ""),
+    TeamsOauthCases::BINDING.merge("tenant" => ""),
+    TeamsOauthCases::BINDING.merge("tenant" => "common"),
+    TeamsOauthCases::BINDING.merge("connection_id" => nil)
+  ]
+  incomplete.each do |bad|
+    transport = oauth_transport
+    lenient = TeamsOauthCases::LenientOauthProvider.new
+    registry = Aiconshell::Plugins::Registry.new(
+      env: TeamsOauthCases::OAUTH_ENV, transport: transport,
+      clock: TeamsOauthCases::FixedClock.new(Time.utc(2026, 9, 26, 12, 0, 0))
+    )
+    registry.register(Aiconshell::Plugins::TeamsOauth.new(oauth_credential_provider: lenient))
+    begin
+      registry.invoke(plugin: "teams_oauth", operation: "latest_events",
+                      input: { "scope" => TeamsOauthCases.channel_scope },
+                      context: { "scopes" => TeamsOauthCases::READ_SCOPES, "oauth_binding" => bad })
+      raise "expected binding rejection for #{bad.inspect}"
+    rescue Aiconshell::Plugins::CredentialsMissing => e
+      expect(e.missing.first).to match(/oauth_binding/)
+    end
+    expect(lenient.calls).to eq(0)
+    expect(transport.requests).to eq([])
+    transport.assert_consumed!
+  end
+end
+
+test("teams_oauth validates Graph-returned ids before building resources and receipts") do
+  bad_ids = ["", " ", "a/b", "a\\b", "..", ".", "a%2Fb", "a%252F", 42, { "id" => "x" }, nil]
+  bad_ids.each do |bad_id|
+    transport = oauth_transport
+    provider = oauth_provider
+    transport.expect_json(:GET, %r{/chats/chat-1/messages}, body: {
+                            "value" => [TeamsOauthCases.graph_message(bad_id,
+                              created: "2026-09-26T12:00:00Z", modified: "2026-09-26T12:00:00Z")]
+                          })
+    registry = oauth_registry(transport, provider)
+    begin
+      registry.invoke(plugin: "teams_oauth", operation: "latest_events",
+                      input: { "scope" => "chat/chat-1" },
+                      context: oauth_ctx(TeamsOauthCases::READ_SCOPES, provider))
+      raise "expected output rejection for #{bad_id.inspect}"
+    rescue Aiconshell::Plugins::OutputInvalid => e
+      expect(e.message).to match(/message|shape/)
+    end
+    transport.assert_consumed!
+  end
+
+  bad_receipts = ["", "reply/9", "a/b", "x%2Fy", 123, nil]
+  bad_receipts.each do |bad_id|
+    transport = oauth_transport
+    provider = oauth_provider
+    url = "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/chan-1/messages"
+    transport.expect_json(:POST, url, body: { "id" => bad_id })
+    registry = oauth_registry(transport, provider)
+    begin
+      registry.invoke(plugin: "teams_oauth", operation: "send_message",
+                      input: { "scope" => "channel:team-1/chan-1", "body" => "x" },
+                      context: oauth_ctx(TeamsOauthCases::WRITE_SCOPES, provider))
+      raise "expected receipt rejection for #{bad_id.inspect}"
+    rescue Aiconshell::Plugins::OutputInvalid => e
+      expect(e.details.first).to match(/message id/)
+    end
+    transport.assert_consumed!
+  end
+end
+
+test("teams_oauth refuses noncanonical page paths before any follow-up") do
+  chan = "19%3Achan%40thread.tacv2"
+  bad_links = [
+    "#{TeamsOauthCases::GRAPH_BASE}/v1.0/teams/team-1/channels/#{chan}/messages?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/#{chan}/messages/?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/#{chan}/messages//?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/./#{chan}/messages?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/#{chan}/messages/%2e?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/chan%2Fevil/messages?$skiptoken=x",
+    "#{TeamsOauthCases::GRAPH_BASE}/teams/team-1/channels/chan%252Fevil/messages?$skiptoken=x",
+    "https://user:secret@graph.microsoft.com/v1.0/teams/team-1/channels/#{chan}/messages?$skiptoken=x"
+  ]
+  # Wrong prefix, trailing slash, empty segments, dot segments, encoded
+  # separators, double-encoding, and userinfo. All must fail before the
+  # follow-up fetch.
+  valid_first = TeamsOauthCases.channel_first_url
+  bad_links.each do |link|
+    transport = oauth_transport
+    provider = oauth_provider
+    transport.expect_json(:GET, valid_first, body: { "value" => [], "@odata.nextLink" => link })
+    registry = oauth_registry(transport, provider)
+    begin
+      registry.invoke(plugin: "teams_oauth", operation: "latest_events",
+                      input: { "scope" => TeamsOauthCases.channel_scope },
+                      context: oauth_ctx(TeamsOauthCases::READ_SCOPES, provider))
+      raise "expected pagination rejection for #{link}"
+    rescue Aiconshell::Plugins::HostRejected, Aiconshell::Plugins::OutputInvalid
+      nil
+    end
+    expect(transport.requests_to(%r{skiptoken=x}).size).to eq(0)
+    transport.assert_consumed!
+  end
+end
+
+test("teams_oauth inspect and to_s stay secret-free with an injected provider") do
+  provider = oauth_provider(TeamsOauthCases::BINDING, token: "super-secret-token-123")
+  adapter = Aiconshell::Plugins::TeamsOauth.new(oauth_credential_provider: provider)
+  expect(adapter.inspect).to eq("#<Aiconshell::Plugins::TeamsOauth>")
+  expect(adapter.to_s).to eq("#<Aiconshell::Plugins::TeamsOauth>")
+  expect(adapter.inspect).not_to include("super-secret-token-123")
+  expect(adapter.to_s).not_to include("super-secret-token-123")
+  expect(JSON.generate([adapter.inspect, adapter.to_s])).not_to include("super-secret-token-123")
 end
 
 test("teams_oauth catalog exposes independent scopes and env-only configured flag") do

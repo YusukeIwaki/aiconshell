@@ -5,6 +5,9 @@ require "json"
 require "time"
 require "uri"
 require_relative "../oauth/errors" unless defined?(Aiconshell::Oauth::BindingMismatch)
+require_relative "../oauth/binding" unless defined?(Aiconshell::Oauth::Binding)
+require_relative "../oauth/config" unless defined?(Aiconshell::Oauth::Config)
+require_relative "../oauth/microsoft" unless defined?(Aiconshell::Oauth::Microsoft)
 
 module Aiconshell
   module Plugins
@@ -62,7 +65,10 @@ module Aiconshell
       PER_PAGE = 50
       OVERLAP_SECONDS = 300
       ID_MAX_LENGTH = 512
-      ID_FORBIDDEN = %r{[\x00-\x1F\x7F\s/\\]}
+      # Single Graph path segments never contain controls, whitespace,
+      # slashes, backslashes, or percent (which would hide traversal or
+      # double-encoding such as %2F or %252F).
+      ID_FORBIDDEN = %r{[\x00-\x1F\x7F\s/%\\]}
       TIMESTAMP_PATTERN = /\A\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\z/
 
       # Test seam only: a credential provider used when the trusted context
@@ -70,6 +76,16 @@ module Aiconshell
       # service-account credentials; the same binding is always resolved.
       def initialize(oauth_credential_provider: nil)
         @injected_provider = oauth_credential_provider
+      end
+
+      # Secret-free inspection: the injected provider may hold tokens, so
+      # never expose instance state here.
+      def inspect
+        "#<Aiconshell::Plugins::TeamsOauth>"
+      end
+
+      def to_s
+        inspect
       end
 
       # Environment settings only; connection success is reported elsewhere.
@@ -158,7 +174,10 @@ module Aiconshell
 
       # Resolves the caller-supplied binding through the caller-supplied
       # provider just-in-time. Never re-selects a "current" binding and never
-      # touches application/Bot credentials.
+      # touches application/Bot credentials. The binding is validated
+      # strictly before the provider is called, so even a lenient test
+      # provider that would return a token cannot cause Graph I/O for a
+      # missing, incomplete, or wrong-provider binding.
       def oauth_token(ctx, operation)
         context = ctx.context.is_a?(Hash) ? ctx.context : {}
         provider = context["oauth_credential_provider"] || context[:oauth_credential_provider] ||
@@ -167,25 +186,22 @@ module Aiconshell
           raise CredentialsMissing.new(plugin: plugin_id,
                                        missing: ["oauth_credential_provider"])
         end
-        binding = context["oauth_binding"] || context[:oauth_binding]
-        if binding.nil?
+        binding_raw = context["oauth_binding"] || context[:oauth_binding]
+        if binding_raw.nil?
           raise CredentialsMissing.new(plugin: plugin_id, missing: ["oauth_binding"])
         end
-        check_binding_provider!(binding)
-
         unless provider.respond_to?(:access_token)
           raise CredentialsMissing.new(plugin: plugin_id,
-                                       missing: ["oauth_credential_provider (must provide access_token)"])
+                                       missing: ["oauth_credential_provider"])
         end
-        begin
-          token = provider.access_token(binding)
-        rescue Aiconshell::Oauth::BindingMismatch
-          raise CredentialsMissing.new(plugin: plugin_id,
-                                       missing: ["oauth_binding (connection changed; reconnect)"])
-        rescue Aiconshell::Oauth::Error => e
-          raise CredentialsMissing.new(plugin: plugin_id,
-                                       missing: ["oauth_binding (connection unavailable: #{e.code})"])
-        end
+        binding = Aiconshell::Oauth::Binding.from_h(binding_raw)
+        check_binding!(binding)
+        # Let OAuth typed errors (BindingMismatch, RefreshBusy,
+        # ProviderError/NotConnected with safe codes) propagate unchanged so
+        # callers can distinguish unconnected from transient failures. They
+        # carry safe codes only and are raised before any Graph HTTP call in
+        # this invoke.
+        token = provider.access_token(binding)
         unless token.is_a?(String) && !token.empty?
           raise OutputInvalid.new(plugin: plugin_id, operation: operation,
                                   details: ["credential provider returned an unexpected token shape"])
@@ -193,20 +209,28 @@ module Aiconshell
         token
       end
 
-      def check_binding_provider!(binding)
-        name =
-          if binding.is_a?(Hash)
-            binding["provider"] || binding[:provider]
-          elsif binding.respond_to?(:provider)
-            binding.provider
-          elsif binding.respond_to?(:to_h)
-            hash = binding.to_h
-            hash.is_a?(Hash) ? (hash["provider"] || hash[:provider]) : nil
-          end
-        return if name.nil? || name.to_s == "microsoft"
-
-        raise CredentialsMissing.new(plugin: plugin_id,
-                                     missing: ["oauth_binding (microsoft connection required)"])
+      # Secret-free binding shape check. Rejects missing, incomplete, and
+      # wrong-provider bindings before the provider or Graph is touched.
+      def check_binding!(binding)
+        unless binding.provider.to_s == "microsoft"
+          raise CredentialsMissing.new(plugin: plugin_id,
+                                       missing: ["oauth_binding provider"])
+        end
+        tenant = binding.tenant.to_s
+        unless !tenant.empty? &&
+               Aiconshell::Oauth::Microsoft::TENANT_PATTERN.match?(tenant) &&
+               !Aiconshell::Oauth::Config::FORBIDDEN_TENANTS.include?(tenant.strip.downcase)
+          raise CredentialsMissing.new(plugin: plugin_id,
+                                       missing: ["oauth_binding tenant"])
+        end
+        if binding.principal.to_s.empty?
+          raise CredentialsMissing.new(plugin: plugin_id,
+                                       missing: ["oauth_binding principal"])
+        end
+        if binding.connection_id.nil?
+          raise CredentialsMissing.new(plugin: plugin_id,
+                                       missing: ["oauth_binding"])
+        end
       end
 
       # -- scope parsing -----------------------------------------------------
@@ -257,16 +281,30 @@ module Aiconshell
       end
 
       # IDs travel as single Graph path segments. Reject anything that could
-      # escape the segment (slashes, traversal, whitespace, controls).
+      # escape the segment (slashes, traversal, whitespace, controls,
+      # percent/double-encoding). Input and Graph-returned IDs share the
+      # same shape; only the error type differs.
+      def valid_single_id?(value)
+        value.is_a?(String) && !value.empty? && value.length <= ID_MAX_LENGTH &&
+          value != "." && value != ".." && !ID_FORBIDDEN.match?(value) &&
+          !value.strip.empty?
+      end
+
       def check_ids!(operation, ids)
-        bad = ids.any? do |_, value|
-          !value.is_a?(String) || value.empty? || value.length > ID_MAX_LENGTH ||
-            value == "." || value == ".." || ID_FORBIDDEN.match?(value) || value.strip.empty?
-        end
+        bad = ids.any? { |_, value| !valid_single_id?(value) }
         return unless bad
 
         raise InputInvalid.new(plugin: plugin_id, operation: operation,
                                details: ["ids must be single Graph path segments without traversal"])
+      end
+
+      # Graph-returned message/root/reply IDs are validated before they enter
+      # resource_id, event_id, or write receipts. No to_s coercion: numeric
+      # or Hash IDs are rejected as unexpected shapes.
+      def check_returned_id!(id)
+        return if valid_single_id?(id)
+
+        invalid_output!("Graph message id had an unexpected shape")
       end
 
       # -- channel + chat polling --------------------------------------------
@@ -340,18 +378,37 @@ module Aiconshell
 
       # Origin plus collection-path pinning: same-host links to another
       # chat, channel, message, or page are refused before any request.
+      # Noncanonical paths (empty segments, dot segments, trailing slash,
+      # encoded separators/dots, double-encoding) are also refused.
       def checked_next_url!(nxt, expected_segments)
         Http.check_host!(nxt, [GRAPH_BASE])
         uri = URI.parse(nxt)
         if uri.fragment && !uri.fragment.empty?
           invalid_output!("Graph next link must not carry a fragment")
         end
-        segments = uri.path.split("/").reject(&:empty?).map do |segment|
+        raw_path = uri.path.to_s
+        if raw_path.empty? || raw_path.include?("//") ||
+           raw_path.include?("/./") || raw_path.include?("/../") ||
+           raw_path.end_with?("/.") || raw_path.end_with?("/..") ||
+           (raw_path.end_with?("/") && raw_path != "/")
+          invalid_output!("Graph next link had a noncanonical path")
+        end
+        raw_segments = raw_path.split("/").reject(&:empty?)
+        if raw_segments.any? { |part| part == "." || part == ".." }
+          invalid_output!("Graph next link had a noncanonical path")
+        end
+        if raw_segments.any? { |part| part.match?(/%2f|%5c|%2e|%25/i) }
+          invalid_output!("Graph next link had an encoded path")
+        end
+        segments = raw_segments.map do |segment|
           begin
             URI::DEFAULT_PARSER.unescape(segment)
           rescue ArgumentError
             invalid_output!("Graph next link had an unexpected shape")
           end
+        end
+        if segments.any? { |part| part.empty? || part == "." || part == ".." || part.include?("/") || part.include?("\\") }
+          invalid_output!("Graph next link had a noncanonical path")
         end
         unless segments == expected_segments
           invalid_output!("Graph next link pointed outside the polled collection")
@@ -376,7 +433,7 @@ module Aiconshell
         )
         payload = response.json
         id = payload.is_a?(Hash) ? payload["id"] : nil
-        unless id.is_a?(String) && !id.empty?
+        unless valid_single_id?(id)
           raise OutputInvalid.new(plugin: plugin_id, operation: operation,
                                   details: ["Graph write response did not include a message id"])
         end
@@ -388,6 +445,8 @@ module Aiconshell
       def channel_event(message, team:, channel:, root: nil)
         modified = graph_modified(message)
         mid = message["id"]
+        check_returned_id!(mid)
+        check_returned_id!(root) unless root.nil?
         kind = root ? "reply" : "message"
         event_type = root ? "teams_oauth.reply" : "teams_oauth.message"
         identity = [team, channel, root, mid].compact.map { |id| uri_escape(id) }.join("/")
@@ -419,6 +478,7 @@ module Aiconshell
       def chat_event(message, chat:)
         modified = graph_modified(message)
         mid = message["id"]
+        check_returned_id!(mid)
         identity = [chat, mid].map { |id| uri_escape(id) }.join("/")
         event = {
           "event_id" => "teams_oauth:chat_message:#{identity}",
@@ -444,7 +504,7 @@ module Aiconshell
       end
 
       def graph_modified(message)
-        unless message.is_a?(Hash) && message["id"].is_a?(String) && !message["id"].empty? &&
+        unless message.is_a?(Hash) && valid_single_id?(message["id"]) &&
                message["body"].is_a?(Hash)
           invalid_output!("Graph message had an unexpected shape")
         end

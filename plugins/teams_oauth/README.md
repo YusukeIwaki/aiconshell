@@ -74,9 +74,14 @@ Graph ベース URL は `https://graph.microsoft.com/v1.0` に固定する。
   更新順なので、root 自体が古くても返信を取得する。
 - `@odata.nextLink` は https origin の一致だけでなく、走査中の collection path と
   完全一致する場合のみ追従する。別チャネル・別チャット・別メッセージ・別ページへの
-  link や fragment 付き link は追従せず型付きエラーとする。
-- 各 ID は単一の Graph path segment として検証・percent encoding する。
-  `/`・`\`・空白・制御文字・`.`・`..` を含む ID は path traversal 防止のため拒否する。
+  link や fragment 付き link は追従せず型付きエラーとする。空 segment・`.` / `..`・
+  trailing slash・`%2F` / `%5C` / `%2E` / `%25` の encoded path・double-encoding・
+  userinfo を含む非正規 path も追従前に拒否する。
+- 入力 ID と Graph が返す message / reply ID はいずれも単一の Graph path segment
+  として検証し、percent encoding してから URL を組み立てる。
+  `/`・`\`・空白・制御文字・`%`・`.`・`..` を含む ID は path traversal /
+  double-encoding 防止のため拒否する。数値・Hash の `to_s` 正常化は行わず、
+  不正な返却 ID は `resource_id` / `external_id` を作らず型付きエラーとする。
 
 cursor は `{"since": "ISO8601"}` のみ。厳密なタイムゾーン付き日時を解析し、
 実時刻で比較して UTC に正規化する。全ページ取得に失敗した場合は例外となり、
@@ -117,17 +122,26 @@ events / cursor を返さない。呼び出し側は全イベントの永続保�
 - `oauth_binding`：接続基盤の Binding またはその `to_h`（秘密なし）
 - `oauth_credential_provider`：`binding_for` / `access_token` ポートを持つ provider
 
-本プラグインは渡された binding をそのまま `access_token(binding)` で解決する。
+本プラグインは渡された binding を正規化（`Binding.from_h`）して検証し、
+同じ binding に対してだけ `access_token(binding)` で解決する。
 現在の binding への勝手な取り直し・service account fallback を行わない。
-binding / provider の不在・不一致・接続不可は外部 HTTP の前に
-`CredentialsMissing` として失敗する。token は検証済みの固定 Graph origin にのみ送る。
+binding / provider の不在・形状不正（provider・tenant・principal・connection_id）は
+外部 HTTP の前に `CredentialsMissing` として失敗する。不完全な binding は
+provider が token を返せる場合でも Graph へ送信しない。
+OAuth 基盤の型付き失敗（`BindingMismatch`・`RefreshBusy`・`ProviderError` の安全な
+code を含む `timeout` / `rate_limited` / `not_connected` 等）はそのまま伝播し、
+`CredentialsMissing` へ一律変換しない。未接続と一時障害を区別できる。
+token は検証済みの固定 Graph origin にのみ送る。
 テスト用 provider は constructor（`oauth_credential_provider:`）でも注入できる。
+`inspect` / `to_s` は注入 provider の内容を出さない。
 
 ## 制約
 
 - 読み書きとも委任 Graph のみ。`TEAMS_*` の読み取り資格・Bot 参照対応表は使わない。
-- token 取得失敗・Graph 側の 429 はそれぞれ `CredentialsMissing`（接続不可）/
-  `HttpError` / `RateLimited` として返す。呼び出し側で待機・再試行すること。
+- binding / provider 不在・形状不正は `CredentialsMissing`、OAuth 基盤の
+  `BindingMismatch` / `RefreshBusy` / `ProviderError`（安全な code 付き）はそのまま、
+  Graph 側の 429 / 401 / timeout はそれぞれ `RateLimited` / `HttpError` /
+  `TransportTimeout` 等として返す。呼び出し側で待機・再試行すること。
   書き込みの自動 replay は行わない。
 - 投稿成功（API 受理）直後に呼び出し側が停止すると、再試行で重複投稿が起こり得る。
   `sent` は外部 API の受理を示し、人間の閲覧や外部での exactly-once を保証しない。
