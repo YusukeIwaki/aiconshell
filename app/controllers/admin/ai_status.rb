@@ -9,13 +9,14 @@ module Admin
   # web-local CLI/home probing: the web container has no CLI, so local
   # probing would always misreport "unconfigured".
   #
-  # Layer to worker role: interaction/coordination use control, execution
-  # uses execution. Each diagnosis carries the role and last checked time.
+  # Layer to worker role: all three layers share the execution worker
+  # (single-worker contract, issue 20). Each diagnosis carries the role
+  # and last checked time.
   module AiStatus
     PROVIDERS = %w[claude codex muse].freeze
     LAYER_ROLES = {
-      "interaction" => "control",
-      "coordination" => "control",
+      "interaction" => "execution",
+      "coordination" => "execution",
       "execution" => "execution"
     }.freeze
 

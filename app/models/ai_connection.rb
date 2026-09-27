@@ -1,12 +1,16 @@
 # frozen_string_literal: true
 
 # Worker-confirmed connection snapshot per provider and worker role.
-# There are six rows at most (3 providers x control/execution). The state is
-# only ever written by the auth worker after running the official CLI; the
-# web process never infers readiness from local binaries or home directories.
+# Single-worker contract (issue 20): current connections are the three
+# execution rows (3 providers x execution). Legacy control rows may remain
+# but are never displayed as current and never copied to execution.
+# The state is only ever written by the auth worker after running the
+# official CLI; the web process never infers readiness from local binaries
+# or home directories.
 class AiConnection < ApplicationRecord
   PROVIDERS = %w[claude codex muse].freeze
   WORKER_ROLES = %w[control execution].freeze
+  EXECUTION_ROLE = "execution"
   STATES = %w[unknown connected disconnected unavailable failed].freeze
 
   validates :provider, presence: true, inclusion: { in: PROVIDERS }

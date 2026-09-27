@@ -8,7 +8,7 @@ test("request emits use interaction layer with safe data only") do |db:|
   sink = WorkflowFakes::FakeEventSink.new
   service = AiAuth::RequestService.new(event_sink: sink)
 
-  session = service.request_login(provider: "claude", worker_role: "control")
+  session = service.request_login(provider: "claude", worker_role: "execution")
   expect(sink.events.last[:layer]).to eq("interaction")
   expect(sink.events.last[:kind]).to eq("auth.requested")
   data = sink.events.last[:data]
@@ -28,10 +28,10 @@ test("real EventLog outbox receives safe auth events") do |db:|
   expect(db.transaction_open?).to eq(true)
   before = EventDelivery.where(kind: ["auth.requested", "auth.succeeded"]).count
 
-  with_worker_role("control") do
+  with_worker_role("execution") do
     # Use the real WorkflowEvents sink (ActiveRecord outbox), not a fake.
     service = AiAuth::RequestService.new(event_sink: WorkflowEvents)
-    session = service.request_login(provider: "codex", worker_role: "control")
+    session = service.request_login(provider: "codex", worker_role: "execution")
     runner = AiAuthTestSupport::FakeAuthRunner.new(
       status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
     )
@@ -44,7 +44,7 @@ test("real EventLog outbox receives safe auth events") do |db:|
   requested = rows.find { |r| r.kind == "auth.requested" }
   succeeded = rows.find { |r| r.kind == "auth.succeeded" }
   expect(requested.layer).to eq("interaction")
-  expect(succeeded.layer).to eq("coordination")
+  expect(succeeded.layer).to eq("execution")
   [requested, succeeded].each do |row|
     envelope = row.envelope
     expect(envelope["layer"]).to eq(row.layer)

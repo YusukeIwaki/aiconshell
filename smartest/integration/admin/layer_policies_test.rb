@@ -5,7 +5,7 @@ require_relative "support/admin_test_support"
 
 test("policy index lists all three layers with worker snapshots") do |http:|
   LayerPolicy.create!(layer: "coordination", provider: "codex", enabled: true)
-  AiConnection.create!(provider: "codex", worker_role: "control",
+  AiConnection.create!(provider: "codex", worker_role: "execution",
                        state: "connected", checked_at: Time.current)
 
   AdminTestSupport.as_admin(http) do
@@ -18,7 +18,7 @@ test("policy index lists all three layers with worker snapshots") do |http:|
     expect(body.include?("実行層")).to eq(true)
     expect(body.include?("codex")).to eq(true)
     expect(body.include?("接続済み")).to eq(true)
-    expect(body.include?("control worker")).to eq(true)
+    expect(body.include?("execution worker")).to eq(true)
   end
 end
 
@@ -114,7 +114,7 @@ end
 test("failed snapshot shows safe Japanese error with role and time") do |http:|
   LayerPolicy.create!(layer: "coordination", provider: "codex", enabled: true)
   checked = Time.current
-  AiConnection.create!(provider: "codex", worker_role: "control",
+  AiConnection.create!(provider: "codex", worker_role: "execution",
                        state: "failed", error_code: "spawn_failed",
                        checked_at: checked)
 
@@ -124,7 +124,7 @@ test("failed snapshot shows safe Japanese error with role and time") do |http:|
     body = http.last_response.body
     expect(body.include?("失敗")).to eq(true)
     expect(body.include?("起動に失敗")).to eq(true)
-    expect(body.include?("control worker")).to eq(true)
+    expect(body.include?("execution worker")).to eq(true)
     expect(body.include?("spawn_failed")).to eq(false)
   end
 end

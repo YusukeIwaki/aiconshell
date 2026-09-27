@@ -7,19 +7,24 @@ module Admin
   class AiConnectionsController < BaseController
     before_action :set_private_headers
 
+    # Single-worker contract (issue 20): one row per provider on the
+    # shared execution worker. Legacy control snapshots/sessions stay in
+    # the database but are never shown as current connections.
+    EXECUTION_ROLE = "execution"
+
     def index
       ops.recover_expired!
       snapshots = AiConnection.where(
-        provider: AiConnection::PROVIDERS, worker_role: AiConnection::WORKER_ROLES
+        provider: AiConnection::PROVIDERS, worker_role: EXECUTION_ROLE
       ).index_by { |row| [row.provider, row.worker_role] }
       # Latest session per pair, including terminal failures/cancels/expiry,
       # so results stay visible with retry actions after the run ends.
       latest = {}
-      AiConnection::PROVIDERS.product(AiConnection::WORKER_ROLES).each do |provider, role|
+      AiConnection::PROVIDERS.product([EXECUTION_ROLE]).each do |provider, role|
         latest[[provider, role]] = AiAuthSession.where(provider: provider, worker_role: role)
           .order(id: :desc).first
       end
-      @rows = AiConnection::PROVIDERS.product(AiConnection::WORKER_ROLES).map do |provider, role|
+      @rows = AiConnection::PROVIDERS.product([EXECUTION_ROLE]).map do |provider, role|
         session = latest[[provider, role]]
         {
           provider: provider,
