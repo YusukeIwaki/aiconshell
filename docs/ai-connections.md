@@ -44,8 +44,7 @@ provider/roleは既知値のみ許可し、認証やCSRFを迂回する経路を
 ### 実行プロセス
 
 - worker には `AICONSHELL_WORKER_ROLE=execution` を明示する。Web には付けない。auth job は execution の worker でのみ実行し、それ以外では安全な分類で失敗する。旧 control 向けの要求は worker に届く前に拒否される。
-- 専用queue `ai_auth_execution` を、execution worker の別1スレッドpoolで処理する。長い認証待ちが通常の execution 処理を塞がない。
-- Compose: `config/queue_execution.yml` が2pool構成。`ruby bin/check-compose` が検証する。`config/queue_control.yml` に残る `ai_auth_control` pool は切替後に使われない。コンテナ・queue設定の整理は別Issueの担当であり、ここでは変えない。
+- 共通 execution worker が `control` / `execution` / `ai_auth_execution` の3poolを消費する（control既定3 threads、execution既定1 thread、認証1 threadに分離し、単一の優先順位付きqueueやwildcard poolへまとめない）。長い実作業・ログイン待ちが control の実行枠を塞がない。canonical config は `config/queue_execution.yml` であり、`ruby bin/check-compose` が新構成を検証する。旧 control 専用の起動設定（旧 control サービス定義や旧 `ai_auth_control` poolを含む）は廃止する。移行全体の構成・切替順序・rollback は [deployment.md](deployment.md) を参照し、この文書ではAI連携側の入口・表示・失効だけを定める。
 - 認証ホームは execution worker の private volume のみ（Composeは `execution_claude_auth` / `execution_codex_auth` / `execution_muse_auth`、Railwayは execution worker の `/data/auth/*`）。Web に CLI・認証volume・worker role を付けない。長期トークンは worker volume だけに置く。
 - 短期の認証秘密（認証URL/ユーザーコード/入力コード）は共有PostgreSQLに `SECRET_KEY_BASE` 由来の専用キーで暗号化（AES-256-GCM・JSON）して保存し、完了・失敗・キャンセル・期限で削除する。
 
@@ -64,7 +63,7 @@ provider/roleは既知値のみ許可し、認証やCSRFを迂回する経路を
 
 - 切替前に旧 control worker を停止すること。停止せずに失効させた場合でも、遅れて届いた旧処理の書込は claim fencing で拒否される（終端行への上書きはしない）が、正規の手順ではない。
 - 新規の control 宛て認証は受付・実行の両方で拒否される。旧 queue に job が届くことはない。
-- 認証cacheのコピーやvolume削除はこの手順では行わない。コンテナ・queue設定の変更も別Issueの担当である。
+- 認証cacheのコピーやvolume削除はこの手順では行わない。コンテナ・queue設定の変更は [deployment.md](deployment.md) の手順で行う。
 
 ## Railway
 

@@ -22,10 +22,25 @@ test("ai connections index lists three providers on the shared execution worker"
 
     expect(http.last_response.status).to eq(200)
     body = http.last_response.body
+    # Provider sections are real rows, not description text: one header per
+    # provider, each bound to the execution worker only.
+    expect(body.scan("Claude × execution worker").size).to eq(1)
+    expect(body.scan("Codex × execution worker").size).to eq(1)
+    expect(body.scan("Muse Code × execution worker").size).to eq(1)
     %w[claude codex muse].each do |provider|
-      expect(body.include?(provider)).to eq(true)
+      expect(body.scan("provider: <code class=\"admin-env\">#{provider}</code>").size).to eq(1)
     end
-    expect(body.include?("execution")).to eq(true)
+    expect(body.scan("provider: <code class=\"admin-env\">").size).to eq(3)
+    expect(body.scan("worker: <code class=\"admin-env\">execution</code>").size).to eq(3)
+    expect(body.include?("worker: <code class=\"admin-env\">control</code>")).to eq(false)
+    # Each provider owns login/status forms for execution; no control forms exist.
+    %w[claude codex muse].each do |provider|
+      login_form = body[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=#{provider}(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+      expect(login_form.nil?).to eq(false)
+      status_form = body[/<form[^>]*action="\/admin\/ai_connections\/status_check\?provider=#{provider}(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+      expect(status_form.nil?).to eq(false)
+    end
+    expect(body.scan(/worker_role=control/).size).to eq(0)
     # Single-worker contract: no per-role rows, no control worker display.
     expect(body.include?("control worker")).to eq(false)
     expect(body.include?("別の永続volume")).to eq(false)
@@ -395,19 +410,47 @@ test("control-targeted login and status are rejected without rows or jobs") do |
 end
 
 test("legacy control snapshots are kept but never shown as current connections") do |http:|
+  # claude has only a legacy control snapshot; codex has divergent snapshots
+  # (control says connected, execution says disconnected).
   AiConnection.create!(provider: "claude", worker_role: "control",
                        state: "connected", checked_at: Time.current)
+  AiConnection.create!(provider: "codex", worker_role: "control",
+                       state: "connected", checked_at: Time.current)
+  AiConnection.create!(provider: "codex", worker_role: "execution",
+                       state: "disconnected", checked_at: Time.current)
 
   AdminTestSupport.as_admin(http) do
     http.get "/admin/ai_connections"
 
     expect(http.last_response.status).to eq(200)
     body = http.last_response.body
+    claude_at = body.index("Claude × execution worker")
+    codex_at = body.index("Codex × execution worker")
+    muse_at = body.index("Muse Code × execution worker")
+    expect(claude_at.nil?).to eq(false)
+    expect(codex_at.nil?).to eq(false)
+    expect(muse_at.nil?).to eq(false)
+    expect(claude_at < codex_at).to eq(true)
+    expect(codex_at < muse_at).to eq(true)
+    claude_card = body[claude_at...codex_at]
+    codex_card = body[codex_at...muse_at]
     # The claude execution row has no snapshot: unknown, not connected.
+    expect(claude_card.include?("未確認")).to eq(true)
+    expect(claude_card.include?("接続済み")).to eq(false)
+    expect(claude_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
+    # The codex row follows its execution snapshot, not the legacy control one.
+    expect(codex_card.include?("未連携")).to eq(true)
+    expect(codex_card.include?("接続済み")).to eq(false)
+    expect(codex_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
+    codex_login = codex_card[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=codex(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+    expect(codex_login.nil?).to eq(false)
+    # No row renders a control snapshot as current.
     expect(body.include?("接続済み")).to eq(false)
-    expect(body.include?("未確認")).to eq(true)
     expect(body.include?("control worker")).to eq(false)
+    expect(body.scan(/worker_role=control/).size).to eq(0)
     # History is preserved in the database.
     expect(AiConnection.find_by(provider: "claude", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "codex", worker_role: "execution").state).to eq("disconnected")
   end
 end
