@@ -1,7 +1,7 @@
 <% content_for(:title, "層別AIポリシー") %>
 <h1>層別AIポリシー</h1>
 <p>各層が使う provider / model / effort / 仕事の指示です。未連携の provider も選択・保存でき、不足は実行時に分類済みエラーになります。秘密情報はここに保存しません。</p>
-<p>設定状態はworker確認済みスナップショットを表示します（対話層・整理層は control worker、実行層は execution workerの確認結果）。最終確認時刻と役割を確認し、workerでのログインと接続確認は <%= link_to "AIアカウント連携", admin_ai_connections_path %> から行ってください。</p>
+<p>設定状態はworker確認済みスナップショットを表示します（対話層・整理層は control worker、実行層は execution workerの確認結果）。最終確認時刻と役割を確認し、保存済みの行は「接続状態を再確認」でworkerに確認を依頼できます。進行と結果は <%= link_to "AIアカウント連携", admin_ai_connections_path %> で確認してください。</p>
 
 <div class="admin-table-wrap">
   <table class="admin-table">
@@ -26,7 +26,14 @@
         <% else %>
           <td colspan="4"><span class="admin-badge admin-badge-warn">未設定</span></td>
         <% end %>
-        <td><%= link_to "編集", edit_admin_layer_policy_path(row[:layer]) %></td>
+        <td>
+          <%= link_to "編集", edit_admin_layer_policy_path(row[:layer]) %>
+          <% if row[:policy]&.persisted? %>
+            <%= button_to "接続状態を再確認", connection_check_admin_layer_policy_path(row[:layer]), method: :post, class: "admin-btn" %>
+          <% else %>
+            <span>設定が必要です</span>
+          <% end %>
+        </td>
       </tr>
     <% end %>
   </table>

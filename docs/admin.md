@@ -4,7 +4,7 @@
 
 - タスクボード (`/admin/tasks`)：状態別ボード、状態フィルタ、50件単位のページ送り
 - タスク詳細 (`/admin/tasks/:id`)：概要・作業計画、フィードバック一覧・投稿、実行結果付き履歴、送信アクション
-- 層別 AI ポリシー (`/admin/layer_policies`)：provider/model/effort/指示 + 設定診断
+- 層別 AI ポリシー (`/admin/layer_policies`)：provider/model/effort/指示 + 設定診断 + 保存済み設定の接続再確認
 - プラグイン (`/admin/plugins`)：対応操作・必要 env 名・設定済み表示（値なし）
 - EventLog 検索 (`/admin/event_logs`)：層・種別・タスク・期間・キーワード
 - AIアカウント連携 (`/admin/ai_connections`)：provider × worker role の状態確認・連携開始・認証案内・コード入力・キャンセル（[ai-connections.md](ai-connections.md)）
@@ -59,6 +59,12 @@
   CSRF は Rails 既定のまま（無効化しない）。
 - provider は claude/codex/muse を常に選択・保存可。未設定は診断バッジのみで保存成功し、
   未知 ID は 422 で拒否する。worker 直接実行ボタンは持たない。
+- 一覧の保存済み行には「接続状態を再確認」があり、保存済み provider と層対応 role の
+  状態確認を `AiAuth::RequestService#request_status` に依頼する。対象は保存済み設定からのみ
+  決まり、リクエストの付加パラメータで変更できない。受付は `admin_ai_connections_path` へ
+  遷移し、接続済みとは表示しない。進行と結果は AIアカウント連携画面で確認する。
+  未設定行は「設定が必要です」と案内し、受け付けない。無効なポリシーでも確認できる。
+  保存済みポリシーや業務タスクは変更しない。不明な層・未認証・CSRF不正では実行しない。
 - 検索パラメータは層 allowlist・bounded text・数値 task_id・厳密な時刻 parse・上限 clamp。
   空の task_id・期間は `nil` に正規化して ClickHouseAdapter に渡す（文字列のまま渡さない）。
   sort/order パラメータは受け付けない。
