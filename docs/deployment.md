@@ -285,6 +285,8 @@ GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
 実デプロイ・有料リソース作成・ログインは運営者作業。同一 project / environment に
 同じ repository を使う web・control・execution と、PostgreSQL・ClickHouse を配置する。
 DB / ClickHouse は private networking で接続し、公開ポートを作らない。
+1 台の PostgreSQL サーバーで独立した利用環境を複数運用する場合は
+[docs/railway-environments.md](railway-environments.md) も参照。
 
 ### サービスごとの設定とビルド
 
@@ -328,10 +330,10 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 
 | 変数 | 設定先と値の例 |
 | --- | --- |
-| `DATABASE_URL` | 3 サービスに `${{Postgres.DATABASE_URL}}` |
+| `DATABASE_URL` | 3 サービスにその利用環境の専用 role 接続文字列。管理者接続（`${{Postgres.DATABASE_URL}}`）をそのまま使わない。複数環境は [docs/railway-environments.md](railway-environments.md) |
 | `CLICKHOUSE_URL` | web / control に `http://${{ClickHouse.RAILWAY_PRIVATE_DOMAIN}}:8123` |
 | `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / control に ClickHouse サービスの値 |
-| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値 |
+| `SECRET_KEY_BASE` | 3 サービスに `bin/rails secret` で生成した秘密値（利用環境ごとに別の値） |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
 | `ADMIN_API_TOKEN` | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値（未設定は fail closed。UI 認証とは別。`docs/task-requests.md`） |
 | `RAILS_ENV` | 3 サービスに `production` |

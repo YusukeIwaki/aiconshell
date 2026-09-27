@@ -145,6 +145,8 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 ## 操作・デプロイ
 
 - 日常操作・AI CLI 導入・Railway・ngrok は [docs/deployment.md](docs/deployment.md)。
+- 共有 PostgreSQL サーバー上の複数利用環境は
+  [docs/railway-environments.md](docs/railway-environments.md)。
 - イメージは役割別: web は常に CLI なしの `app`、worker は `ai` が既定
   （Claude/Codex/Muse 付き。Muse は公式公開 Linux バイナリを固定
   バージョン・SHA256 検証で同梱）。認証ログインは別の実行時手順。
