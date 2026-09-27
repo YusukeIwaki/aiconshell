@@ -6,18 +6,19 @@
 #   ruby bin/check-compose
 #
 # Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
-# separated control/execution queues plus dedicated 1-thread ai_auth pools,
-# explicit worker roles, no integration credentials on the
-# execution worker, explicit workflow settings on every Rails process,
-# the EventLog channel default on every emitting Rails process, Teams
-# targets path on web/control only, recurring schedules on control only,
+# the unified execution worker's three separated pools (control / execution /
+# ai_auth_execution) plus the recurring scheduler on that same worker, the
+# explicit worker role, integration/ClickHouse settings on the worker's Rails
+# parent (never in AI child envs), explicit workflow settings on every Rails
+# process, the EventLog channel default on every emitting Rails process, Teams
+# targets path on web/worker only, recurring schedules targeting control,
 # ClickHouse-independent startup (SQL migrate vs clickhouse-init split),
-# AI auth only on the workers, persisted workspaces outside app source,
-# image role targets (app web/migrate/clickhouse-init, ai workers with an
+# AI auth only on the worker, persisted workspaces outside app source,
+# image role targets (app web/migrate/clickhouse-init, ai worker with an
 # explicit app override), pinned Muse download boundaries (no build secret),
 # a single migration process, production /up health exclusion, loopback-bound
-# ports, no Docker socket mounts, and .env.example coverage of every compose
-# variable.
+# ports, no Docker socket mounts, no leftover control-plane startup config,
+# and .env.example coverage of every compose variable.
 # Runs in CI (ops job) and locally before `docker compose up`.
 require "yaml"
 
@@ -50,14 +51,24 @@ AI_VARS = %w[
   AICONSHELL_CLAUDE_BIN AICONSHELL_CODEX_BIN AICONSHELL_MUSE_BIN
 ].freeze
 
+INTEGRATION_VARS = %w[
+  GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL
+  TEAMS_BOT_TARGETS_FILE
+].freeze
+
+POLLING_VARS = %w[
+  AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID
+].freeze
+
 compose_path = File.join(ROOT, "compose.yml")
 compose = YAML.load_file(compose_path, aliases: true)
 services = compose.fetch("services")
 
-check(failures, "compose.yml declares web/control/execution/migrate/clickhouse-init/db/clickhouse") do
-  %w[web control execution migrate clickhouse-init db clickhouse].each do |name|
+check(failures, "compose.yml declares web/execution/migrate/clickhouse-init/db/clickhouse (no control)") do
+  %w[web execution migrate clickhouse-init db clickhouse].each do |name|
     assert(services.key?(name), "missing service #{name}")
   end
+  assert(!services.key?("control"), "obsolete control service must be gone (unified execution worker)")
 end
 
 check(failures, "ngrok is opt-in via the tunnel profile") do
@@ -70,14 +81,14 @@ check(failures, "project name is per-worktree (COMPOSE_PROJECT_NAME)") do
     "top-level name: must reference COMPOSE_PROJECT_NAME")
 end
 
-app_services = %w[web control execution migrate]
+app_services = %w[web execution migrate]
 env_of = ->(name) do
   env = services.dig(name, "environment")
   assert(env.is_a?(Hash), "#{name}.environment must be a mapping, got #{env.class}")
   env.transform_keys(&:to_s)
 end
 
-check(failures, "web/control/execution/migrate share one DATABASE_URL") do
+check(failures, "web/execution/migrate share one DATABASE_URL") do
   urls = app_services.to_h { |name| [name, env_of.call(name)["DATABASE_URL"]] }
   assert(urls.values.all? { |url| !url.to_s.empty? }, "DATABASE_URL must be set on #{app_services.join(", ")}")
   assert(urls.values.uniq.size == 1, "DATABASE_URL differs: #{urls.keys.join(", ")}")
@@ -98,33 +109,42 @@ check(failures, "execution root is explicit, outside app source, on a persisted 
   root = roots.values.first.to_s
   assert(root.include?("/workspaces"), "execution root must be /workspaces, got #{root.inspect}")
   assert(!root.include?("/rails"), "execution root must be outside the app source (/rails)")
-  %w[control execution].each do |name|
-    mounts = Array(services.dig(name, "volumes")).map(&:to_s)
-    assert(mounts.any? { |mount| mount.include?("ai_workspaces:/workspaces") },
-      "#{name} must mount ai_workspaces at /workspaces")
-  end
+  mounts = Array(services.dig("execution", "volumes")).map(&:to_s)
+  assert(mounts.any? { |mount| mount.include?("ai_workspaces:/workspaces") },
+    "execution must mount ai_workspaces at /workspaces")
   assert(compose.fetch("volumes").key?("ai_workspaces"), "missing named volume ai_workspaces")
 end
 
-check(failures, "execution worker receives no integration credentials") do
-  forbidden = env_of.call("execution").keys.select do |key|
-    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|CLICKHOUSE_)/)
+check(failures, "unified worker holds integration/ClickHouse/polling settings in its Rails parent") do
+  env = env_of.call("execution")
+  INTEGRATION_VARS.each do |var|
+    assert(env.key?(var), "execution is missing #{var} (polling/delivery/diagnostics need it)")
   end
-  assert(forbidden.empty?, "forbidden keys on execution: #{forbidden.join(", ")}")
-  %w[AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID].each do |var|
-    assert(!env_of.call("execution").key?(var), "forbidden key on execution: #{var}")
+  POLLING_VARS.each do |var|
+    assert(env.key?(var), "execution is missing #{var} (control-pool poll/outbound filtering)")
   end
+  %w[CLICKHOUSE_URL CLICKHOUSE_DATABASE CLICKHOUSE_USER CLICKHOUSE_PASSWORD].each do |var|
+    assert(env.key?(var), "execution is missing #{var} (EventLog delivery needs it)")
+  end
+  # The AI lane never inherits these into CLI subprocesses
+  # (lib/aiconshell/ai/child_env.rb builds the child env from scratch).
+  child_env = File.read(File.join(ROOT, "lib/aiconshell/ai/child_env.rb"))
+  assert(child_env.include?("unsetenv_others") || child_env.include?("constructed from scratch") ||
+    child_env.include?("never inherited"),
+    "child_env.rb must document that parent credentials never reach AI children")
 end
 
-check(failures, "control has integration credentials plus self-actor ids; web has credentials but no self-actor ids") do
-  %w[GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE].each do |var|
+check(failures, "web has credentials but no polling-only vars; migrate has neither") do
+  INTEGRATION_VARS.each do |var|
     assert(env_of.call("web").key?(var), "web is missing #{var} (admin diagnostics)")
-    assert(env_of.call("control").key?(var), "control is missing #{var}")
   end
-  %w[AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID].each do |var|
-    assert(env_of.call("control").key?(var), "control is missing #{var} (poll/outbound filtering)")
-    assert(!env_of.call("web").key?(var), "web must not carry #{var} (control-only)")
+  POLLING_VARS.each do |var|
+    assert(!env_of.call("web").key?(var), "web must not carry #{var} (worker control-pool only)")
   end
+  forbidden = env_of.call("migrate").keys.select do |key|
+    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|CLICKHOUSE_)/) || POLLING_VARS.include?(key)
+  end
+  assert(forbidden.empty?, "forbidden keys on migrate: #{forbidden.join(", ")}")
 end
 
 check(failures, "every emitting Rails process receives EVENT_LOG_TEAMS_CHANNEL (blank default)") do
@@ -138,46 +158,48 @@ check(failures, "every emitting Rails process receives EVENT_LOG_TEAMS_CHANNEL (
     ".env.example must default EVENT_LOG_TEAMS_CHANNEL to blank")
 end
 
-check(failures, "AI auth goes only to control/execution (corrected muse mapping, no MUSE_CONFIG_DIR)") do
+check(failures, "AI auth goes only to execution (corrected muse mapping, no MUSE_CONFIG_DIR)") do
   services.each do |name, svc|
     keys = (svc["environment"] || {}).keys.map(&:to_s)
     assert(!keys.include?("MUSE_CONFIG_DIR"),
       "#{name} sets MUSE_CONFIG_DIR, which the native CLI does not honor (use AICONSHELL_MUSE_HOME)")
   end
-  %w[control execution].each do |name|
-    env = env_of.call(name)
-    missing = AI_VARS.reject { |var| env.key?(var) }
-    assert(missing.empty?, "#{name} is missing AI variables: #{missing.join(", ")}")
-  end
+  env = env_of.call("execution")
+  missing = AI_VARS.reject { |var| env.key?(var) }
+  assert(missing.empty?, "execution is missing AI variables: #{missing.join(", ")}")
   %w[web migrate clickhouse-init].each do |name|
     present = env_of.call(name).keys & AI_VARS
     assert(present.empty?, "#{name} must not carry AI variables: #{present.join(", ")}")
   end
-  %w[control execution].each do |name|
-    mounts = Array(services.dig(name, "volumes")).map(&:to_s)
-    %w[claude codex muse].each do |provider|
-      volume = name == "control" ? "#{provider}_auth" : "execution_#{provider}_auth"
-      assert(mounts.include?("#{volume}:/private/#{provider}"), "#{name} must mount its own #{volume}")
-      assert(compose.fetch("volumes").key?(volume), "missing auth volume #{volume}")
-      other = name == "control" ? "execution_#{provider}_auth" : "#{provider}_auth"
-      assert(mounts.none? { |mount| mount.start_with?("#{other}:") }, "auth volumes must not be shared between worker roles")
-    end
+  mounts = Array(services.dig("execution", "volumes")).map(&:to_s)
+  %w[claude codex muse].each do |provider|
+    volume = "execution_#{provider}_auth"
+    assert(mounts.include?("#{volume}:/private/#{provider}"), "execution must mount its own #{volume}")
+    assert(compose.fetch("volumes").key?(volume), "missing auth volume #{volume}")
   end
   assert(Array(services.dig("web", "volumes")).empty?, "web must mount no AI auth volumes")
 end
 
-check(failures, "web/migrate/clickhouse-init stay app, workers default to ai with an app override") do
+check(failures, "legacy control auth volumes are neither mounted nor recreated") do
+  raw = File.read(compose_path)
+  %w[claude_auth codex_auth muse_auth].each do |volume|
+    assert(!raw.match?(/(?<!execution_)#{volume}:/),
+      "compose must not mount or declare legacy #{volume} (pre-existing host volumes stay untouched)")
+  end
+end
+
+check(failures, "web/migrate/clickhouse-init stay app, worker defaults to ai with an app override") do
   example = File.read(File.join(ROOT, ".env.example"))
   %w[web migrate clickhouse-init].each do |name|
     target = services.dig(name, "build", "target").to_s
     assert(target == "app", "#{name} build target must be app, got #{target.inspect}")
   end
-  { "control" => "CONTROL_TARGET", "execution" => "EXECUTION_TARGET" }.each do |name, var|
-    target = services.dig(name, "build", "target").to_s
-    assert(target == "${#{var}:-ai}",
-      "#{name} build target must default to ai via #{var} for offline app builds (got #{target.inspect})")
-    assert(example.match?(/^#{var}=ai$/), ".env.example must default #{var} to ai")
-  end
+  target = services.dig("execution", "build", "target").to_s
+  assert(target == "${EXECUTION_TARGET:-ai}",
+    "execution build target must default to ai via EXECUTION_TARGET for offline app builds (got #{target.inspect})")
+  assert(example.match?(/^EXECUTION_TARGET=ai$/), ".env.example must default EXECUTION_TARGET to ai")
+  assert(!example.match?(/^CONTROL_TARGET=/m), ".env.example must not define CONTROL_TARGET (no control service)")
+  assert(!File.read(compose_path).include?("CONTROL_TARGET"), "base compose must not reference CONTROL_TARGET")
 end
 
 check(failures, "obsolete optional-Muse contract is gone (no override, secret, or path)") do
@@ -192,47 +214,71 @@ check(failures, "obsolete optional-Muse contract is gone (no override, secret, o
     "base compose must not reference the muse_cli build secret")
 end
 
-check(failures, "control worker runs queue control, execution runs queue execution") do
-  control_cmd = Array(services.dig("control", "command")).join(" ")
+check(failures, "obsolete control-plane startup config is gone") do
+  assert(!File.exist?(File.join(ROOT, "config/queue_control.yml")),
+    "config/queue_control.yml must be removed (canonical config is config/queue_execution.yml)")
+  assert(!File.exist?(File.join(ROOT, "railway.control.toml")),
+    "railway.control.toml must be removed (unified execution worker only)")
+  raw = File.read(compose_path)
+  assert(!raw.include?("queue_control"), "compose must not reference queue_control")
+  assert(!raw.include?("ai_auth_control"), "compose must not reference ai_auth_control")
+end
+
+check(failures, "unified worker runs queue_execution.yml with the scheduler (no --skip-recurring)") do
   execution_cmd = Array(services.dig("execution", "command")).join(" ")
-  assert(control_cmd.include?("--config-file=config/queue_control.yml"), "control command: #{control_cmd}")
   assert(execution_cmd.include?("--config-file=config/queue_execution.yml"), "execution command: #{execution_cmd}")
-  assert(execution_cmd.include?("--skip-recurring"), "execution must pass --skip-recurring")
-  assert(!control_cmd.include?("--skip-recurring"), "control must keep the recurring scheduler")
+  assert(!execution_cmd.include?("--skip-recurring"), "execution must keep the recurring scheduler")
 end
 
-check(failures, "queue configs bind workers to role queues plus a 1-thread auth pool") do
-  control_q = YAML.load_file(File.join(ROOT, "config/queue_control.yml"))
+check(failures, "queue_execution.yml binds three separated pools (control 3 / execution 1 / auth 1)") do
   execution_q = YAML.load_file(File.join(ROOT, "config/queue_execution.yml"))
-  control_workers = Array(control_q["workers"])
-  execution_workers = Array(execution_q["workers"])
-  assert(control_workers.size == 2, "queue_control must declare 2 worker pools, got #{control_workers.size}")
-  assert(execution_workers.size == 2, "queue_execution must declare 2 worker pools, got #{execution_workers.size}")
-  control_main = control_workers[0]
-  control_auth = control_workers[1]
-  execution_main = execution_workers[0]
-  execution_auth = execution_workers[1]
-  assert(Array(control_main["queues"]).map(&:to_s) == ["control"], "queue_control main: #{control_main["queues"].inspect}")
-  assert(Array(execution_main["queues"]).map(&:to_s) == ["execution"], "queue_execution main: #{execution_main["queues"].inspect}")
-  assert(Array(control_auth["queues"]).map(&:to_s) == ["ai_auth_control"], "queue_control auth: #{control_auth["queues"].inspect}")
-  assert(Array(execution_auth["queues"]).map(&:to_s) == ["ai_auth_execution"], "queue_execution auth: #{execution_auth["queues"].inspect}")
-  assert(control_auth["threads"].to_i == 1, "ai_auth_control pool must be 1 thread")
-  assert(execution_auth["threads"].to_i == 1, "ai_auth_execution pool must be 1 thread")
-  assert(control_main["threads"].to_i >= 1, "control pool must keep its threads")
-  assert(execution_main["threads"].to_i >= 1, "execution pool must keep its threads")
+  workers = Array(execution_q["workers"])
+  assert(workers.size == 3, "queue_execution must declare 3 worker pools, got #{workers.size}")
+  by_queue = workers.to_h { |worker| [Array(worker["queues"]).map(&:to_s), worker] }
+  control_pool = by_queue[["control"]]
+  execution_pool = by_queue[["execution"]]
+  auth_pool = by_queue[["ai_auth_execution"]]
+  assert(control_pool, "queue_execution must bind a dedicated control pool")
+  assert(execution_pool, "queue_execution must bind a dedicated execution pool")
+  assert(auth_pool, "queue_execution must bind a dedicated ai_auth_execution pool")
+  assert(control_pool["threads"].to_i == 3, "control pool must default to 3 threads")
+  assert(execution_pool["threads"].to_i == 1, "execution pool must default to 1 thread")
+  assert(auth_pool["threads"].to_i == 1, "ai_auth_execution pool must be 1 thread")
+  workers.each do |worker|
+    queues = Array(worker["queues"]).map(&:to_s)
+    assert(queues.size == 1 && queues.first != "*", "pools must not be wildcard or merged: #{queues.inspect}")
+  end
 end
 
-check(failures, "workers carry explicit roles, web/migrate carry none") do
-  assert(env_of.call("control")["AICONSHELL_WORKER_ROLE"] == "control", "control role")
+check(failures, "development queue.yml mirrors the same three-pool separation (no wildcard)") do
+  dev_q = YAML.load_file(File.join(ROOT, "config/queue.yml"), aliases: true)
+  workers = Array(dev_q.dig("development", "workers"))
+  assert(workers.size == 3, "queue.yml development must declare 3 worker pools, got #{workers.size}")
+  by_queue = workers.to_h { |worker| [Array(worker["queues"]).map(&:to_s), worker] }
+  assert(by_queue[["control"]]["threads"].to_i == 3, "queue.yml control pool must default to 3 threads")
+  assert(by_queue[["execution"]]["threads"].to_i == 1, "queue.yml execution pool must default to 1 thread")
+  assert(by_queue[["ai_auth_execution"]]["threads"].to_i == 1, "queue.yml auth pool must be 1 thread")
+  workers.each do |worker|
+    queues = Array(worker["queues"]).map(&:to_s)
+    assert(queues.size == 1 && queues.first != "*", "pools must not be wildcard or merged: #{queues.inspect}")
+  end
+end
+
+check(failures, "worker carries the execution role, web/migrate carry none") do
   assert(env_of.call("execution")["AICONSHELL_WORKER_ROLE"] == "execution", "execution role")
   %w[web migrate clickhouse-init].each do |name|
     env = services.dig(name, "environment") || {}
     assert(!env.transform_keys(&:to_s).key?("AICONSHELL_WORKER_ROLE"), "#{name} must not carry AICONSHELL_WORKER_ROLE")
   end
   job_file = File.join(ROOT, "app/jobs/ai_auth_job.rb")
-  assert(File.file?(job_file), "missing app/jobs/ai_auth_job.rb for the auth queues")
+  assert(File.file?(job_file), "missing app/jobs/ai_auth_job.rb for the auth queue")
   job_source = File.read(job_file)
-  assert(job_source.include?("queue_as :ai_auth_control"), "AiAuthJob must declare queue_as :ai_auth_control")
+  # The declared default belongs to #20 (ai_auth_execution once integrated);
+  # pre-integration trees still declare ai_auth_control. Either is accepted
+  # here because RequestService routes explicitly per role; the unified
+  # worker only consumes ai_auth_execution.
+  assert(job_source.match?(/queue_as :ai_auth_(control|execution)/),
+    "AiAuthJob must declare an ai_auth role queue (default unification is #20's scope)")
   request_source = File.read(File.join(ROOT, "app/services/ai_auth/request_service.rb"))
   assert(request_source.include?("ai_auth_"), "RequestService must reserve the ai_auth role queue")
 end
@@ -285,10 +331,10 @@ end
 
 check(failures, "exactly one SQL migration setup process (migrate service)") do
   assert(env_of.call("migrate")["AICONSHELL_RUN_DB_SETUP"] == "1", "migrate must set AICONSHELL_RUN_DB_SETUP=1")
-  %w[web control execution clickhouse-init].each do |name|
+  %w[web execution clickhouse-init].each do |name|
     assert(env_of.call(name)["AICONSHELL_RUN_DB_SETUP"].nil?, "#{name} must not run SQL setup")
   end
-  %w[web control execution].each do |name|
+  %w[web execution].each do |name|
     dep = services.dig(name, "depends_on", "migrate", "condition")
     assert(dep == "service_completed_successfully", "#{name} must wait for migrate (got #{dep.inspect})")
   end
@@ -305,7 +351,7 @@ check(failures, "ClickHouse outage never blocks startup (independent clickhouse-
   assert(dep == "service_healthy", "clickhouse-init must wait for clickhouse healthy")
   init_env = init.fetch("environment").transform_keys(&:to_s)
   assert(init_env.key?("CLICKHOUSE_URL"), "clickhouse-init needs the clickhouse-client variables")
-  %w[web control execution migrate].each do |name|
+  %w[web execution migrate].each do |name|
     assert(services.dig(name, "depends_on", "clickhouse").nil?,
       "#{name} must not depend on clickhouse (EventLog is eventually consistent)")
   end
@@ -408,6 +454,9 @@ check(failures, "CI runs all suites with required services and no live providers
   assert(!raw.include?("compose.muse.yml"), "CI must not reference the removed muse override config")
   assert(!raw.include?("MUSE_CLI_PATH"), "CI must not reference MUSE_CLI_PATH")
   assert(!raw.include?("muse_cli"), "CI must not reference the muse_cli build secret")
+  assert(!raw.include?("CONTROL_TARGET"), "CI must not reference CONTROL_TARGET (no control service)")
+  assert(!raw.include?("queue_control"), "CI must not reference queue_control (canonical config is queue_execution)")
+  assert(!raw.include?("railway.control"), "CI must not reference railway.control (unified worker only)")
   %w[NGROK_AUTHTOKEN CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY].each do |secret|
     assert(!raw.include?(secret), "CI must not reference #{secret}")
   end
@@ -419,6 +468,15 @@ check(failures, "Railway predeploy runs SQL only (ClickHouse setup is separate)"
     "railway predeploy must be SQL-only db:prepare")
   assert(!railway.match?(/^preDeployCommand.*setup-clickhouse/m),
     "railway predeploy must not couple ClickHouse setup to deploys")
+end
+
+check(failures, "Railway worker runs the unified queue config with the scheduler") do
+  worker = File.read(File.join(ROOT, "railway.execution.toml"))
+  assert(worker.include?("--config-file=config/queue_execution.yml"),
+    "railway worker must start with config/queue_execution.yml")
+  assert(!worker.include?("--skip-recurring"),
+    "railway worker must keep the recurring scheduler (no --skip-recurring)")
+  assert(!worker.include?("queue_control"), "railway worker must not reference queue_control")
 end
 
 puts "check-compose: failures=#{failures.size}"

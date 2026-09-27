@@ -1,13 +1,12 @@
 # Solid Queue recurring tasks (see docs/deployment.md "Recurring jobs").
 #
-# Only the control worker runs the scheduler: it starts with
-# `--config-file=config/queue_control.yml` and no `--skip-recurring`, while
-# the execution worker passes `--skip-recurring` (see compose.yml and
-# docs/deployment.md). Every task below targets queue `control`, which the
-# control worker owns. The hourly cleanup needs the explicit queue as well:
-# without it the cleanup command would land on
-# SolidQueue::RecurringJob's default `solid_queue_recurring` queue, which
-# no worker listens on.
+# Only the unified execution worker runs the scheduler: it starts with
+# `--config-file=config/queue_execution.yml` and no `--skip-recurring`
+# (see compose.yml and docs/deployment.md). Every task below targets queue
+# `control`, which the unified worker's control pool owns. The hourly
+# cleanup needs the explicit queue as well: without it the cleanup command
+# would land on SolidQueue::RecurringJob's default
+# `solid_queue_recurring` queue, which no worker listens on.
 #
 # Development and production share one schedule (single anchor below). Test
 # intentionally has no section: suites enqueue jobs explicitly and must

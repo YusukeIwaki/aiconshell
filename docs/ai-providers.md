@@ -53,8 +53,8 @@ Boundary: CLI flags are policy requests to a subprocess, not a sandbox.
 *grants* tool access to a directory, it does not confine Bash/Read to the
 workspace — and Codex documents `--sandbox` as the policy for
 model-generated shell commands only. The real isolation boundary is the
-container / trusted-worker deployment: run CLIs in the control and execution
-workers with dedicated workspace directories and private provider volumes,
+container / trusted-worker deployment: run CLIs in the unified execution
+worker with dedicated workspace directories and private provider volumes,
 and no secrets in the child environment. The Ruby path guard rejects
 workspaces that overlap provider auth locations (symlinks resolved) and
 relative paths, but it does not sandbox the CLI and does not scan for
@@ -97,11 +97,15 @@ Notes and edges:
 
 ## Login and credential homes
 
-Start the official subscription login on each worker through the
-[AI connections admin page](ai-connections.md); the operator approves the
-challenge in their browser. The worker itself needs no browser. Persist each
-worker's own credential directories. Direct CLI login is also available when
-operating that worker; the automated protocol is in [ai-auth-protocol.md](ai-auth-protocol.md).
+Start the official subscription login on the unified execution worker
+through the [AI connections admin page](ai-connections.md); the operator
+approves the challenge in their browser. The worker itself needs no browser.
+Persist the worker's own credential directories. Direct CLI login is also
+available when operating that worker; the automated protocol is in
+[ai-auth-protocol.md](ai-auth-protocol.md). The execution-side auth volumes
+continue to be used; legacy control-side host volumes are neither mounted
+nor deleted, and auth caches are never copied between volumes (old control
+sessions expire through #20's ops entry in [AI connections](ai-connections.md)).
 
 | Provider | Login | Credential home (presence-checked) | Child env override |
 | --- | --- | --- | --- |
@@ -122,10 +126,9 @@ scope by design.
 Token refresh is left to the CLIs themselves: keep the credential homes on
 persistent volumes so refresh writes survive restarts. Mount private credential directories (e.g. `/private/ai/claude`,
 `/private/ai/codex`, `/private/ai/muse-xdg`) and point the `AICONSHELL_*`
-overrides at them. Compose uses named volumes; Railway uses separate subdirectories
-on each worker's single `/data` volume. Configure and log in on both control and
-execution workers, since all three layers can use AI. Do not assume that separate
-Railway services share a volume or refresh tokens. Web does not need them; its presence diagnostic is local to
+overrides at them. Compose uses named volumes; Railway uses subdirectories
+on the unified worker's single `/data` volume. One login set serves all
+three layers on the unified worker. Web does not need them; its presence diagnostic is local to
 the Web process and does not establish worker readiness.
 
 Muse layout note: `AICONSHELL_MUSE_HOME` is the XDG config home itself (the
@@ -144,7 +147,7 @@ never copied into the repo.
 
 ## Railway and Compose
 
-Compose defaults **both control and execution** workers to the Docker `ai`
+Compose defaults the unified execution worker to the Docker `ai`
 target, which bundles pinned Claude, Codex, and Muse CLIs. Muse is downloaded
 from the official public Linux release with an architecture-specific SHA256
 check; no login or auth cache is needed at build time. The `app` target used by

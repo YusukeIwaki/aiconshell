@@ -7,11 +7,13 @@ volume 初期化の詳細は [docs/deployment.md](deployment.md) が正であり
 
 ## 概念
 
-- 利用環境（installation）= 専用 DB + Web / control / execution の3サービス
-  （Solid Queue はその DB に同居）+ 専用の Rails・管理・連携 secrets +
-  worker 専用 `/data` volume 2 個 + ClickHouse の専用 database / user。
+- 利用環境（installation）= 専用 DB + Web / execution の2サービス
+  （Solid Queue はその DB に同居。単一 execution ワーカーが control /
+  execution / `ai_auth_execution` の 3 pool と scheduler を動かす）+
+  専用の Rails・管理・連携 secrets +
+  worker 専用 `/data` volume 1 個 + ClickHouse の専用 database / user。
 - 同一利用環境の Web replica 追加は同じ DB・`SECRET_KEY_BASE`・認証設定を使う。
-  DB を分けて Web / control / execution 一式を揃える独立環境とは別物である。
+  DB を分けて Web / execution 一式を揃える独立環境とは別物である。
   Web だけ別 DB に向けて既存 worker を共有しない。
 - Railway environment 間は private network が分離される。本パターンの
   独立サービス群は**同一 project / 同一 environment** に置く。
@@ -29,7 +31,7 @@ shared variable を使う場合は利用環境の接頭辞を付け、必要な�
 
 | shared variable（例） | 参照するサービス |
 | --- | --- |
-| `AICONSHELL_PRODUCTION_DATABASE_URL` | その利用環境の web / control / execution の `DATABASE_URL` |
+| `AICONSHELL_PRODUCTION_DATABASE_URL` | その利用環境の web / execution の `DATABASE_URL` |
 | `AICONSHELL_PRODUCTION_SECRET_KEY_BASE` | 同上の `SECRET_KEY_BASE` |
 
 - `DATABASE_URL` には専用 role の接続文字列だけを入れる。
@@ -39,8 +41,9 @@ shared variable を使う場合は利用環境の接頭辞を付け、必要な�
   `${{shared.AICONSHELL_PRODUCTION_DATABASE_URL}}` を参照する。
   deploy 前に解決後の host / database / role が期待値かを確認する。
   接続文字列全体やパスワードは確認ログに出さない。
-- 他環境の連携資格情報を渡さない。`execution` には連携資格情報を渡さない
-  （既存境界どおり）。
+- 他環境の連携資格情報を渡さない。単一 execution ワーカーの Rails 親は連携・
+  ClickHouse 資格情報を持つが、AI CLI 子プロセスには継承させない
+  （`ChildEnv` の契約。詳細は [deployment.md](deployment.md) §1）。
 - `railway variable list ... --json` は秘密値をそのまま表示する。
   出力を Issue・ログ・リポジトリに貼らない。
 
@@ -66,22 +69,23 @@ DB 名・role 名・パスワードは運営者が決める。無関係な DB / 
    operator コンテキストで実行できる。アプリに恒久的な管理権限は付けない。
    次に、その database だけに `SELECT` / `INSERT` を許可した別の user を作り
    （operator / access-management 権限なし）、その制限付き資格情報だけを
-   当該利用環境の web / control の `CLICKHOUSE_DATABASE/USER/PASSWORD` に入れる。
+   当該利用環境の web / execution の `CLICKHOUSE_DATABASE/USER/PASSWORD` に入れる。
    operator 資格情報は平常時 ClickHouse 側だけに置く。初期化用コンテナへ一時的に
    渡した場合は、完了後にそのコンテナと一時設定を削除する。
-   `execution` には ClickHouse 資格情報を渡さない。
-3. その利用環境の web / control / execution サービス群を用意する。
+3. その利用環境の web / execution サービス群を用意する。
    新規サービスは Railway CLI / API / dashboard で設定する
    （TOML への自動 opt-in は無い。既存 TOML 互換設定の注意は
    [docs/deployment.md](deployment.md) §7 どおり）。
 4. 変数を設定する（前節の表）。管理者接続・他環境の秘密を混ぜない。
 5. マイグレーションは web の predeploy（`./bin/rails db:prepare`）で1回だけ。
    worker 起動時には実行しない。
-6. control / execution の `/data` volume を既存 runbook
+6. execution の `/data` volume を既存 runbook
    （[docs/deployment.md](deployment.md) §7「初回だけ volume の所有者を設定する」）
    どおりに初期化し、一時設定を外して UID 1000 に戻す。
-7. worker を通常 Start Command（control / execution の queue config）に戻して起動する。
-8. 確認: 接続先 DB 名・current user、両 worker の共有 DB 登録、
+7. worker を通常 Start Command（`config/queue_execution.yml`。`--skip-recurring`
+   なしで scheduler も動く）に戻して起動する。
+8. 確認: 接続先 DB 名・current user、単一 worker の共有 DB 登録
+   （Supervisor 1 件・Worker 3 pool）と recurring 6 件の登録、
    Web ヘルスチェックと管理画面認証、ClickHouse schema / search を
    read-only に確認する。実 AI や外部投稿は確認に使わない。
 
@@ -95,7 +99,8 @@ railway ssh --project "$PROJECT_ID" --environment "$ENVIRONMENT_ID" --service we
 - `railway ssh` の本体は remote container 内で動く。`railway run` はローカル実行なので
   private DNS 宛てに使わない（[docs/deployment.md](deployment.md) §7 どおり）。
 - worker 登録の目安は `./bin/smoke` と同じ考え方:
-  共有 DB 上の Supervisor heartbeat と control の recurring 登録を read-only に見る。
+  共有 DB 上の Supervisor heartbeat（1 件）と Worker 3 pool、
+  recurring 6 件の登録を read-only に見る。
 - 実デプロイの受け入れ結果は本書に書かない。調整担当が別途記録する。
 
 ## バックアップと復元

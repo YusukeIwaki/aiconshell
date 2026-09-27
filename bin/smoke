@@ -6,10 +6,12 @@
 #   docker compose up --build -d   # first, in another terminal (or -d here)
 #   ./bin/smoke
 #
-# Checks: web /up, PostgreSQL SELECT 1, control/execution containers running
-# with one shared DATABASE_URL and both supervisors registered on that same
-# database, the 6 recurring tasks scheduled by the control scheduler, and
-# ClickHouse ping + event_log table. ClickHouse is covered by the
+# Checks: web /up, PostgreSQL SELECT 1, the unified execution container
+# running with one shared DATABASE_URL and its supervisor registered on that
+# same database, the 6 recurring tasks scheduled by the unified scheduler,
+# and ClickHouse ping + event_log table. The three queue pools (control 3 /
+# execution 1 / ai_auth_execution 1) are verified statically by
+# `ruby bin/check-compose`. ClickHouse is covered by the
 # eventual-consistency contract: an unreachable server is a WARNING
 # (deliveries stay queued and retry), but a reachable server with a missing
 # table is a FAIL (clickhouse-init should have applied the schema).
@@ -59,7 +61,7 @@ begin
   db_host, db_port = endpoint.call("db", 5432)
   ch_host, ch_port = endpoint.call("clickhouse", 8123)
   db = services.fetch("db").fetch("environment")
-  ch = services.fetch("control").fetch("environment")
+  ch = services.fetch("execution").fetch("environment")
   values = [http_url.call(web_host, web_port), db_host, db_port,
             db.fetch("POSTGRES_USER"), db.fetch("POSTGRES_DB"), db.fetch("POSTGRES_PASSWORD"),
             http_url.call(ch_host, ch_port), ch.fetch("CLICKHOUSE_DATABASE"),
@@ -127,8 +129,8 @@ else
     docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1"
 fi
 
-# 3. Workers running.
-for svc in control execution; do
+# 3. Unified worker running (web health is checked in section 1).
+for svc in execution; do
   state="$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | awk -v s="$svc" '$1==s{print $2; exit}')"
   if [[ "$state" == "running" ]]; then
     echo "smoke: ok   - compose service $svc is running"
@@ -138,13 +140,12 @@ for svc in control execution; do
   fi
 done
 
-# 4. One shared DATABASE_URL across web/control/execution.
-url_web="" url_control="" url_execution="" urls_read=0
-for svc in web control execution; do
+# 4. One shared DATABASE_URL across web/execution.
+url_web="" url_execution="" urls_read=0
+for svc in web execution; do
   if val="$(docker compose exec -T "$svc" printenv DATABASE_URL 2>/dev/null)"; then
     case "$svc" in
       web) url_web="$val" ;;
-      control) url_control="$val" ;;
       execution) url_execution="$val" ;;
     esac
     urls_read=$((urls_read + 1))
@@ -153,35 +154,35 @@ for svc in web control execution; do
     failures=$((failures + 1))
   fi
 done
-if (( urls_read == 3 )); then
-  if [[ "$url_web" == "$url_control" && "$url_control" == "$url_execution" ]]; then
-    echo "smoke: ok   - web/control/execution share one DATABASE_URL"
+if (( urls_read == 2 )); then
+  if [[ "$url_web" == "$url_execution" ]]; then
+    echo "smoke: ok   - web/execution share one DATABASE_URL"
   else
     echo "smoke: FAIL - DATABASE_URL differs between services" >&2
     failures=$((failures + 1))
   fi
 fi
 
-# 5. Both supervisors registered on that same database (fork-mode bin/jobs
-# registers one Supervisor row each; heartbeats prove they are alive).
+# 5. The unified supervisor registered on that same database (fork-mode
+# bin/jobs registers one Supervisor row; the heartbeat proves it is alive).
 supervisors_registered() {
   local count
   local tries=0
   while (( tries < 18 )); do
     count="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc \
       "SELECT COUNT(*) FROM solid_queue_processes WHERE kind LIKE 'Supervisor%' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'" 2>/dev/null | tr -d ' ')"
-    if [[ "$count" == "2" ]]; then return 0; fi
+    if [[ "$count" == "1" ]]; then return 0; fi
     tries=$((tries + 1))
     sleep 5
   done
   return 1
 }
-check "control+execution supervisors registered on shared DB (2 heartbeats)" \
+check "execution supervisor registered on shared DB (1 heartbeat)" \
   supervisors_registered
 
-# 6. Recurring tasks registered by the control scheduler (the execution
-# worker passes --skip-recurring, so exactly the 6 static tasks from
-# config/recurring.yml must be present while control is running).
+# 6. Recurring tasks registered by the unified scheduler (exactly the
+# 6 static tasks from config/recurring.yml must be present while the
+# unified worker is running).
 recurring_registered() {
   local count
   local tries=0
@@ -194,10 +195,23 @@ recurring_registered() {
   done
   return 1
 }
-check "6 recurring tasks registered (control scheduler)" \
+check "6 recurring tasks registered (unified scheduler)" \
   recurring_registered
 
-# 7. ClickHouse: unreachable is a warning (queued + retried); reachable
+# 7. Three separated worker pools live (control 3 / execution 1 /
+# ai_auth_execution 1). Distinct queue bindings must match exactly: a long
+# real job or login on execution/ai_auth_execution must never occupy
+# control slots. Tolerant of JOB_CONCURRENCY > 1 (several rows per pool).
+worker_pools_registered() {
+  local out
+  out="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+    "SELECT DISTINCT ((metadata::json)->>'queues') || '|' || ((metadata::json)->>'pool_size') FROM solid_queue_processes WHERE kind = 'Worker' ORDER BY 1" 2>/dev/null)"
+  [[ "$out" == "$(printf 'ai_auth_execution|1\ncontrol|3\nexecution|1')" ]]
+}
+check "3 worker pools registered (control 3 / execution 1 / ai_auth_execution 1)" \
+  worker_pools_registered
+
+# 8. ClickHouse: unreachable is a warning (queued + retried); reachable
 # with a missing table is a failure (schema setup did not run).
 if curl -fsSL --max-time 10 "$CH_URL/ping" > /dev/null 2>&1; then
   echo "smoke: ok   - clickhouse $CH_URL answers /ping"

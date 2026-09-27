@@ -1,10 +1,26 @@
+# Development supervisor config for local `bin/jobs` without args.
+#
+# Mirrors the canonical config/queue_execution.yml separation: three pools
+# (`control` default 3 threads, `execution` default 1 thread,
+# `ai_auth_execution` 1 thread) plus the recurring scheduler. Never use a
+# wildcard (`*`) or single priority queue here: a long real job or login
+# must not occupy control slots. Production Compose/Railway use
+# config/queue_execution.yml directly (see docs/deployment.md).
 default: &default
   dispatchers:
     - polling_interval: 1
       batch_size: 500
   workers:
-    - queues: "*"
+    - queues: control
       threads: 3
+      processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+      polling_interval: 1
+    - queues: execution
+      threads: 1
+      processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+      polling_interval: 1
+    - queues: ai_auth_execution
+      threads: 1
       processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
       polling_interval: 1
 
