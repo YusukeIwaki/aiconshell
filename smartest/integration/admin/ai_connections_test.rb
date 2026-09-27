@@ -16,23 +16,21 @@ test("ai connections index requires admin auth") do |http:|
   end
 end
 
-test("ai connections index lists three providers on the shared execution worker") do |http:|
+test("ai connections index lists three provider linkage sections") do |http:|
   AdminTestSupport.as_admin(http) do
     http.get "/admin/ai_connections"
 
     expect(http.last_response.status).to eq(200)
     body = http.last_response.body
-    # Provider sections are real rows, not description text: one header per
-    # provider, each bound to the execution worker only.
-    expect(body.scan("Claude × execution worker").size).to eq(1)
-    expect(body.scan("Codex × execution worker").size).to eq(1)
-    expect(body.scan("Muse Code × execution worker").size).to eq(1)
-    %w[claude codex muse].each do |provider|
-      expect(body.scan("provider: <code class=\"admin-env\">#{provider}</code>").size).to eq(1)
-    end
-    expect(body.scan("provider: <code class=\"admin-env\">").size).to eq(3)
-    expect(body.scan("worker: <code class=\"admin-env\">execution</code>").size).to eq(3)
-    expect(body.include?("worker: <code class=\"admin-env\">control</code>")).to eq(false)
+    # Provider sections are real rows, not description text: one plain
+    # admin header per provider, with no worker/layer design vocabulary.
+    expect(body.scan("Claudeと連携").size).to eq(1)
+    expect(body.scan("Codexと連携").size).to eq(1)
+    expect(body.scan("Muse Codeと連携").size).to eq(1)
+    expect(body.include?("provider: <code")).to eq(false)
+    expect(body.include?("worker: <code")).to eq(false)
+    expect(body.include?("execution worker")).to eq(false)
+    expect(body.include?("control worker")).to eq(false)
     # Each provider owns login/status forms for execution; no control forms exist.
     %w[claude codex muse].each do |provider|
       login_form = body[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=#{provider}(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
@@ -41,13 +39,14 @@ test("ai connections index lists three providers on the shared execution worker"
       expect(status_form.nil?).to eq(false)
     end
     expect(body.scan(/worker_role=control/).size).to eq(0)
-    # Single-worker contract: no per-role rows, no control worker display.
-    expect(body.include?("control worker")).to eq(false)
+    # No layer/worker design notes on the admin page.
     expect(body.include?("別の永続volume")).to eq(false)
-    expect(body.include?("1回の provider ログイン")).to eq(true)
-    expect(body.include?("対話層")).to eq(true)
-    expect(body.include?("整理層")).to eq(true)
-    expect(body.include?("実行層")).to eq(true)
+    expect(body.include?("1回の provider ログイン")).to eq(false)
+    expect(body.include?("層とworker")).to eq(false)
+    expect(body.include?("使うworker")).to eq(false)
+    expect(body.include?("対話層")).to eq(false)
+    expect(body.include?("整理層")).to eq(false)
+    expect(body.include?("実行層")).to eq(false)
     expect(body.include?("未確認")).to eq(true)
     # No CLI surface or raw output leaks into the page.
     expect(body.include?("claude auth login")).to eq(false)
@@ -152,12 +151,40 @@ test("challenge URL renders as a short safe label, not the secret query") do |ht
     expect(body.include?("noopener")).to eq(true)
     expect(body.include?("noreferrer")).to eq(true)
     expect(body.include?("TEST-CODE-1")).to eq(true)
-    expect(body.include?("コード入力は不要")).to eq(true)
+    # The provider page asks for the user code (Codex device flow), so the
+    # guidance must not claim no code input is needed at all: only this
+    # screen needs no input.
+    expect(body.include?("上記のユーザーコードを入力")).to eq(true)
+    expect(body.include?("この画面への入力は不要")).to eq(true)
+    expect(body.include?("この手順ではコード入力は不要")).to eq(false)
     expect(body.include?("Codex公式認証画面を開く")).to eq(true)
     # The secret URL must not become the visible link text.
     expect(body.include?(">https://example.invalid/device/test-link")).to eq(false)
     # Ciphertext itself never renders.
     expect(body.include?(session.reload.encrypted_challenge.to_s[0, 20])).to eq(false)
+  end
+end
+
+test("challenge without user code says no code input is needed") do |http:|
+  session = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
+    .request_login(provider: "muse", worker_role: "execution")
+  session.update_columns(
+    status: "waiting",
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://example.invalid/device/no-code",
+        "user_code" => nil, "input_required" => false }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
+
+  AdminTestSupport.as_admin(http) do
+    http.get "/admin/ai_connections"
+    body = http.last_response.body
+
+    expect(body.include?("この手順ではコード入力は不要")).to eq(true)
+    expect(body.include?("上記のユーザーコードを入力")).to eq(false)
+    expect(body.include?("Muse Code公式認証画面を開く")).to eq(true)
   end
 end
 
@@ -424,9 +451,9 @@ test("legacy control snapshots are kept but never shown as current connections")
 
     expect(http.last_response.status).to eq(200)
     body = http.last_response.body
-    claude_at = body.index("Claude × execution worker")
-    codex_at = body.index("Codex × execution worker")
-    muse_at = body.index("Muse Code × execution worker")
+    claude_at = body.index("Claudeと連携")
+    codex_at = body.index("Codexと連携")
+    muse_at = body.index("Muse Codeと連携")
     expect(claude_at.nil?).to eq(false)
     expect(codex_at.nil?).to eq(false)
     expect(muse_at.nil?).to eq(false)
@@ -437,11 +464,11 @@ test("legacy control snapshots are kept but never shown as current connections")
     # The claude execution row has no snapshot: unknown, not connected.
     expect(claude_card.include?("未確認")).to eq(true)
     expect(claude_card.include?("接続済み")).to eq(false)
-    expect(claude_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
+    claude_login = claude_card[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=claude(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
+    expect(claude_login.nil?).to eq(false)
     # The codex row follows its execution snapshot, not the legacy control one.
     expect(codex_card.include?("未連携")).to eq(true)
     expect(codex_card.include?("接続済み")).to eq(false)
-    expect(codex_card.include?("worker: <code class=\"admin-env\">execution</code>")).to eq(true)
     codex_login = codex_card[/<form[^>]*action="\/admin\/ai_connections\/login\?provider=codex(&amp;|&)worker_role=execution"[^>]*>.*?<\/form>/m, 0]
     expect(codex_login.nil?).to eq(false)
     # No row renders a control snapshot as current.

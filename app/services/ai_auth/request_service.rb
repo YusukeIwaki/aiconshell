@@ -64,7 +64,7 @@ module AiAuth
           raise InvalidRequest, "キャンセルを受け付け済みです。もう一度お試しください。"
         end
         if session.input_submitted_at.present?
-          raise InvalidRequest, "認証コードは既に受付済みです。workerの処理をお待ちください。"
+          raise InvalidRequest, "認証コードは既に受付済みです。結果が出るまでお待ちください。"
         end
 
         challenge = session.challenge
@@ -72,7 +72,7 @@ module AiAuth
           raise InvalidRequest, "まだ入力待ちではありません。認証案内が表示されるまでお待ちください。"
         end
         unless challenge["input_required"]
-          raise InvalidRequest, "この手順ではコード入力は不要です。ブラウザで承認してください。"
+          raise InvalidRequest, "この手順ではこの画面へのコード入力は不要です。ブラウザで承認してください。"
         end
 
         now_time = now

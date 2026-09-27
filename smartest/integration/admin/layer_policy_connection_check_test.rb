@@ -84,7 +84,7 @@ test("recheck accepts saved provider and lands on connections without claiming c
     notice = body[/<p class="admin-flash admin-flash-notice">(.*?)<\/p>/m, 1].to_s
     expect(notice.include?("接続状態の再確認を受け付けました")).to eq(true)
     expect(notice.include?("接続済み")).to eq(false)
-    expect(body.include?("codex")).to eq(true)
+    expect(body.include?("Codexと連携")).to eq(true)
   end
 end
 

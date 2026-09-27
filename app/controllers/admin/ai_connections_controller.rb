@@ -53,7 +53,7 @@ module Admin
 
     def code
       ops.submit_code(session_uuid: params[:id], code: params[:auth_code])
-      redirect_to admin_ai_connections_path, notice: "認証コードを受け付けました。workerが処理を続けます。"
+      redirect_to admin_ai_connections_path, notice: "認証コードを受け付けました。結果が出るまでお待ちください。"
     rescue AiAuth::RequestService::InvalidRequest => e
       redirect_to admin_ai_connections_path, alert: e.message
     end
@@ -89,7 +89,7 @@ module Admin
 
     def check_notice(session)
       if session.status == "queued" && session.created_at && session.created_at > 10.seconds.ago
-        "状態確認を受け付けました。workerの確認結果をお待ちください。"
+        "状態確認を受け付けました。結果が出るまでお待ちください。"
       else
         "進行中の操作があります。結果をお待ちください。"
       end
