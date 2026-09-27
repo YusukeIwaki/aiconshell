@@ -2,8 +2,9 @@
 # worker images only. Base compose.yml parses and runs without this file,
 # without MUSE_CLI_PATH, and without the binary.
 #
-#   MUSE_CLI_PATH=/abs/path/outside-repo/muse \
-#     docker compose -f compose.yml -f compose.muse.yml up --build
+#   export MUSE_CLI_PATH=/abs/path/outside-repo/muse
+#   docker compose -f compose.yml -f compose.muse.yml build --no-cache control execution
+#   docker compose -f compose.yml -f compose.muse.yml up --build
 #
 # MUSE_CLI_PATH must be an absolute path to an authorized Linux Muse binary
 # kept OUTSIDE the repository, matching the image architecture (amd64/arm64).

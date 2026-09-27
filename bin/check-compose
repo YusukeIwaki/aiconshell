@@ -162,6 +162,7 @@ check(failures, "AI auth goes only to control/execution (corrected muse mapping,
 end
 
 check(failures, "web/migrate/clickhouse-init stay app, workers default to ai with an app override") do
+  example = File.read(File.join(ROOT, ".env.example"))
   %w[web migrate clickhouse-init].each do |name|
     target = services.dig(name, "build", "target").to_s
     assert(target == "app", "#{name} build target must be app, got #{target.inspect}")
@@ -170,21 +171,21 @@ check(failures, "web/migrate/clickhouse-init stay app, workers default to ai wit
     target = services.dig(name, "build", "target").to_s
     assert(target == "${#{var}:-ai}",
       "#{name} build target must default to ai via #{var} for offline app builds (got #{target.inspect})")
+    assert(example.match?(/^#{var}=ai$/), ".env.example must default #{var} to ai")
   end
 end
 
 check(failures, "muse override forwards its build secret to workers only and forces ai") do
   override = YAML.load_file(File.join(ROOT, "compose.muse.yml"))
   override_services = override.fetch("services")
+  assert(override_services.keys.sort == %w[control execution],
+    "muse override must affect only control/execution")
   %w[control execution].each do |name|
     build = override_services.dig(name, "build") || {}
     assert(build["target"] == "ai", "override #{name} must force target ai (operator intent)")
     secrets = Array(build["secrets"]).map(&:to_s)
     assert(secrets == ["muse_cli"], "override #{name} build secrets: #{secrets.inspect}")
   end
-  assert(!override_services.key?("web"), "override must not touch web")
-  raw_override = File.read(File.join(ROOT, "compose.muse.yml"))
-  assert(!raw_override.match?(/^  web:/m), "override must not define web")
   file = override.dig("secrets", "muse_cli", "file").to_s
   assert(file.match?(/\$\{MUSE_CLI_PATH:\?/),
     "muse_cli secret file must require MUSE_CLI_PATH (:?), got #{file.inspect}")

@@ -156,12 +156,30 @@ Compose は `Dockerfile` の target から直接ビルドする。単体の
 docker compose up --build
 # CLI 不要のローカル検証（worker も app に明示切替）
 CONTROL_TARGET=app EXECUTION_TARGET=app docker compose up --build
+```
+
+既存の `.env` に `CONTROL_TARGET=app` / `EXECUTION_TARGET=app` がある場合は、
+CLI を使う両 worker の値を `ai` に変更する。
+
+Muse を追加・更新するときは、最初のビルドも含めて次の手順を使う。
+BuildKit は secret の内容・有無をキャッシュキーにしないため、
+`--no-cache` で Muse 未導入の古い層を再利用しないようにする:
+
+```sh
 # muse 付き（MUSE_CLI_PATH は compose.muse.yml のみが読む必須変数。
 # 正規の Linux バイナリへの絶対パスをリポジトリ外に置く。
 # イメージのアーキテクチャと一致させること。ホストの macOS バイナリや
 # 資格情報は使わない。override は両 worker を ai に固定する）
-MUSE_CLI_PATH=$HOME/.cache/aiconshell/muse-cli/muse \
-  docker compose -f compose.yml -f compose.muse.yml up --build
+export MUSE_CLI_PATH="$HOME/.cache/aiconshell/muse-cli/muse"
+docker compose -f compose.yml -f compose.muse.yml build --no-cache control execution
+docker compose -f compose.yml -f compose.muse.yml up --build
+```
+
+Muse をイメージから外すときは override を省き、同様に再ビルドする:
+
+```sh
+docker compose -f compose.yml build --no-cache control execution
+docker compose -f compose.yml up --build
 ```
 
 下記は単体ビルド（private registry 用など）の例であり、付けたタグは
@@ -174,13 +192,8 @@ docker build -t aiconshell:app .
 docker build --target ai -t aiconshell:ai .
 # muse を含める場合（リポジトリ外の正規 Linux バイナリをシークレットで渡す）
 docker build --target ai --no-cache -t aiconshell:ai \
-  --secret id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse .
+  --secret "id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse" .
 ```
-
-muse バイナリの追加・変更・削除後は `--no-cache` 付きで再ビルドすること:
-BuildKit は secret 内容をキャッシュキーにしないため、付けないと古い層が
-残る。Compose override でも同じ
-（`... -f compose.muse.yml build --no-cache control execution`）。
 
 `muse` の取り扱いを正確に述べる: ビルド時の `install` はバイナリを
 `/usr/local/bin/muse` に**意図的にコピーし、ai イメージの一部にする**。

@@ -138,7 +138,7 @@ jobs:
             abort "offline targets: #{build.slice("control", "execution").inspect}" unless build["control"] == "app" && build["execution"] == "app"
           '
           printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/muse-fixture"
-          MUSE_CLI_PATH="$RUNNER_TEMP/muse-fixture" docker compose -f compose.yml -f compose.muse.yml config --format json | ruby -rjson -e '
+          CONTROL_TARGET=app EXECUTION_TARGET=app MUSE_CLI_PATH="$RUNNER_TEMP/muse-fixture" docker compose -f compose.yml -f compose.muse.yml config --format json | ruby -rjson -e '
             services = JSON.parse(STDIN.read).fetch("services")
             build = services.to_h { |name, svc| [name, svc.dig("build", "target")] }
             abort "muse targets: #{build.slice("control", "execution").inspect}" unless build["control"] == "ai" && build["execution"] == "ai"
