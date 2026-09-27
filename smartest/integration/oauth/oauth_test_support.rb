@@ -84,4 +84,46 @@ module OauthTestSupport
   def binding_for(ctx, provider)
     ctx[:creds].binding_for(provider)
   end
+
+  # Thread-safe injectable clock for race tests. Services read it fresh
+  # after every lock, so advancing it mid-wait proves the TTL/lease
+  # rechecks instead of trusting a timestamp fixed before the wait.
+  class ManualClock
+    def initialize(now)
+      @mutex = Mutex.new
+      @now = now
+    end
+
+    def now
+      @mutex.synchronize { @now }
+    end
+    alias current now
+
+    def advance(seconds)
+      @mutex.synchronize { @now += seconds }
+    end
+  end
+
+  # Bounded poll proving a real PostgreSQL lock wait: waiter_pid must be
+  # blocked by holder_pid in pg_blocking_pids, not merely alive or
+  # sleeping. Raises on timeout instead of hanging the suite.
+  def wait_for_lock_waiter(waiter_pid, holder_pid, timeout: 15)
+    waiter_pid = Integer(waiter_pid)
+    holder_pid = Integer(holder_pid)
+    raise "race requires independent sessions" if waiter_pid == holder_pid
+
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    ActiveRecord::Base.connection_pool.with_connection do |observer|
+      loop do
+        blocked = observer.select_value(
+          "SELECT #{holder_pid} = ANY(pg_blocking_pids(#{waiter_pid}))"
+        )
+        return if blocked
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          raise "session #{waiter_pid} never blocked on #{holder_pid}"
+        end
+        sleep 0.01
+      end
+    end
+  end
 end

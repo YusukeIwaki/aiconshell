@@ -263,6 +263,131 @@ test("expired leases clear on the next refresh") do |db:|
   ctx[:transport].assert_consumed!
 end
 
+test("a lease that expires during the commit lock wait is cleared, never issued") do
+  # Real lock overlap on the connection row with no wrapping db
+  # transaction: the refresher claims its lease, parks in the lock-free
+  # network phase, then a guard session holds the connection row. The
+  # injected clock advances past the lease while the refresher waits on
+  # that row inside its commit transaction (observed, not slept). The
+  # commit must recheck the lease clock after its locks, clear the lease,
+  # and discard the rotation instead of issuing a token.
+  OauthConnection.where(provider: "atlassian").delete_all
+  OauthAuthAttempt.where(provider: "atlassian").delete_all
+  inner = BoundaryFixtures::HttpTransport.new
+  base_env = OauthTestSupport.test_env
+  store = OauthTestSupport.secret_store
+  clock = OauthTestSupport::ManualClock.new(Time.current)
+  setup_ctx = OauthTestSupport.services(env: base_env, transport: inner, store: store,
+                                        sink: WorkflowFakes::FakeEventSink.new)
+  OauthTestSupport.connect(setup_ctx, "atlassian")
+  connection_id = OauthConnection.find_by!(provider: "atlassian").id
+  OauthConnection.find(connection_id).update!(token_expires_at: 1.minute.ago)
+  binding_h = Oauth::CredentialProvider.new(env: base_env, transport: inner, clock: clock,
+                                            secret_store: store,
+                                            event_sink: WorkflowFakes::FakeEventSink.new).binding_for("atlassian").to_h
+  inner.expect_json(:POST, "https://auth.atlassian.com/oauth/token", body: {
+    "access_token" => "at-stale", "refresh_token" => "rt-stale",
+    "expires_in" => 3600, "scope" => OauthTestSupport::ATLASSIAN_SCOPES, "token_type" => "Bearer"
+  })
+
+  entered_network = Queue.new
+  release_network = Queue.new
+  blocking = BlockingRefreshTransport.new(inner, entered_network, release_network)
+  refresh_result = Queue.new
+  guard_result = Queue.new
+  refresh_pid = Queue.new
+  guard_pid = Queue.new
+  guard_ready = Queue.new
+  release_guard = Queue.new
+
+  refresher = Thread.new do
+    ActiveRecord::Base.connection_pool.with_connection do |connection|
+      begin
+        refresh_pid << connection.raw_connection.backend_pid
+        creds = Oauth::CredentialProvider.new(env: base_env, transport: blocking, clock: clock,
+                                              secret_store: store,
+                                              event_sink: WorkflowFakes::FakeEventSink.new)
+        refresh_result << { ok: true, token: creds.access_token(binding_h) }
+      rescue Aiconshell::Oauth::Error => e
+        refresh_result << { ok: false, code: e.code }
+      end
+    end
+  end
+  Timeout.timeout(15) { entered_network.pop }
+  # The lease claim committed before the network phase; the refresher now
+  # holds no DB lock.
+  expect(OauthConnection.find(connection_id).refresh_lease_token.nil?).to eq(false)
+
+  guard = Thread.new do
+    ActiveRecord::Base.connection_pool.with_connection do |connection|
+      begin
+        guard_pid << connection.raw_connection.backend_pid
+        ActiveRecord::Base.transaction do
+          OauthConnection.lock.find(connection_id)
+          guard_ready << true
+          Timeout.timeout(15) { release_guard.pop }
+        end
+        guard_result << { ok: true }
+      rescue StandardError => e
+        begin
+          guard_result << { ok: false, error: e }
+        rescue StandardError
+          nil
+        end
+      end
+    end
+  end
+  Timeout.timeout(15) { guard_ready.pop }
+  guard_backend = Timeout.timeout(15) { guard_pid.pop }
+  refresh_backend = Timeout.timeout(15) { refresh_pid.pop }
+  # The refresher finishes HTTP and waits on the connection row inside its
+  # commit transaction. The wait is observed, not slept.
+  release_network << true
+  OauthTestSupport.wait_for_lock_waiter(refresh_backend, guard_backend)
+
+  # The lease lapses mid-wait; the commit must recheck the lease clock
+  # after its locks and discard the rotation.
+  clock.advance(Oauth::TokenService::REFRESH_LEASE_SECONDS + 60)
+  release_guard << true
+
+  outcome = Timeout.timeout(15) { refresh_result.pop }
+  guard_outcome = Timeout.timeout(15) { guard_result.pop }
+  Timeout.timeout(15) { refresher.join(15) || raise("refresher thread stuck") }
+  Timeout.timeout(15) { guard.join(15) || raise("guard thread stuck") }
+  expect(guard_outcome[:ok]).to eq(true)
+  expect(refresh_backend == guard_backend).to eq(false)
+  # Deterministic: the post-lock lease recheck discards the rotation.
+  expect(outcome).to eq({ ok: false, code: "expired" })
+
+  reloaded = OauthConnection.find(connection_id)
+  expect(reloaded.state).to eq("connected")
+  expect(reloaded.refresh_lease_token.nil?).to eq(true)
+  expect(reloaded.refresh_lease_expires_at.nil?).to eq(true)
+  expect(reloaded.refresh_lease_generation.nil?).to eq(true)
+  # The stale rotation never landed: the previous tokens are intact.
+  expect(store.decrypt(reloaded.encrypted_access_token)).to eq("at-1")
+  expect(store.decrypt(reloaded.encrypted_refresh_token)).to eq("rt-1")
+  # Setup connect used 1 token POST; the discarded rotation adds exactly
+  # one more, and nothing is retried.
+  expect(inner.requests_to("https://auth.atlassian.com/oauth/token", method: :POST).size).to eq(2)
+  inner.assert_consumed!
+ensure
+  begin
+    release_network << true
+  rescue StandardError
+    nil
+  end
+  begin
+    release_guard << true
+  rescue StandardError
+    nil
+  end
+  refresher&.kill if defined?(refresher) && refresher&.alive?
+  guard&.kill if defined?(guard) && guard&.alive?
+  OauthConnection.where(provider: "atlassian").delete_all
+  OauthAuthAttempt.where(provider: "atlassian").delete_all
+end
+
 test("a refresh lease orphaned by disconnect never resurrects through the public port") do |db:|
   expect(db.transaction_open?).to eq(true)
   ctx = OauthTestSupport.services

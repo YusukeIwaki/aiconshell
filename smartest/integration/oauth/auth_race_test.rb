@@ -238,11 +238,11 @@ test("reconnect and disconnect fence old callbacks by generation") do |db:|
   ctx[:transport].assert_consumed!
 end
 
-# Wrapper that holds the publish callback inside its first token POST
-# (no DB lock held) until the concurrent disconnect has started, so both
-# reach their short DB-save transactions from separate PG connections with
-# an explicit barrier and finite timeouts.
-class BarrierPublishTransport
+# Setup-only gate that parks the publish callback inside its first token
+# POST (no DB lock held) until the guard below has locked the consumed
+# attempt row. It orders the setup; the real barriers are the observed
+# PostgreSQL lock waits further down, so no schedule can slip through.
+class NetworkGateTransport
   def initialize(inner, entered, release)
     @inner = inner
     @entered = entered
@@ -269,38 +269,48 @@ class BarrierPublishTransport
 end
 
 test("concurrent publish and disconnect from separate connections never resurrect") do
-  # Real PG race: no wrapping db transaction so publish and disconnect use
-  # independent connections on committed rows. Publish is held in its
-  # lock-free network phase until disconnect has started; both then race
-  # to their short save transactions (same advisory/row lock order, fresh
-  # clocks, tombstone fencing). Either order must end disconnected with no
-  # tokens and no resurrection.
+  # Deterministic first-connection overlap on real PostgreSQL (no wrapping
+  # db transaction, so every thread commits on its own connection). A guard
+  # session holds the consumed attempt row lock; publish -- already past
+  # its lock-free network phase -- is observed waiting on that row inside
+  # its short save transaction, then disconnect is observed waiting on
+  # publish's provider advisory lock. Only after both waits are observed is
+  # the injected clock advanced past the attempt TTL and the guard
+  # released. Publish must then fail on its post-lock TTL recheck while
+  # disconnect wins, ending disconnected with no tokens and no
+  # resurrection. The old code (connection-first locking, no tombstone,
+  # pre-lock clock) leaves the connection behind under this ordering.
   OauthConnection.where(provider: "atlassian").delete_all
   OauthAuthAttempt.where(provider: "atlassian").delete_all
   inner = BoundaryFixtures::HttpTransport.new
   base_env = OauthTestSupport.test_env
   store = OauthTestSupport.secret_store
-  setup_auth = Oauth::AuthService.new(env: base_env, transport: inner, clock: Time,
+  clock = OauthTestSupport::ManualClock.new(Time.current)
+  setup_auth = Oauth::AuthService.new(env: base_env, transport: inner, clock: clock,
                                       secret_store: store,
                                       event_sink: WorkflowFakes::FakeEventSink.new)
   begun = setup_auth.begin(provider: "atlassian", browser_session_id: "sess-race")
   state_raw = begun["state"]
+  attempt_id = OauthAuthAttempt.last.id
   OauthTestSupport.script_atlassian_callback(inner)
 
-  entered = Queue.new
-  release = Queue.new
-  blocking = BarrierPublishTransport.new(inner, entered, release)
+  entered_network = Queue.new
+  release_network = Queue.new
+  gated = NetworkGateTransport.new(inner, entered_network, release_network)
   publish_result = Queue.new
   disconnect_result = Queue.new
+  guard_result = Queue.new
   publish_pid = Queue.new
   disconnect_pid = Queue.new
-  disconnect_started = Queue.new
+  guard_pid = Queue.new
+  guard_ready = Queue.new
+  release_guard = Queue.new
 
   publish = Thread.new do
     ActiveRecord::Base.connection_pool.with_connection do |connection|
       begin
         publish_pid << connection.raw_connection.backend_pid
-        auth = Oauth::AuthService.new(env: base_env, transport: blocking, clock: Time,
+        auth = Oauth::AuthService.new(env: base_env, transport: gated, clock: clock,
                                       secret_store: store,
                                       event_sink: WorkflowFakes::FakeEventSink.new)
         connection_result = auth.callback(provider: "atlassian", state: state_raw,
@@ -311,13 +321,44 @@ test("concurrent publish and disconnect from separate connections never resurrec
       end
     end
   end
-  Timeout.timeout(15) { entered.pop }
+  Timeout.timeout(15) { entered_network.pop }
+  # Publish consumed the attempt before parking in its network phase: the
+  # consumed row is committed and ready for the guard to lock.
+  expect(OauthAuthAttempt.find(attempt_id).status).to eq("consumed")
+
+  guard = Thread.new do
+    ActiveRecord::Base.connection_pool.with_connection do |connection|
+      begin
+        guard_pid << connection.raw_connection.backend_pid
+        ActiveRecord::Base.transaction do
+          OauthAuthAttempt.lock.find(attempt_id)
+          guard_ready << true
+          Timeout.timeout(15) { release_guard.pop }
+        end
+        guard_result << { ok: true }
+      rescue StandardError => e
+        begin
+          guard_result << { ok: false, error: e }
+        rescue StandardError
+          nil
+        end
+      end
+    end
+  end
+  Timeout.timeout(15) { guard_ready.pop }
+  guard_backend = Timeout.timeout(15) { guard_pid.pop }
+  publish_backend = Timeout.timeout(15) { publish_pid.pop }
+  # Publish leaves the network and runs into the guard's row lock inside
+  # its save transaction (provider advisory lock first, then the attempt
+  # row -- the same order disconnect uses). The wait is observed, not slept.
+  release_network << true
+  OauthTestSupport.wait_for_lock_waiter(publish_backend, guard_backend)
+
   disconnect = Thread.new do
     ActiveRecord::Base.connection_pool.with_connection do |connection|
       begin
         disconnect_pid << connection.raw_connection.backend_pid
-        disconnect_started << true
-        auth = Oauth::AuthService.new(env: base_env, transport: inner, clock: Time,
+        auth = Oauth::AuthService.new(env: base_env, transport: inner, clock: clock,
                                       secret_store: store,
                                       event_sink: WorkflowFakes::FakeEventSink.new)
         auth.disconnect(provider: "atlassian")
@@ -327,42 +368,57 @@ test("concurrent publish and disconnect from separate connections never resurrec
       end
     end
   end
-  Timeout.timeout(15) { disconnect_started.pop }
-  release << true
+  disconnect_backend = Timeout.timeout(15) { disconnect_pid.pop }
+  # Disconnect entered its own DB path and now waits on publish's provider
+  # advisory lock: both sides overlap inside their save transactions, with
+  # the first connection row still absent.
+  OauthTestSupport.wait_for_lock_waiter(disconnect_backend, publish_backend)
+
+  # The attempt TTL lapses while both wait. Publish must observe it on its
+  # post-lock recheck instead of resurrecting the connection.
+  clock.advance(Oauth::AuthService::ATTEMPT_TTL_SECONDS + 60)
+  release_guard << true
 
   publish_outcome = Timeout.timeout(15) { publish_result.pop }
   disconnect_outcome = Timeout.timeout(15) { disconnect_result.pop }
+  guard_outcome = Timeout.timeout(15) { guard_result.pop }
   Timeout.timeout(15) { publish.join(15) || raise("publish thread stuck") }
   Timeout.timeout(15) { disconnect.join(15) || raise("disconnect thread stuck") }
-  expect(Timeout.timeout(15) { publish_pid.pop } == Timeout.timeout(15) { disconnect_pid.pop }).to eq(false)
-  expect(disconnect_outcome[:ok]).to eq(true)
-  # Publish either succeeded just before disconnect (then fenced by the
-  # disconnect) or was fenced itself; it must never resurrect.
-  if publish_outcome[:ok]
-    expect(["expired", "state_mismatch"].include?(publish_outcome[:code]) || true).to eq(true)
-  else
-    expect(["expired", "state_mismatch"].include?(publish_outcome[:code])).to eq(true)
-  end
+  Timeout.timeout(15) { guard.join(15) || raise("guard thread stuck") }
+  expect(guard_outcome[:ok]).to eq(true)
+  expect([publish_backend, disconnect_backend, guard_backend].uniq.size).to eq(3)
+  expect(disconnect_outcome).to eq({ ok: true })
+  # Deterministic: the post-lock TTL recheck fails publish, disconnect wins.
+  expect(publish_outcome).to eq({ ok: false, code: "expired" })
 
   ActiveRecord::Base.connection_pool.with_connection do
     final_row = OauthConnection.find_by(provider: "atlassian")
     expect(final_row.nil?).to eq(false)
     expect(final_row.state).to eq("disconnected")
+    expect(final_row.generation).to eq(1)
     expect(final_row.encrypted_access_token.nil?).to eq(true)
     expect(final_row.encrypted_refresh_token.nil?).to eq(true)
+    expect(OauthAuthAttempt.find(attempt_id).status).to eq("expired")
     dumped = ([final_row.attributes] + OauthAuthAttempt.all.map(&:attributes)).inspect
     expect(dumped.include?("at-1")).to eq(false)
     expect(dumped.include?("rt-1")).to eq(false)
   end
+  expect(inner.requests_to("https://auth.atlassian.com/oauth/token", method: :POST).size).to eq(1)
   inner.assert_consumed!
 ensure
   begin
-    release << true
+    release_network << true
+  rescue StandardError
+    nil
+  end
+  begin
+    release_guard << true
   rescue StandardError
     nil
   end
   publish&.kill if defined?(publish) && publish&.alive?
   disconnect&.kill if defined?(disconnect) && disconnect&.alive?
+  guard&.kill if defined?(guard) && guard&.alive?
   OauthConnection.where(provider: "atlassian").delete_all
   OauthAuthAttempt.where(provider: "atlassian").delete_all
 end
