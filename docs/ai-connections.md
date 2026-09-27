@@ -4,7 +4,7 @@
 
 ## なぜworker別にログインが必要か
 
-- control と execution は別々の認証ホーム（Composeは共有の名前付きvolumeを両方にマウントするが、Railwayはサービス別の `/data`）と別々のトークン更新を持つ。一方へのログインで他方は使えない。
+- control と execution は別々の認証ホーム（Composeはrole別の名前付きvolume、Railwayはサービス別の `/data`）と別々のトークン更新を持つ。一方へのログインで他方は使えない。
 - 層とworkerの対応: 対話層・整理層は control、実行層は execution。各層のAIポリシーで選んだ provider に対応する worker へログインする。
 - 未連携の provider も層ポリシーで選択・保存できる。不足は実行時に分類済みエラーになる（APIキー課金への切替はしない）。
 
@@ -22,8 +22,10 @@
 - worker には `AICONSHELL_WORKER_ROLE=control|execution` を明示する。Web には付けない。auth job は要求 role と一致しない worker では実行せず、安全な分類で失敗する。
 - 専用queue `ai_auth_control` / `ai_auth_execution` を、対応 worker の別1スレッドpoolで処理する。長い認証待ちが通常の control/execution 処理を塞がない。
 - Compose: `config/queue_control.yml` と `config/queue_execution.yml` が2pool構成。`ruby bin/check-compose` が検証する。
-- 認証ホームは worker の private volume のみ（`claude_auth` / `codex_auth` / `muse_auth`、Railwayは各 worker の `/data/auth/*`）。Web に CLI・認証volume・worker role を付けない。長期トークンは worker volume だけに置く。
+- 認証ホームは worker の private volume のみ（controlは `claude_auth` / `codex_auth` / `muse_auth`、executionはそれぞれ `execution_` を付けたvolume、Railwayは各 worker の `/data/auth/*`）。Web に CLI・認証volume・worker role を付けない。長期トークンは worker volume だけに置く。
 - 短期の認証秘密（認証URL/ユーザーコード/入力コード）は共有PostgreSQLに `SECRET_KEY_BASE` 由来の専用キーで暗号化（AES-256-GCM・JSON）して保存し、完了・失敗・キャンセル・期限で削除する。
+
+旧Composeからの更新では既存の認証volumeをcontrolに維持する。executionは新しい専用volumeになるため、管理画面から再ログインする。既存volumeの削除や認証ファイルのコピーは行わない。
 
 ## Railway
 

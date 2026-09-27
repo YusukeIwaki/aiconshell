@@ -47,7 +47,7 @@ module AiAuth
       text = code.strip
       raise InvalidRequest, "認証コードを入力してください。" if text.empty?
       raise InvalidRequest, "認証コードが長すぎます。" if text.bytesize > MAX_CODE_BYTES
-      if text.match?(/[\x00-\x1F\x7F]/)
+      if text.match?(/[[:cntrl:]]/)
         raise InvalidRequest, "認証コードは1行で入力してください。改行や制御文字は使えません。"
       end
 

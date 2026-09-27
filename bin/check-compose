@@ -155,8 +155,12 @@ check(failures, "AI auth goes only to control/execution (corrected muse mapping,
   end
   %w[control execution].each do |name|
     mounts = Array(services.dig(name, "volumes")).map(&:to_s)
-    %w[claude_auth codex_auth muse_auth].each do |volume|
-      assert(mounts.any? { |mount| mount.start_with?("#{volume}:") }, "#{name} must mount #{volume}")
+    %w[claude codex muse].each do |provider|
+      volume = name == "control" ? "#{provider}_auth" : "execution_#{provider}_auth"
+      assert(mounts.include?("#{volume}:/private/#{provider}"), "#{name} must mount its own #{volume}")
+      assert(compose.fetch("volumes").key?(volume), "missing auth volume #{volume}")
+      other = name == "control" ? "execution_#{provider}_auth" : "#{provider}_auth"
+      assert(mounts.none? { |mount| mount.start_with?("#{other}:") }, "auth volumes must not be shared between worker roles")
     end
   end
   assert(Array(services.dig("web", "volumes")).empty?, "web must mount no AI auth volumes")
