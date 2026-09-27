@@ -8,7 +8,11 @@ namespace :admin do
     resources :feedbacks, only: %i[create]
   end
 
-  resources :layer_policies, only: %i[index edit update], param: :layer
+  resources :layer_policies, only: %i[index edit update], param: :layer do
+    member do
+      post :connection_check
+    end
+  end
   resources :plugins, only: %i[index]
   resources :event_logs, only: %i[index]
   resources :task_requests, only: %i[new create show]
