@@ -317,12 +317,12 @@ check(failures, "Dockerfile defaults to app, ai carries git and pinned muse down
   assert(dockerfile.include?("USER 1000:1000"), "runtime must drop to non-root")
   assert(!dockerfile.include?("muse_cli"),
     "Dockerfile must not use the muse_cli build secret (official public download instead)")
-  assert(dockerfile.include?("ARG MUSE_VERSION=1.4.0-R4302.1"),
+  assert(dockerfile.match?(/^ARG MUSE_VERSION=\d+\.\d+\.\d+-R\d+(?:\.\d+)?$/),
     "muse version must be pinned via MUSE_VERSION")
-  assert(dockerfile.include?("ARG MUSE_SHA256_AMD64=ad21c22965f8600b4473b4ab8354ff7cc483d4cb681b46f2952561d855c8ed86"),
-    "muse amd64 digest must be pinned via MUSE_SHA256_AMD64")
-  assert(dockerfile.include?("ARG MUSE_SHA256_ARM64=79cfba1b9e417b370bdb9154a546c524b7f32a34026e6164b6f3f122f0ea3386"),
-    "muse arm64 digest must be pinned via MUSE_SHA256_ARM64")
+  %w[AMD64 ARM64].each do |arch|
+    assert(dockerfile.match?(/^ARG MUSE_SHA256_#{arch}=[0-9a-f]{64}$/),
+      "muse #{arch} digest must be pinned via MUSE_SHA256_#{arch}")
+  end
   assert(dockerfile.include?("muse-x86-linux") && dockerfile.include?("muse-aarch64-linux"),
     "muse download must select the per-arch native artifact")
   assert(dockerfile.include?('"https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=${MUSE_VERSION}&file=${MUSE_ARTIFACT}"'),

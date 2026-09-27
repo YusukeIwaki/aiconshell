@@ -143,15 +143,15 @@ jobs:
         run: docker build -t aiconshell:ci-app .
       - name: Default app image carries no AI CLIs
         run: |
-          docker run --rm --entrypoint /bin/sh aiconshell:ci-app -c 'for bin in claude codex muse; do if command -v "$bin" >/dev/null 2>&1; then echo "unexpected AI CLI in app image: $bin" >&2; exit 1; fi; done'
+          docker run --rm --network none --entrypoint /bin/sh aiconshell:ci-app -c 'for bin in claude codex muse; do if command -v "$bin" >/dev/null 2>&1; then echo "unexpected AI CLI in app image: $bin" >&2; exit 1; fi; done'
       - name: Build AI worker image (no login, no credentials)
         run: docker build --target ai -t aiconshell:ci-ai .
       - name: AI worker image carries pinned Linux CLIs
         run: |
-          docker run --rm --entrypoint /usr/local/bin/claude aiconshell:ci-ai --version
-          docker run --rm --entrypoint /usr/local/bin/codex aiconshell:ci-ai --version
-          docker run --rm --entrypoint /usr/local/bin/muse aiconshell:ci-ai --version
-          docker run --rm --entrypoint /usr/bin/git aiconshell:ci-ai --version
+          docker run --rm --network none --entrypoint /usr/local/bin/claude aiconshell:ci-ai --version
+          docker run --rm --network none --entrypoint /usr/local/bin/codex aiconshell:ci-ai --version
+          docker run --rm --network none --entrypoint /usr/local/bin/muse aiconshell:ci-ai --version
+          docker run --rm --network none --entrypoint /usr/bin/git aiconshell:ci-ai --version
 
   clickhouse-smoke:
     runs-on: ubuntu-latest

@@ -139,11 +139,12 @@ never copied into the repo.
 
 ## Railway and Compose
 
-Use the repository's optional Docker `ai` target for **both control and execution**
-workers. It installs pinned Claude/Codex versions. Muse requires an authorized
-Linux executable supplied at build time; do not copy a macOS binary or auth cache
-into the image. See [deployment.md](deployment.md) for the tested build, volume,
-and login commands. Keep subscription credential volumes writable for refresh.
+Compose defaults **both control and execution** workers to the Docker `ai`
+target, which bundles pinned Claude, Codex, and Muse CLIs. Muse is downloaded
+from the official public Linux release with an architecture-specific SHA256
+check; no login or auth cache is needed at build time. The `app` target used by
+web contains no AI CLI. See [deployment.md](deployment.md) for build, volume,
+and runtime login commands. Keep subscription credential volumes writable for refresh.
 No real subscription login or billed model call is part of the automated tests.
 
 ## Failure modes

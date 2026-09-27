@@ -88,9 +88,6 @@ FROM base AS ai
 ARG NODE_VERSION=24.21.0
 ARG CLAUDE_CODE_VERSION=2.1.283
 ARG CODEX_VERSION=0.157.1
-ARG MUSE_VERSION=1.4.0-R4302.1
-ARG MUSE_SHA256_AMD64=ad21c22965f8600b4473b4ab8354ff7cc483d4cb681b46f2952561d855c8ed86
-ARG MUSE_SHA256_ARM64=79cfba1b9e417b370bdb9154a546c524b7f32a34026e6164b6f3f122f0ea3386
 ARG TARGETARCH
 
 # Node.js from the official tarball (multi-arch) for the Node-based CLIs.
@@ -126,13 +123,18 @@ RUN npm install -g --no-audit --no-fund \
 # launcher) and verifies the per-arch SHA256 before install. Bump
 # MUSE_VERSION together with both MUSE_SHA256_* digests. Never commit the
 # binary or credentials into the repository.
+ARG MUSE_VERSION=1.4.0-R4302.1
+ARG MUSE_SHA256_AMD64=ad21c22965f8600b4473b4ab8354ff7cc483d4cb681b46f2952561d855c8ed86
+ARG MUSE_SHA256_ARM64=79cfba1b9e417b370bdb9154a546c524b7f32a34026e6164b6f3f122f0ea3386
 RUN set -e; \
     case "${TARGETARCH:-amd64}" in \
       amd64) MUSE_ARTIFACT=muse-x86-linux; MUSE_SHA256=${MUSE_SHA256_AMD64} ;; \
       arm64) MUSE_ARTIFACT=muse-aarch64-linux; MUSE_SHA256=${MUSE_SHA256_ARM64} ;; \
       *) echo "unsupported TARGETARCH for muse: ${TARGETARCH:-<unset>}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL --max-time 120 "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=${MUSE_VERSION}&file=${MUSE_ARTIFACT}" \
+    curl -fsSL --proto '=https' --proto-redir '=https' \
+      --connect-timeout 15 --max-time 600 --retry 2 \
+      "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=${MUSE_VERSION}&file=${MUSE_ARTIFACT}" \
       -o /tmp/muse; \
     echo "${MUSE_SHA256}  /tmp/muse" | sha256sum -c -; \
     install -m 0755 /tmp/muse /usr/local/bin/muse; \
