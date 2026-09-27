@@ -29,7 +29,7 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 - JSON Schema 検証は `json_schemer`。単体・結合テストは Smartest。
 - EventLog の検索用保存先は ClickHouse 26.8 系。PostgreSQL に残るのは配信待ちとリトライ状態で、永続ログアーカイブではない。
 - Docker Compose は web/control worker/execution worker/postgres/clickhouse。Railway も同じ分割。ngrok は必要時のみ。
-- コンテナイメージは役割別: `app`（web / migrate / clickhouse-init 固定。AI CLI なし）と `ai`（control / execution の既定。Claude / Codex 同梱、`muse` は任意のビルドシークレットでのみ追加）。Railway は `RUNTIME_TARGET`（既定 `app`、worker は `ai`）で同じ分離を行う。未設定 provider は選択可・実行時失敗が契約。
+- コンテナイメージは役割別: `app`（web / migrate / clickhouse-init 固定。AI CLI なし）と `ai`（control / execution の既定。Claude / Codex / Muse 同梱。Muse は公式公開 Linux バイナリを固定バージョン・SHA256 検証で取得し、ビルド時ログイン不要）。Railway は `RUNTIME_TARGET`（既定 `app`、worker は `ai`）で同じ分離を行う。未設定 provider は選択可・実行時失敗が契約。
 - GitHub Actions を使う場合は CI だけとする。
 
 ## 永続モデル

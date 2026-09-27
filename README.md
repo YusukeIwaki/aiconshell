@@ -146,8 +146,8 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 
 - 日常操作・AI CLI 導入・Railway・ngrok は [docs/deployment.md](docs/deployment.md)。
 - イメージは役割別: web は常に CLI なしの `app`、worker は `ai` が既定
-  （Claude/Codex 付き）。`muse` は `compose.muse.yml` の任意 override
-  でのみ追加し、認証ログインは別の実行時手順。
+  （Claude/Codex/Muse 付き。Muse は公式公開 Linux バイナリを固定
+  バージョン・SHA256 検証で同梱）。認証ログインは別の実行時手順。
 - 環境変数は `.env.example` が正。`execution` worker には連携資格情報を
   渡さない（compose と AI 層の両方で遮断）。
 - ClickHouse は結果整合性のため分離起動する: 障害時も web/worker は
@@ -177,4 +177,4 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
   ClickHouse 配送、ClickHouse 停止中の起動継続と復帰後配送、
   本番同等 `/up` の redirect 除外（詳細は `docs/deployment.md` §10）。
 - 運営者作業（要アカウント）: Railway 実デプロイ、ngrok 実公開、各 CLI
-  のログイン（`muse` バイナリ入手含む）、実サービスへの投稿・取得。
+  のサブスクリプションログイン、実サービスへの投稿・取得。

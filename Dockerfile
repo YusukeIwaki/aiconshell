@@ -5,23 +5,18 @@
 # Targets:
 #   app           - Rails web / Solid Queue workers without AI CLIs.
 #                   Missing AI credentials or binaries never block this image.
-#   ai            - `app` plus Node.js, git, and the Claude/Codex subscription
-#                   CLIs (pinned, overridable versions). The Muse CLI is an
-#                   authenticated distribution: operators supply an authorized
-#                   Linux binary via a BuildKit secret, and the build COPIES it
-#                   into /usr/local/bin/muse intentionally. Only the secret
-#                   mount itself is ephemeral (it never lands in a layer);
-#                   without the secret the binary is simply absent and the
-#                   provider fails at execution time. Auth credentials always
-#                   stay outside the image (mounted volumes, never baked in).
+#   ai            - `app` plus Node.js, git, and the Claude/Codex/Muse
+#                   subscription CLIs (pinned, overridable versions).
+#                   Muse is the official public native Linux artifact
+#                   (pinned version + per-arch SHA256, verified at build
+#                   time). No build-time login, API key, or auth cache is
+#                   needed. Auth credentials always stay outside the image
+#                   (mounted volumes, never baked in).
 #   runtime       - Final target, selects app by default; build arg
 #                   RUNTIME_TARGET=ai selects the CLI image for Railway.
 #
 #   docker build -t aiconshell:app .
-#   docker build --target ai --no-cache -t aiconshell:ai \
-#     --secret id=muse_cli,src=$HOME/.cache/aiconshell/muse-cli/muse .
-# (--no-cache: BuildKit caches secret-mount layers, so toggling the
-# secret without it can reuse a stale layer.)
+#   docker build --target ai -t aiconshell:ai .
 #
 # See docs/deployment.md ("AI CLI provisioning") for the operator flow.
 
@@ -82,16 +77,20 @@ RUN bundle exec bootsnap precompile app/ lib/
 # root comes from the runtime environment and its persisted volume).
 RUN SECRET_KEY_BASE_DUMMY=1 AICONSHELL_EXECUTION_ROOT=/tmp/aiconshell-build-root ./bin/rails assets:precompile
 
-# Optional CLI-enabled worker image. Select with --target ai or RUNTIME_TARGET=ai.
+# CLI-enabled worker image. Select with --target ai or RUNTIME_TARGET=ai.
 FROM base AS ai
 
 # Pinned, overridable toolchain. Verify replacements at:
 #   https://nodejs.org/dist/ (v${NODE_VERSION} linux x64+arm64 tarballs)
 #   https://registry.npmjs.org/@anthropic-ai%2fclaude-code
 #   https://registry.npmjs.org/@openai%2fcodex
+#   https://api.meta.ai/muse-code/channels/muse-stable (MUSE_VERSION + per-arch SHA256)
 ARG NODE_VERSION=24.21.0
 ARG CLAUDE_CODE_VERSION=2.1.283
 ARG CODEX_VERSION=0.157.1
+ARG MUSE_VERSION=1.4.0-R4302.1
+ARG MUSE_SHA256_AMD64=ad21c22965f8600b4473b4ab8354ff7cc483d4cb681b46f2952561d855c8ed86
+ARG MUSE_SHA256_ARM64=79cfba1b9e417b370bdb9154a546c524b7f32a34026e6164b6f3f122f0ea3386
 ARG TARGETARCH
 
 # Node.js from the official tarball (multi-arch) for the Node-based CLIs.
@@ -119,21 +118,26 @@ RUN npm install -g --no-audit --no-fund \
     claude --version && \
     codex --version
 
-# Muse CLI: authenticated distribution supplied by the operator at build time.
-# `install` copies the binary into /usr/local/bin/muse ON PURPOSE: the
-# executable is part of the ai image. What disappears after the build is
-# only the secret mount (/run/secrets/muse_cli leaves no layer behind).
-# Without `--secret id=muse_cli,src=<authorized Linux binary>` the image
-# still builds; `muse` is simply absent and the provider fails at execution
-# time. Never commit the binary or credentials into the repository.
-RUN --mount=type=secret,id=muse_cli,required=false \
-    if [ -f /run/secrets/muse_cli ]; then \
-      install -m 0755 /run/secrets/muse_cli /usr/local/bin/muse && \
-      muse --version && \
-      echo "muse CLI installed from build secret into the image"; \
-    else \
-      echo "muse CLI not supplied; skipping (see docs/deployment.md)"; \
-    fi
+# Muse CLI: pinned native Linux binary from the official public
+# distribution (same channel manifest as
+# https://api.meta.ai/muse-code/channels/muse-stable).
+# No build-time login, API key, or auth cache: the artifact URL is public
+# and unauthenticated. This pins the binary itself (not the auto-updating
+# launcher) and verifies the per-arch SHA256 before install. Bump
+# MUSE_VERSION together with both MUSE_SHA256_* digests. Never commit the
+# binary or credentials into the repository.
+RUN set -e; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) MUSE_ARTIFACT=muse-x86-linux; MUSE_SHA256=${MUSE_SHA256_AMD64} ;; \
+      arm64) MUSE_ARTIFACT=muse-aarch64-linux; MUSE_SHA256=${MUSE_SHA256_ARM64} ;; \
+      *) echo "unsupported TARGETARCH for muse: ${TARGETARCH:-<unset>}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --max-time 120 "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=${MUSE_VERSION}&file=${MUSE_ARTIFACT}" \
+      -o /tmp/muse; \
+    echo "${MUSE_SHA256}  /tmp/muse" | sha256sum -c -; \
+    install -m 0755 /tmp/muse /usr/local/bin/muse; \
+    rm -f /tmp/muse; \
+    muse --version
 
 # App artifacts (gems + code) shared with the default image.
 COPY --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
