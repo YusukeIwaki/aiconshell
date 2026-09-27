@@ -72,8 +72,11 @@ cursorを更新すること。
 
 受信event IDと送信external_idは安定形式で、アプリの自己投稿照合に使える。
 `jira:issue:<KEY>` / `jira:comment:<id>` / `jira:changelog:<issueId>:<changeId>`、
-`reply` の `external_id` はコメントid文字列、`create_issue` の `external_id` は
-課題キー（例 `PROJ-123`）。pluginが異なるため既存 `jira` のIDと衝突しない
+`reply` の `external_id` は数字のみの非空文字列コメントid、
+`create_issue` の `external_id` は `要求project-数字` 形式の課題キー
+（例 `PROJ-123`）。数値・Hash・空文字・形式外・要求project外の応答は
+`to_s` でreceipt化せず `OutputInvalid` とし、照合を壊さない。
+pluginが異なるため既存 `jira` のIDと衝突しない
 （永続の一意は plugin + event_id + fingerprint）。
 actorは実態を保つ（`accountType: app` のみ `bot`、それ以外は `human`。
 課題本体イベントは `system`/`unknown`）。個人ユーザーの発言をbotに偽装しない。
@@ -82,10 +85,13 @@ actorは実態を保つ（`accountType: app` のみ `bot`、それ以外は `hum
 
 - cloud・principal・actorは `oauth_binding` の検証済み値のみを使う。
   AI・input JSON・envで上書きできない（input schemaに含めない）。
-- base URLとpagingの `nextPage` は同cloud境界に閉じる。
-  scheme・host・portに加え `/ex/jira/<cloudId>/` 前方一致と `.`/`..`
-  除去でcross-host・cross-cloud・path escapeを拒否し、送信前に
-  `HostRejected` とする。userinfo付きURLは送らない。
+- base URLとpagingの `nextPage` は要求中の同一issue/collectionに固定する。
+  scheme・host・portに加え `/ex/jira/<cloudId>/` 前方一致と要求pathとの
+  完全一致でcross-host・cross-cloud・別issue/別collectionへの遷移を拒否する。
+  queryはpaging要素（`startAt`/`maxResults`/`orderBy`）のみを許し、それ以外・
+  fragment・userinfo付きURLは送らない。`%`（`%2e`/`%2f`/`%5c`・二重エンコード
+  `%25` を含む）・`\`・`//`・`.`/`..`・末尾 `/` 等の非正規pathはHTTP前に
+  `HostRejected` とし、不正URLへの送信はゼロとする。
 - 同一invoke内は固定世代の1 tokenを使い回す。並行呼出で別ユーザーtokenを混ぜない。
   外部書込を401等で自動replayしない。
 - `oauth_binding` / `oauth_credential_provider` 不在・provider不一致・cloud不正は

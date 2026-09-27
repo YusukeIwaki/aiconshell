@@ -665,3 +665,147 @@ test("jira_oauth validates input and cursors before resolving credentials") do
   expect(provider.token_calls).to eq(0)
   transport.assert_consumed!
 end
+
+test("jira_oauth pins nextPage to the same issue and collection") do
+  bad_targets = [
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-2/comment?startAt=1&maxResults=1",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/changelog?startAt=1&maxResults=50",
+    "#{JOAUTH_BASE}/rest/api/3/issue/OTHER-9/comment?startAt=1&maxResults=50"
+  ]
+  bad_targets.each do |target|
+    transport = BoundaryFixtures::HttpTransport.new
+    provider = JoFakeProvider.new
+    registry = jo_registry(transport, provider: provider)
+    transport.expect_json(:POST, "#{JOAUTH_BASE}/rest/api/3/search/jql", body: {
+                            "issues" => [jo_issue("PROJ-1", updated: "2026-09-26T12:00:00Z")]
+                          })
+    transport.expect_json(:GET, %r{/issue/PROJ-1/comment}, body: {
+                            "comments" => [jo_comment("c0", updated: "2026-09-26T12:01:00Z")],
+                            "startAt" => 0, "maxResults" => 1, "total" => 2,
+                            "nextPage" => target
+                          })
+
+    raised = nil
+    begin
+      registry.invoke(plugin: "jira_oauth", operation: "latest_events",
+                      input: { "scope" => "PROJ" }, context: jo_context(jo_binding, provider))
+    rescue JoPlugins::HostRejected => error
+      raised = error
+    end
+    expect(raised.nil?).to eq(false)
+    expect(transport.requests_to(target, method: :GET).size).to eq(0)
+    expect(transport.requests.size).to eq(2)
+    transport.assert_consumed!
+  end
+end
+
+test("jira_oauth follows a same-collection nextPage with paging query") do
+  transport = BoundaryFixtures::HttpTransport.new
+  provider = JoFakeProvider.new
+  registry = jo_registry(transport, provider: provider)
+  valid_next = "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/comment?startAt=1&maxResults=1&orderBy=created"
+
+  transport.expect_json(:POST, "#{JOAUTH_BASE}/rest/api/3/search/jql", body: {
+                          "issues" => [jo_issue("PROJ-1", updated: "2026-09-26T12:00:00Z")]
+                        })
+  transport.expect_json(:GET, %r{/issue/PROJ-1/comment\?.*startAt=0}, body: {
+                          "comments" => [jo_comment("c0", updated: "2026-09-26T12:01:00Z")],
+                          "startAt" => 0, "maxResults" => 1, "total" => 2,
+                          "nextPage" => valid_next
+                        })
+  transport.expect_json(:GET, %r{/issue/PROJ-1/comment\?.*startAt=1}, body: {
+                          "comments" => [jo_comment("c1", updated: "2026-09-26T12:02:00Z")],
+                          "startAt" => 1, "maxResults" => 1, "total" => 2
+                        })
+  transport.expect_json(:GET, %r{/issue/PROJ-1/changelog}, body: jo_page("values", []))
+
+  out = registry.invoke(plugin: "jira_oauth", operation: "latest_events",
+                        input: { "scope" => "PROJ" }, context: jo_context(jo_binding, provider))
+  expect(out["events"].map { |event| event["event_id"] }).to include("jira:comment:c1")
+  expect(transport.requests_to(valid_next, method: :GET).size).to eq(1)
+  transport.assert_consumed!
+end
+
+test("jira_oauth rejects encoded and noncanonical nextPage paths before HTTP") do
+  bad_targets = [
+    "#{JOAUTH_BASE}/rest/api/3/issue/%2e%2e/comment?startAt=1&maxResults=50",
+    "#{JOAUTH_BASE}/rest/api/3/issue/%2E%2E/comment?startAt=1&maxResults=50",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1%2fcomment?startAt=1",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1%5ccomment?startAt=1",
+    "#{JOAUTH_BASE}/rest/api/3/issue/%252e/comment?startAt=1",
+    "#{JOAUTH_BASE}/rest/api/3/issue//comment?startAt=1&maxResults=50",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/comment/?startAt=1&maxResults=50",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/comment?startAt=1&maxResults=50#frag",
+    "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/comment?startAt=1&jql=evil",
+    "https://user:secret@api.atlassian.com/ex/jira/#{JOAUTH_CLOUD}/rest/api/3/issue/PROJ-1/comment?startAt=1"
+  ]
+  bad_targets.each do |target|
+    transport = BoundaryFixtures::HttpTransport.new
+    provider = JoFakeProvider.new
+    registry = jo_registry(transport, provider: provider)
+    transport.expect_json(:POST, "#{JOAUTH_BASE}/rest/api/3/search/jql", body: {
+                            "issues" => [jo_issue("PROJ-1", updated: "2026-09-26T12:00:00Z")]
+                          })
+    transport.expect_json(:GET, %r{/issue/PROJ-1/comment}, body: {
+                            "comments" => [jo_comment("c0", updated: "2026-09-26T12:01:00Z")],
+                            "startAt" => 0, "maxResults" => 1, "total" => 2,
+                            "nextPage" => target
+                          })
+
+    raised = nil
+    begin
+      registry.invoke(plugin: "jira_oauth", operation: "latest_events",
+                      input: { "scope" => "PROJ" }, context: jo_context(jo_binding, provider))
+    rescue JoPlugins::HostRejected => error
+      raised = error
+    end
+    expect(raised.nil?).to eq(false)
+    expect(transport.requests.size).to eq(2)
+    transport.assert_consumed!
+  end
+end
+
+test("jira_oauth validates write receipts strictly without to_s coercion") do
+  bad_comment_ids = [123, { "x" => 1 }, "", "abc", "12a", nil]
+  bad_comment_ids.each do |bad_id|
+    transport = BoundaryFixtures::HttpTransport.new
+    provider = JoFakeProvider.new(token: "write-token")
+    registry = jo_registry(transport, provider: provider)
+    transport.expect_json(:POST, "#{JOAUTH_BASE}/rest/api/3/issue/PROJ-1/comment",
+                          status: 201, body: { "id" => bad_id })
+    raised = nil
+    begin
+      registry.invoke(plugin: "jira_oauth", operation: "reply",
+                      input: { "resource_id" => "issue:PROJ-1", "body" => "hi" },
+                      context: jo_context(jo_binding, provider, scopes: ["jira_oauth:write"]))
+    rescue JoPlugins::OutputInvalid => error
+      raised = error
+    end
+    expect(raised.nil?).to eq(false)
+    expect(raised.message).to match(/comment id/)
+    expect(transport.requests.size).to eq(1)
+    transport.assert_consumed!
+  end
+
+  bad_issue_keys = [42, { "key" => "PROJ-1" }, "", "lower-1", "PROJ-", "PROJ-abc",
+                    "OTHER-1", "PROJX-1", nil]
+  bad_issue_keys.each do |bad_key|
+    transport = BoundaryFixtures::HttpTransport.new
+    provider = JoFakeProvider.new(token: "write-token")
+    registry = jo_registry(transport, provider: provider)
+    transport.expect_json(:POST, "#{JOAUTH_BASE}/rest/api/3/issue",
+                          status: 201, body: { "id" => "101", "key" => bad_key })
+    raised = nil
+    begin
+      registry.invoke(plugin: "jira_oauth", operation: "create_issue",
+                      input: { "scope" => "PROJ", "title" => "t", "body" => "b" },
+                      context: jo_context(jo_binding, provider, scopes: ["jira_oauth:write"]))
+    rescue JoPlugins::OutputInvalid => error
+      raised = error
+    end
+    expect(raised.nil?).to eq(false)
+    expect(raised.message).to match(/issue key/)
+    expect(transport.requests.size).to eq(1)
+    transport.assert_consumed!
+  end
+end

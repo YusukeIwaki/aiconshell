@@ -34,6 +34,13 @@ module Aiconshell
     # The same binding is resolved once per invoke; the adapter never
     # calls binding_for to switch users and never retries writes on 401.
     class JiraOauth < Jira
+      # Strict receipt shapes: server ids/keys are never coerced with to_s.
+      COMMENT_ID_PATTERN = /\A\d+\z/
+      ISSUE_KEY_PATTERN = /\A[A-Z][A-Z0-9_]*-\d+\z/
+      # nextPage query allowlist: only paging elements may change across
+      # pages. Path must equal the requesting collection path exactly.
+      ALLOWED_NEXT_QUERY_KEYS = %w[startAt maxResults orderBy].freeze
+
       plugin_id "jira_oauth"
       required_env "OAUTH_ATLASSIAN_CLIENT_ID", "OAUTH_ATLASSIAN_CLIENT_SECRET",
                    "OAUTH_ATLASSIAN_CLIENT_SECRET_FILE", "OAUTH_ATLASSIAN_CLOUD_ID",
@@ -150,12 +157,13 @@ module Aiconshell
           body: JSON.generate({ "body" => adf_doc(input["body"].to_s) })
         )
         payload = response.json
-        unless payload.is_a?(Hash) && payload["id"]
+        comment_id = payload.is_a?(Hash) ? payload["id"] : nil
+        unless comment_id.is_a?(String) && COMMENT_ID_PATTERN.match?(comment_id)
           raise OutputInvalid.new(plugin: plugin_id, operation: "reply",
                                   details: ["Jira response did not include a comment id"])
         end
 
-        { "external_id" => payload["id"].to_s, "url" => browse_url(base, match[:key]) }
+        { "external_id" => comment_id, "url" => browse_url(base, match[:key]) }
       end
 
       def handle_create_issue(input, ctx)
@@ -181,12 +189,14 @@ module Aiconshell
                               })
         )
         payload = response.json
-        unless payload.is_a?(Hash) && payload["key"]
+        issue_key = payload.is_a?(Hash) ? payload["key"] : nil
+        unless issue_key.is_a?(String) && ISSUE_KEY_PATTERN.match?(issue_key) &&
+               issue_key.start_with?("#{scope}-")
           raise OutputInvalid.new(plugin: plugin_id, operation: "create_issue",
                                   details: ["Jira response did not include an issue key"])
         end
 
-        { "external_id" => payload["key"].to_s, "url" => browse_url(base, payload["key"].to_s) }
+        { "external_id" => issue_key, "url" => browse_url(base, issue_key) }
       end
 
       # Never fall back to service-account env: these overrides fail
@@ -252,15 +262,18 @@ module Aiconshell
         { binding: binding, token: token, cloud: cloud, base: "https://#{host}/ex/jira/#{cloud}" }
       end
 
-      # Same numeric paging as `jira`, plus a cloud path fence: the shared
-      # host check allows any api.atlassian.com origin, so additionally
-      # require the same /ex/jira/<cloud>/ prefix and reject dot segments.
+      # Same numeric paging as `jira`, plus a strict collection fence:
+      # the shared host check allows any api.atlassian.com origin, so
+      # additionally require the same /ex/jira/<cloud>/ prefix, the exact
+      # requesting issue/collection path, paging-only query keys, and no
+      # encoded or noncanonical path escapes. Rejected before any HTTP.
       def paged_get(ctx, headers, first_url, allowed_hosts, collection)
         items = []
         url = first_url
         seen = {}
         expected_start = 0
         expected_prefix = oauth_path_prefix(allowed_hosts)
+        expected_path = oauth_collection_path(first_url, allowed_hosts)
         MAX_PAGES.times do
           incomplete!("Jira pagination did not advance") if seen[url]
 
@@ -275,7 +288,10 @@ module Aiconshell
           nxt = payload["nextPage"]
           unless nxt.nil? || nxt == ""
             Http.check_host!(nxt, allowed_hosts)
-            check_oauth_path!(nxt, expected_prefix, allowed_hosts)
+            check_oauth_path!(nxt, expected_prefix, allowed_hosts,
+                              expected_path: expected_path,
+                              allowed_query_keys: ALLOWED_NEXT_QUERY_KEYS,
+                              first_url: first_url)
           end
           start, maximum, total = payload.values_at("startAt", "maxResults", "total")
           unless [start, maximum, total].all? { |value| value.is_a?(Integer) && value >= 0 }
@@ -315,22 +331,73 @@ module Aiconshell
                                allowed_hosts: Array(allowed_hosts).map(&:to_s))
       end
 
-      def check_oauth_path!(url, expected_prefix, allowed_hosts)
+      def oauth_collection_path(first_url, allowed_hosts)
+        uri = URI.parse(first_url.to_s)
+        path = uri.path.to_s
+        reject_oauth_url!(uri, allowed_hosts) if path.empty?
+
+        path
+      rescue URI::InvalidURIError
+        raise HostRejected.new(host: "(invalid url)",
+                               allowed_hosts: Array(allowed_hosts).map(&:to_s))
+      end
+
+      def reject_oauth_url!(uri, allowed_hosts)
+        raise HostRejected.new(host: uri.host.to_s.downcase,
+                               allowed_hosts: Array(allowed_hosts).map(&:to_s))
+      end
+
+      # Rejects encoded and noncanonical path escapes before HTTP and pins
+      # the page to the requesting issue/collection: the candidate path
+      # must equal expected_path exactly and its query may only carry
+      # paging keys. Any "%" in the raw path is rejected because the
+      # canonical collection path is pure ASCII without encoding; this
+      # covers %2e/%2f/%5c and double-encoded %25 without decoding
+      # attacker-controlled text.
+      def check_oauth_path!(url, expected_prefix, allowed_hosts,
+                            expected_path: nil, allowed_query_keys: nil,
+                            first_url: nil)
         uri = URI.parse(url.to_s)
         raw_path = uri.path.to_s
-        if raw_path.include?("/../") || raw_path.include?("/./") ||
-           raw_path.end_with?("/..") || raw_path.end_with?("/.")
-          raise HostRejected.new(host: uri.host.to_s.downcase,
-                                 allowed_hosts: Array(allowed_hosts).map(&:to_s))
+        if uri.fragment && !uri.fragment.empty?
+          reject_oauth_url!(uri, allowed_hosts)
+        end
+        if raw_path.include?("\\") || raw_path.include?("%") || raw_path.include?("//") ||
+           raw_path.include?("/../") || raw_path.include?("/./") ||
+           raw_path.end_with?("/..") || raw_path.end_with?("/.") || raw_path.end_with?("/")
+          reject_oauth_url!(uri, allowed_hosts)
         end
         segments = raw_path.split("/").reject(&:empty?)
-        if segments.any? { |part| part == "." || part == ".." }
-          raise HostRejected.new(host: uri.host.to_s.downcase,
-                                 allowed_hosts: Array(allowed_hosts).map(&:to_s))
+        if segments.any? { |part| part == "." || part == ".." || part.empty? }
+          reject_oauth_url!(uri, allowed_hosts)
         end
         unless segments[0, expected_prefix.length] == expected_prefix
-          raise HostRejected.new(host: uri.host.to_s.downcase,
-                                 allowed_hosts: Array(allowed_hosts).map(&:to_s))
+          reject_oauth_url!(uri, allowed_hosts)
+        end
+        if expected_path && raw_path != expected_path
+          reject_oauth_url!(uri, allowed_hosts)
+        end
+        if first_url
+          begin
+            first_uri = URI.parse(first_url.to_s)
+          rescue URI::InvalidURIError
+            reject_oauth_url!(uri, allowed_hosts)
+          end
+          unless uri.scheme.to_s.downcase == first_uri.scheme.to_s.downcase &&
+                 uri.host.to_s.downcase == first_uri.host.to_s.downcase &&
+                 uri.port == first_uri.port
+            reject_oauth_url!(uri, allowed_hosts)
+          end
+        end
+        if allowed_query_keys
+          begin
+            pairs = URI.decode_www_form(uri.query.to_s)
+          rescue ArgumentError
+            reject_oauth_url!(uri, allowed_hosts)
+          end
+          unless pairs.all? { |key, _| allowed_query_keys.include?(key) }
+            reject_oauth_url!(uri, allowed_hosts)
+          end
         end
         uri
       rescue URI::InvalidURIError
