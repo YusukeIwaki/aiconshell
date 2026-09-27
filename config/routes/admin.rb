@@ -13,6 +13,12 @@ namespace :admin do
       post :connection_check
     end
   end
+  resources :oauth_connections, only: %i[index] do
+    collection do
+      post :connect
+      post :disconnect
+    end
+  end
   resources :plugins, only: %i[index]
   resources :event_logs, only: %i[index]
   resources :task_requests, only: %i[new create show]

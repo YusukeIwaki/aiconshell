@@ -221,6 +221,72 @@ token = creds.access_token(binding.to_h) # 直前の外部書込のためだけ�
   [workflow](workflow.md) と [architecture](architecture.md#plugins) を参照。
   OAuth 管理画面の往復（#23）は別レーンであり、この文書の基盤契約は変えない。
 
+## 管理画面での接続手順（#23）
+
+運用者は日本語管理画面の「OAuth連携」（`/admin/oauth_connections`、管理画面ナビと
+プラグイン診断から到達）で、Atlassian/Microsoft の連携開始・再接続・解除を行う。
+開始・解除は Basic 認証 + 実CSRF検証の POST のみ。controller は
+`Oauth::AuthService`（`begin` / `callback` / `disconnect` / `public_status`）
+だけを使い、Task/TaskRun/業務jobを作らない。
+
+### callback URI の登録
+
+provider アプリ側の redirect URI には次の固定 callback を登録する（環境の
+公開ホスト名に置き換える）。provider 名は経路制約で atlassian/microsoft に
+固定され、token URL・redirect URI・tenant は callback 入力で選べない。
+
+- `https://<app-host>/oauth/atlassian/callback` → `OAUTH_ATLASSIAN_REDIRECT_URI`
+- `https://<app-host>/oauth/microsoft/callback` → `OAUTH_MICROSOFT_REDIRECT_URI`
+
+callback 経路は Basic 認証なしの公開 GET である（provider は認証情報を送れない）。
+偽造対策はブラウザsession束縛・TTL（600 秒）・一回消費の state で行う。
+同意・拒否のいずれも query なし管理画面へ戻し、code/state/`error_description`/
+認可URL/token/verifier を画面・Railsログ・例外・EventLog・Referer に残さない
+（認可リダイレクトは `Redirected to` ログを避ける手動 Location、
+callback query は parameter filter、リダイレクトは `no-referrer`）。
+
+### 秘密の配置
+
+client secret は `OAUTH_*_CLIENT_SECRET` 直書きか `OAUTH_*_CLIENT_SECRET_FILE`
+の private ファイルのどちらかで渡す（両方ある場合は直書きが優先される）。
+秘密の値は画面・ログ・EventLog に出さず、環境変数名のみ表示する。
+既存 service account 用の `JIRA_*` / `TEAMS_*` とは独立した変数であり混在・転用しない。
+
+### 同意の前提と scope
+
+- Microsoft は固定 Entra tenant の仕事/学校アカウントのみ。個人アカウント
+  （hotmail/outlook.com 等）は対応しない。`common` / `organizations` /
+  `consumers` は tenant として受け付けない。
+- Microsoft の要求 scope は同意したユーザー名義で動く委任された権限であり、
+  `ChannelMessage.Read.All` 等は tenant の管理者同意が必要になり得る。
+  同意は対象ユーザーがブラウザで行い、確認済み principal（表示名/ID）・
+  tenant/cloud・付与 scope を画面で確認する。
+- Atlassian は Jira Cloud 3LO で、運用設定の 1 cloud ID に固定する。
+  `offline_access` は refresh token 取得用であり API 権限ではない。
+
+### 接続状態の読み方
+
+未設定（env不足）・未接続・接続中（同意待ち試行あり）・接続済み・再認証必要・
+失敗を別のバッジで区別する。「設定済み」は env が揃っていること、「接続済み」は
+検証済み接続があることであり、両者を混同しない。接続中は接続バッジに並ぶ
+追加表示であり、再接続の同意待ちでも確認済み principal・接続先・付与 scope と
+解除は隠さない。初回同意の失敗は接続行を作らず最新の試行結果として表示し、
+未接続と区別する。再同意の失敗は接続バッジを上書きせず試行結果として分けて
+表示し、過去の正常接続は壊れない。設定 env が欠けても保存済み接続・進行中試行の
+ローカル解除は行える。callback の state/code/error に型不正・過大値があれば
+provider への HTTP 前に拒否する（追加の provider 情報は無視してよい）。
+
+### 解除の意味
+
+解除はこのアプリでの利用停止と token 破棄であり、世代を進めて古い callback・
+refresh を再利用不可にする。provider 側の同意取り消しは別途 provider 側で
+行う（取り消された場合は refresh 失敗として再認証必要になる）。
+
+個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT
+fallback は提供しない。Bot運用（`jira` service account / `teams` Graph
+application + Bot 名義）と OAuth2代理運用（同意ユーザー名義）の区別は管理画面と
+各 plugin README に明示する。
+
 公式仕様:
 
 - <https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/>

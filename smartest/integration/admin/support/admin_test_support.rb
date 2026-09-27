@@ -48,6 +48,7 @@ module AdminTestSupport
     Admin::AiStatus.reset!
     Admin::PluginStatus.reset!
     Admin::EventLogSearch.reset!
+    Admin::OauthStatus.reset!
     ActionController::Base.allow_forgery_protection = false
   end
 
