@@ -61,8 +61,12 @@ module AiAuth
           return Result.new(ok: false, code: :cancelled)
         end
 
+        # Single-worker contract (issue 20): only execution sessions run,
+        # only on the execution worker. Legacy control rows fail safe here
+        # without running the runtime; they are revoked through
+        # RequestService#revoke_legacy_control!, never executed.
         own_role = worker_role
-        if own_role.nil? || own_role.empty? || own_role != session.worker_role
+        if session.worker_role != "execution" || own_role.nil? || own_role.empty? || own_role != session.worker_role
           finalize(session, status: "failed", result_state: nil,
                    result_error: "role_mismatch", now_time: now_time, snapshot: false)
           return Result.new(ok: false, code: :role_mismatch)
@@ -287,8 +291,12 @@ module AiAuth
 
     # An old job must never overwrite a newer session's snapshot.
     # last_session_id fencing keeps the newest terminal result authoritative
-    # even when an old snapshot write lands after a newer one.
+    # even when an old snapshot write lands after a newer one. Snapshots
+    # are execution-only: legacy control rows never gain a snapshot here,
+    # and control state is never copied to execution.
     def update_snapshot(session, state, error_code, now_time)
+      return unless session.worker_role == "execution"
+
       sanitized = error_code ? ErrorCodes.sanitize(error_code) : nil
       AiConnection.transaction do
         # First insert with ON CONFLICT DO NOTHING. insert_all skips
@@ -324,12 +332,13 @@ module AiAuth
       end
     end
 
-    # Worker ops results use coordination for control role and execution for
-    # execution role (valid Envelope layers; web intents use interaction).
+    # Worker auth results always use the execution layer (valid Envelope
+    # layer; web intents use interaction). The shared execution worker
+    # serves all three business layers from one login.
     def emit(session, status)
       return unless session
 
-      layer = session.worker_role == "execution" ? "execution" : "coordination"
+      layer = "execution"
       @event_sink.emit(
         layer: layer, kind: "auth.#{status}", message: "認証操作が#{status}になりました",
         data: { provider: session.provider, worker_role: session.worker_role,

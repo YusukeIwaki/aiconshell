@@ -26,9 +26,11 @@ test("policy index aligns operation column for saved and unset rows") do |http:|
       expect(width).to eq(7)
     end
 
-    coord_row = rows.find { |r| r.include?("coordination") }
-    interaction_row = rows.find { |r| r.include?("interaction") }
-    execution_row = rows.find { |r| r.include?("execution") }
+    # Locate rows by the layer slug cell: every saved row now renders an
+    # "execution worker" badge, so a bare "execution" substring is ambiguous.
+    coord_row = rows.find { |r| r.include?("（coordination）") }
+    interaction_row = rows.find { |r| r.include?("（interaction）") }
+    execution_row = rows.find { |r| r.include?("（execution）") }
     expect(coord_row.nil?).to eq(false)
     expect(interaction_row.nil?).to eq(false)
     expect(execution_row.nil?).to eq(false)
@@ -65,10 +67,10 @@ test("recheck accepts saved provider and lands on connections without claiming c
     location = http.last_response.headers["Location"]
     expect(location.include?("/admin/ai_connections")).to eq(true)
 
-    session = AiAuthSession.active.find_by(provider: "codex", worker_role: "control")
+    session = AiAuthSession.active.find_by(provider: "codex", worker_role: "execution")
     expect(session.nil?).to eq(false)
     expect(session.operation).to eq("status_check")
-    expect(SolidQueue::Job.where(class_name: "AiAuthJob", queue_name: "ai_auth_control").count).to eq(1)
+    expect(SolidQueue::Job.where(class_name: "AiAuthJob", queue_name: "ai_auth_execution").count).to eq(1)
 
     # Saved policy and business records are untouched; no snapshot is written at accept time.
     expect(policy.reload.attributes.slice("layer", "provider", "model", "effort", "instructions", "enabled")).to eq(before_policy)
@@ -100,14 +102,14 @@ end
 
 test("disabled and disconnected policies can still be rechecked") do |http:|
   LayerPolicy.create!(layer: "interaction", provider: "claude", enabled: false)
-  AiConnection.create!(provider: "claude", worker_role: "control",
+  AiConnection.create!(provider: "claude", worker_role: "execution",
                        state: "disconnected", checked_at: Time.current)
 
   AdminTestSupport.as_admin(http) do
     http.post "/admin/layer_policies/interaction/connection_check"
     expect(http.last_response.status).to eq(302)
 
-    session = AiAuthSession.active.find_by(provider: "claude", worker_role: "control")
+    session = AiAuthSession.active.find_by(provider: "claude", worker_role: "execution")
     expect(session.nil?).to eq(false)
     expect(session.operation).to eq("status_check")
     expect(LayerPolicy.find_by(layer: "interaction").enabled).to eq(false)
@@ -146,7 +148,7 @@ test("extra provider params cannot retarget the saved setting") do |http:|
       { provider: "muse", worker_role: "execution", layer_policy: { provider: "muse" } }
     expect(http.last_response.status).to eq(302)
 
-    expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "control").nil?).to eq(false)
+    expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "execution").nil?).to eq(false)
     expect(AiAuthSession.find_by(provider: "muse")).to eq(nil)
 
     http.post "/admin/layer_policies/coordination/connection_check", { provider: "gpt" }
@@ -160,7 +162,7 @@ test("rapid recheck reuses the active session and reports progress consistently"
 
   AdminTestSupport.as_admin(http) do
     http.post "/admin/layer_policies/coordination/connection_check"
-    first = AiAuthSession.active.find_by(provider: "codex", worker_role: "control")
+    first = AiAuthSession.active.find_by(provider: "codex", worker_role: "execution")
     expect(first.nil?).to eq(false)
     http.follow_redirect!
     first_notice = http.last_response.body[/<p class="admin-flash admin-flash-notice">(.*?)<\/p>/m, 1].to_s
@@ -168,9 +170,9 @@ test("rapid recheck reuses the active session and reports progress consistently"
 
     http.post "/admin/layer_policies/coordination/connection_check"
     expect(http.last_response.status).to eq(302)
-    expect(AiAuthSession.active.where(provider: "codex", worker_role: "control").count).to eq(1)
+    expect(AiAuthSession.active.where(provider: "codex", worker_role: "execution").count).to eq(1)
     expect(SolidQueue::Job.where(class_name: "AiAuthJob").count).to eq(1)
-    expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "control").uuid).to eq(first.uuid)
+    expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "execution").uuid).to eq(first.uuid)
 
     http.follow_redirect!
     second_notice = http.last_response.body[/<p class="admin-flash admin-flash-notice">(.*?)<\/p>/m, 1].to_s
@@ -183,7 +185,7 @@ test("in-progress login for the same provider is kept and reported as login") do
   LayerPolicy.create!(layer: "coordination", provider: "claude", enabled: true)
   # Fresh queued login (created within seconds) shares the provider/role slot.
   login = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    .request_login(provider: "claude", worker_role: "control")
+    .request_login(provider: "claude", worker_role: "execution")
   expect(login.operation).to eq("login")
   expect(login.status).to eq("queued")
 
@@ -191,8 +193,8 @@ test("in-progress login for the same provider is kept and reported as login") do
     http.post "/admin/layer_policies/coordination/connection_check"
     expect(http.last_response.status).to eq(302)
 
-    expect(AiAuthSession.active.where(provider: "claude", worker_role: "control").count).to eq(1)
-    kept = AiAuthSession.active.find_by(provider: "claude", worker_role: "control")
+    expect(AiAuthSession.active.where(provider: "claude", worker_role: "execution").count).to eq(1)
+    kept = AiAuthSession.active.find_by(provider: "claude", worker_role: "execution")
     expect(kept.uuid).to eq(login.uuid)
     expect(kept.operation).to eq("login")
     expect(SolidQueue::Job.where(class_name: "AiAuthJob").count).to eq(1)
@@ -240,7 +242,7 @@ test("CSRF: recheck POST with form token succeeds") do |http:|
 
       http.post "/admin/layer_policies/coordination/connection_check", { authenticity_token: token }
       expect(http.last_response.status).to eq(302)
-      expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "control").nil?).to eq(false)
+      expect(AiAuthSession.active.find_by(provider: "codex", worker_role: "execution").nil?).to eq(false)
     end
   end
 end

@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
 # Auth-queue job for one AI connection session. Enqueued by the ops request
-# service onto ai_auth_control or ai_auth_execution; the matching worker pool
-# runs it. Claim fencing makes redelivery safe, so retries never double-run.
+# service onto ai_auth_execution; the execution worker pool runs it.
+# Legacy ai_auth_control jobs are discarded by
+# RequestService#revoke_legacy_control!, never executed. Claim fencing
+# makes redelivery safe, so retries never double-run.
 class AiAuthJob < ApplicationJob
-  queue_as :ai_auth_control
+  queue_as :ai_auth_execution
 
   retry_on StandardError, wait: :polynomially_longer, attempts: 2
 

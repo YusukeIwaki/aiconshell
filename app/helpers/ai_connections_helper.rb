@@ -12,9 +12,11 @@ module AiConnectionsHelper
     "execution" => "execution worker"
   }.freeze
 
+  # Single-worker contract (issue 20): every layer uses the shared
+  # execution worker. The control label stays only for legacy records.
   LAYER_ROLE_ROWS = [
-    ["対話層", "interaction", "control"],
-    ["整理層", "coordination", "control"],
+    ["対話層", "interaction", "execution"],
+    ["整理層", "coordination", "execution"],
     ["実行層", "execution", "execution"]
   ].freeze
 

@@ -19,7 +19,7 @@ def other_pg_connection
   )
 end
 
-def with_committed_session(provider: "claude", role: "control", operation: "login")
+def with_committed_session(provider: "claude", role: "execution", operation: "login")
   service = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
   session = operation == "login" ?
     service.request_login(provider: provider, worker_role: role) :
@@ -38,7 +38,7 @@ ensure
 end
 
 test("cancel from another connection is observed despite query cache") do
-  with_worker_role("control") do
+  with_worker_role("execution") do
     with_committed_session do |session|
       token = SecureRandom.uuid
       session.update_columns(status: "running", claim_token: token,
@@ -73,7 +73,7 @@ test("cancel from another connection is observed despite query cache") do
 end
 
 test("code input from another connection is consumed exactly once") do
-  with_worker_role("control") do
+  with_worker_role("execution") do
     with_committed_session do |session|
       token = SecureRandom.uuid
       challenge = AiAuth::SecretBox.default.encrypt(

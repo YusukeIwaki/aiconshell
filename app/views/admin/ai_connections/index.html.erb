@@ -41,11 +41,11 @@
   <% end %>
 <% end %>
 <h1>AIアカウント連携</h1>
-<p>Claude / Codex / Muse Code のサブスクリプションログインを、worker別に開始・確認します。control と execution は別の永続volumeを使うため、それぞれでログインが必要です。一方へのログインで他方が使えるようにはなりません。</p>
+<p>Claude / Codex / Muse Code のサブスクリプションログインを、共通の execution worker で開始・確認します。1回の provider ログインを対話層・整理層・実行層の全てで使います。</p>
 
 <div class="admin-card">
   <h2 style="margin-top:0">層とworkerの対応</h2>
-  <p>AIポリシーで選んだ provider は未連携でも保存でき、実行時に結果が分かります。どのworkerにログインが必要かは、使う層で決まります。</p>
+  <p>AIポリシーで選んだ provider は未連携でも保存でき、実行時に結果が分かります。全ての層が共通の execution worker を使うため、使う層によらず同じログインで足ります。</p>
   <div class="admin-table-wrap">
     <table class="admin-table">
       <tr><th>層</th><th>使うworker</th></tr>

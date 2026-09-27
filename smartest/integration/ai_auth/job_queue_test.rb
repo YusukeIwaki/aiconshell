@@ -3,13 +3,13 @@
 require "db_helper"
 require_relative "ai_auth_test_support"
 
-test("auth jobs land on the role queue and perform like a worker") do |db:|
+test("auth jobs land on ai_auth_execution and perform like a worker") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_worker_role("control") do
+  with_worker_role("execution") do
     service = AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
-    session = service.request_login(provider: "claude", worker_role: "control")
+    session = service.request_login(provider: "claude", worker_role: "execution")
 
-    record = SolidQueue::Job.find_by(class_name: "AiAuthJob", queue_name: "ai_auth_control")
+    record = SolidQueue::Job.find_by(class_name: "AiAuthJob", queue_name: "ai_auth_execution")
     expect(record.nil?).to eq(false)
     expect(record.arguments["arguments"].first).to eq(session.uuid)
 
@@ -19,7 +19,7 @@ test("auth jobs land on the role queue and perform like a worker") do |db:|
     end
 
     expect(session.reload.status).to eq("succeeded")
-    expect(AiConnection.find_by(provider: "claude", worker_role: "control").state).to eq("connected")
+    expect(AiConnection.find_by(provider: "claude", worker_role: "execution").state).to eq("connected")
   end
 end
 
