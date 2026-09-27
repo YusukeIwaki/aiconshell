@@ -6,6 +6,7 @@
     <%= csrf_meta_tags %>
     <%= csp_meta_tag %>
     <%= stylesheet_link_tag "admin" %>
+    <%= yield :head %>
   </head>
 
   <body>
@@ -31,7 +32,7 @@
     </main>
 
     <footer class="admin-footer">
-      <p>操作用設定のみ表示します。秘密情報（APIキー・認証内容）は表示しません。</p>
+      <p>操作用設定のみ表示します。長期トークン・APIキーは表示しません。</p>
     </footer>
   </body>
 </html>

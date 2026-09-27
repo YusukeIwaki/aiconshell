@@ -109,8 +109,8 @@ x-ai-auth: &ai-auth
   # Private persisted auth homes (named volumes below) plus the executable
   # paths the AI lane resolves (lib/aiconshell/ai/config.rb). Only the
   # workers that run AI CLIs (control + execution) receive them; web stays
-  # AI-free, so its admin provider badges can only ever describe web-local
-  # state (see docs/deployment.md "Provider diagnosis is web-local").
+  # AI-free and displays worker-confirmed snapshots from PostgreSQL.
+  # Each role has separate auth volumes, matching Railway.
   # Muse is XDG-rooted: AICONSHELL_MUSE_HOME is the directory CONTAINING
   # the "muse" directory (auth at $AICONSHELL_MUSE_HOME/muse/auth.json).
   # There is no MUSE_CONFIG_DIR; the native CLI does not honor one.
@@ -231,9 +231,9 @@ services:
       start_period: 60s
 
   # Control plane: interaction polling, coordination dispatch, outbound and
-  # EventLog delivery, recurring scheduler. Queue `control` only. Also runs
-  # coordination AI (triage), so it takes the ai image and AI auth homes
-  # just like execution.
+  # EventLog delivery, recurring scheduler. Queues `control` plus the
+  # 1-thread `ai_auth_control` pool. Also runs coordination AI (triage), so
+  # it takes the ai image and AI auth homes just like execution.
   control:
     build:
       context: .
@@ -247,6 +247,7 @@ services:
         condition: service_healthy
     environment:
       <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *control-only, *ai-auth]
+      AICONSHELL_WORKER_ROLE: "control"
     volumes:
       - claude_auth:/private/claude
       - codex_auth:/private/codex
@@ -254,7 +255,8 @@ services:
       - ai_workspaces:/workspaces
     command: ["./bin/jobs", "--config-file=config/queue_control.yml"]
 
-  # Execution plane: AI CLI subprocess runs on queue `execution` only.
+  # Execution plane: AI CLI subprocess runs on queue `execution` plus the
+  # 1-thread `ai_auth_execution` pool.
   # Receives the database, workflow settings, the EventLog channel default
   # (a non-credential `channel:<team>/<channel>` name, blank by default),
   # AI auth homes, and the workspaces volume — and NOTHING ELSE: no
@@ -273,10 +275,11 @@ services:
         condition: service_healthy
     environment:
       <<: [*app-database, *workflow, *event-log, *ai-auth]
+      AICONSHELL_WORKER_ROLE: "execution"
     volumes:
-      - claude_auth:/private/claude
-      - codex_auth:/private/codex
-      - muse_auth:/private/muse
+      - execution_claude_auth:/private/claude
+      - execution_codex_auth:/private/codex
+      - execution_muse_auth:/private/muse
       - ai_workspaces:/workspaces
     command: ["./bin/jobs", "--config-file=config/queue_execution.yml", "--skip-recurring"]
 
@@ -302,6 +305,10 @@ volumes:
   claude_auth:
   codex_auth:
   muse_auth:
+  # Execution has its own logins; original names stay with control.
+  execution_claude_auth:
+  execution_codex_auth:
+  execution_muse_auth:
   # AI execution workspaces (AICONSHELL_EXECUTION_ROOT=/workspaces).
   # Persisted and writable by uid 1000 so control/execution can create
   # per-run directories outside the application source.

@@ -12,4 +12,14 @@ namespace :admin do
   resources :plugins, only: %i[index]
   resources :event_logs, only: %i[index]
   resources :task_requests, only: %i[new create show]
+  resources :ai_connections, only: %i[index] do
+    collection do
+      post :login
+      post :status_check
+    end
+    member do
+      post :code
+      post :cancel
+    end
+  end
 end

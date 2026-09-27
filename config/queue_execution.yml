@@ -1,10 +1,13 @@
 # Solid Queue supervisor config for the EXECUTION worker (compose
 # `execution` service, Railway execution service).
 #
-# Runs workers bound to the `execution` queue only: AI CLI subprocess runs in
-# isolated workspaces. The supervisor must ALSO be started with
-# `--skip-recurring` (see compose.yml / docs/deployment.md) so the recurring
-# scheduler runs solely on the control worker.
+# Runs workers bound to the `execution` queue (AI CLI subprocess runs in
+# isolated workspaces) plus a separate 1-thread pool for the
+# `ai_auth_execution` queue (AI account login/status). The auth pool keeps a
+# long login wait from occupying normal execution work. The supervisor must
+# ALSO be started with `--skip-recurring` (see compose.yml /
+# docs/deployment.md) so the recurring scheduler runs solely on the control
+# worker.
 #
 # Flat (no per-env keys): see config/queue_control.yml for why.
 dispatchers:
@@ -13,5 +16,9 @@ dispatchers:
 workers:
   - queues: execution
     threads: 3
+    processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+    polling_interval: 1
+  - queues: ai_auth_execution
+    threads: 1
     processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
     polling_interval: 1

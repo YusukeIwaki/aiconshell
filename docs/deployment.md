@@ -9,8 +9,8 @@ worker / PostgreSQL / ClickHouse）を使うための手順書。全体設計は
 | サービス | 役割 | キュー | 環境変数 |
 | --- | --- | --- | --- |
 | `web` | 管理画面 | — | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報 |
-| `control` | ポーリング・振分・配信・定期実行・coordination AI | `control` のみ | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報・自アクタ・AI auth |
-| `execution` | AI CLI 実行（隔離 workspace） | `execution` のみ | DB・ワークフロー設定・EventLog 既定チャネル・AI auth のみ |
+| `control` | ポーリング・振分・配信・定期実行・coordination AI | `control` + 別1スレッド `ai_auth_control` | DB・ワークフロー設定・EventLog 既定チャネル・ClickHouse・連携資格情報・自アクタ・AI auth・`AICONSHELL_WORKER_ROLE=control` |
+| `execution` | AI CLI 実行（隔離 workspace） | `execution` + 別1スレッド `ai_auth_execution` | DB・ワークフロー設定・EventLog 既定チャネル・AI auth のみ・`AICONSHELL_WORKER_ROLE=execution` |
 | `migrate` | SQL マイグレーション専用（使い捨て） | — | DB・ワークフロー設定・EventLog 既定チャネル |
 | `clickhouse-init` | ClickHouse スキーマ適用（使い捨て・独立） | — | ClickHouse のみ |
 | `db` | PostgreSQL 17（Solid Queue 同居） | — | — |
@@ -192,11 +192,11 @@ EXECUTION_TARGET=app
 
 認証ホーム（AI 層 `Config` と同一契約）:
 
-| provider | コンテナ内 env | マウント先 volume |
-| --- | --- | --- |
-| claude | `CLAUDE_CONFIG_DIR=/private/claude` | `claude_auth` |
-| codex | `CODEX_HOME=/private/codex` | `codex_auth` |
-| muse | `AICONSHELL_MUSE_HOME=/private/muse`（XDG home） | `muse_auth` |
+| provider | コンテナ内 env | control volume | execution volume |
+| --- | --- | --- | --- |
+| claude | `CLAUDE_CONFIG_DIR=/private/claude` | `claude_auth` | `execution_claude_auth` |
+| codex | `CODEX_HOME=/private/codex` | `codex_auth` | `execution_codex_auth` |
+| muse | `AICONSHELL_MUSE_HOME=/private/muse`（XDG home） | `muse_auth` | `execution_muse_auth` |
 
 muse は XDG 基準: `AICONSHELL_MUSE_HOME` は `muse` ディレクトリを**含む**
 ディレクトリを指し、認証は `/private/muse/muse/auth.json` に置かれる。
@@ -205,15 +205,17 @@ muse は XDG 基準: `AICONSHELL_MUSE_HOME` は `muse` ディレクトリを**�
 （`ChildEnv` の契約）。
 
 volume は uid 1000（`rails`）で書けるよう image 側で用意済み。通常の
-CLI トークン更新が volume に永続化される。サブスクリプションのログイン
-自体は運営者作業（worker コンテナに入り、各 CLI の公式ログインフローで
-認証する。CI・テストでは一切行わない）:
+CLI トークン更新が volume に永続化される。通常は管理画面の「AI連携」から
+worker別の公式ログインを開始し、運営者がブラウザで承認する。詳細は
+[AIアカウント連携](ai-connections.md)。旧Composeから更新した場合、既存の
+認証volumeはcontrolで維持され、executionは再ログインが必要になる。
+コンテナから手動で始める場合も、対象workerを明示する:
 
 ```sh
 docker compose run --rm -it execution bash
 # claude / codex は compose の env がそのまま効く
-claude login   # または公式フロー
-codex login    # または公式フロー
+claude auth login --claudeai
+codex login --device-auth -c 'forced_login_method="chatgpt"' -c 'cli_auth_credentials_store="file"'
 # muse だけは対話シェルで XDG を明示する（アプリ経由の実行では不要）
 export XDG_CONFIG_HOME=$AICONSHELL_MUSE_HOME
 muse login     # または公式フロー

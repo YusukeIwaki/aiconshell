@@ -155,6 +155,9 @@ ruby bin/check-compose         # compose・queue・CI の静的検査
 - ClickHouse は結果整合性のため分離起動する: 障害時も web/worker は
   起動し、配信は outbox に滞留してリトライされる。スキーマ適用は
   `clickhouse-init`（compose）/ 別途 one-off（Railway）で行う。
+- AI のサブスクリプションログインは管理画面の「AI連携」から worker 別に行う
+  （[docs/ai-connections.md](docs/ai-connections.md)）。control と execution
+  は別 volume のため両方へのログインが要る。未連携 provider も選択可。
 
 ## 構成
 
