@@ -15,7 +15,7 @@ module Admin
       by_layer = LayerPolicy.where(layer: LAYERS).index_by(&:layer)
       @rows = LAYERS.map do |layer|
         policy = by_layer[layer]
-        { layer:, policy:, diagnosis: policy&.provider ? AiStatus.diagnosis(policy.provider) : nil }
+        { layer:, policy:, diagnosis: policy&.provider ? AiStatus.diagnosis(policy.provider, layer: layer) : nil }
       end
     end
 
@@ -24,7 +24,7 @@ module Admin
       return redirect_to(admin_layer_policies_path, alert: "不明な層です。") if @layer.nil?
 
       @policy = LayerPolicy.find_or_initialize_by(layer: @layer)
-      @diagnosis = @policy.provider ? AiStatus.diagnosis(@policy.provider) : nil
+      @diagnosis = @policy.provider ? AiStatus.diagnosis(@policy.provider, layer: @layer) : nil
     end
 
     def update
@@ -42,7 +42,7 @@ module Admin
       if @policy.save
         redirect_to admin_layer_policies_path, notice: "「#{@layer}」のAIポリシーを保存しました。"
       else
-        @diagnosis = AiStatus.diagnosis(@policy.provider)
+        @diagnosis = AiStatus.diagnosis(@policy.provider, layer: @layer)
         flash.now[:alert] = @policy.errors.full_messages.join(" / ")
         render :edit, status: :unprocessable_entity
       end

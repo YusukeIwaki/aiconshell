@@ -35,16 +35,31 @@ module AiAuth
     end
 
     def submit_code(session_uuid:, code:)
-      text = code.to_s.strip
+      unless code.is_a?(String)
+        raise InvalidRequest, "認証コードが不正です。"
+      end
+
+      # Leading/trailing paste whitespace (spaces, tabs, newlines) is
+      # stripped; the inner text must be a single printable line. The full
+      # text including any "#state" fragment is preserved for the worker.
+      text = code.strip
       raise InvalidRequest, "認証コードを入力してください。" if text.empty?
       raise InvalidRequest, "認証コードが長すぎます。" if text.length > MAX_CODE_CHARS
-      raise InvalidRequest, "認証コードが不正です。" if text.include?("\u0000")
+      if text.match?(/[\x00-\x1F\x7F]/)
+        raise InvalidRequest, "認証コードは1行で入力してください。改行や制御文字は使えません。"
+      end
 
       AiAuthSession.transaction do
         session = AiAuthSession.lock.find_by(uuid: session_uuid.to_s)
         raise InvalidRequest, "セッションが見つかりません。" if session.nil?
         raise InvalidRequest, "このセッションは終了しています。" unless session.active?
         raise InvalidRequest, "期限切れです。もう一度お試しください。" if session.expired_due?(now)
+        if session.cancel_requested
+          raise InvalidRequest, "キャンセルを受け付け済みです。もう一度お試しください。"
+        end
+        if session.input_submitted_at.present?
+          raise InvalidRequest, "認証コードは既に受付済みです。workerの処理をお待ちください。"
+        end
 
         challenge = session.challenge
         if challenge.nil?
@@ -54,8 +69,13 @@ module AiAuth
           raise InvalidRequest, "この手順ではコード入力は不要です。ブラウザで承認してください。"
         end
 
+        now_time = now
         ciphertext = SecretBox.default.encrypt(text)
-        session.update!(encrypted_input_code: ciphertext, input_updated_at: now)
+        session.update!(
+          encrypted_input_code: ciphertext,
+          input_updated_at: now_time,
+          input_submitted_at: now_time
+        )
         session
       end
     end
@@ -66,8 +86,19 @@ module AiAuth
         raise InvalidRequest, "セッションが見つかりません。" if session.nil?
         return session if session.terminal?
 
-        session.update!(cancel_requested: true)
-        emit(session, "auth.cancel_requested", "認証操作のキャンセルを受け付けました")
+        now_time = now
+        # Queued rows have no worker claim yet: finish them immediately so
+        # the active-slot lock is released and the next operation can start.
+        # Running/waiting rows keep their claim; the flag is observed by the
+        # worker callbacks and the final settle, and the UI hides the input
+        # immediately.
+        if session.status == "queued"
+          close_as(session, "cancelled", "cancelled", "cancelled", now_time,
+                   kind: "auth.cancelled", message: "認証操作をキャンセルしました")
+        else
+          session.update!(cancel_requested: true)
+          emit(session, "auth.cancel_requested", "認証操作のキャンセルを受け付けました")
+        end
         session
       end
     end
@@ -147,7 +178,8 @@ module AiAuth
       end
     end
 
-    def close_as(session, status, result_state, result_error, now_time)
+    def close_as(session, status, result_state, result_error, now_time,
+                 kind: "auth.expired", message: "認証操作が期限切れになりました")
       session.update!(
         status: status,
         result_state: result_state,
@@ -158,7 +190,7 @@ module AiAuth
         encrypted_input_code: nil,
         input_updated_at: nil
       )
-      emit(session, "auth.expired", "認証操作が期限切れになりました")
+      emit(session, kind, message)
     end
 
     def enqueue(session)
@@ -166,9 +198,11 @@ module AiAuth
       job.set(queue: "ai_auth_#{session.worker_role}").perform_later(session.uuid)
     end
 
+    # Web-originated ops intents use the interaction layer (valid Envelope
+    # layer; worker results use coordination/execution by role).
     def emit(session, kind, message)
       @event_sink.emit(
-        layer: "control", kind: kind, message: message,
+        layer: "interaction", kind: kind, message: message,
         data: { provider: session.provider, worker_role: session.worker_role,
                 operation: session.operation, status: session.status }
       )

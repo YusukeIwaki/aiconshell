@@ -63,6 +63,13 @@ class AiAuthSession < ApplicationRecord
     !encrypted_input_code.nil? && !encrypted_input_code.empty?
   end
 
+  # True once a code has been accepted, even after the worker consumed and
+  # cleared the ciphertext. Used to suppress double submits and to show the
+  # "received" state in the UI.
+  def input_submitted?
+    !input_submitted_at.nil?
+  end
+
   # Atomically fetch and clear the submitted auth code. Returns the String
   # once, then nil on every later call, even across job retries.
   def consume_input_code!

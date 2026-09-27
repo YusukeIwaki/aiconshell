@@ -79,4 +79,10 @@ module AiConnectionsHelper
   def ai_layer_role_rows
     LAYER_ROLE_ROWS
   end
+
+  # Short safe label for the verified auth URL; the long secret query stays
+  # in href only and never becomes the visible link text.
+  def ai_verification_link_label(provider)
+    "#{ai_provider_label(provider)}公式認証画面を開く"
+  end
 end

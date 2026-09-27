@@ -1,12 +1,28 @@
 # frozen_string_literal: true
 
 module AiAuth
-  # Safe fixed error classification and Japanese presentation. The runtime
-  # only returns allowlisted codes; anything else is collapsed to a generic
-  # failure so raw CLI text can never reach the database or the UI.
+  # Safe fixed error classification and Japanese presentation. Only the
+  # explicit allowlist below is ever persisted; anything else (including
+  # safe-looking lowercase strings) collapses to provider_error so raw CLI
+  # text and future codes can never reach the database, the UI, or EventLog.
   module ErrorCodes
     SNAPSHOT_STATES = %w[unknown connected disconnected unavailable failed].freeze
     RUNTIME_STATES = %w[connected disconnected unavailable failed cancelled expired].freeze
+
+    # Fixed runtime vocabulary (Issue #16 contract). Unknown runtime codes
+    # are not persisted; they collapse to provider_error.
+    RUNTIME_ERROR_CODES = %w[
+      invalid_provider invalid_argument spawn_failed timeout unexpected_output
+      output_capped challenge_rejected auth_rejected callback_failed
+      input_failed cancel_check_failed interrupted unknown
+    ].freeze
+
+    # UI/ops-specific fixed codes for worker management itself.
+    UI_ERROR_CODES = %w[
+      cancelled expired role_mismatch runtime_unavailable provider_error
+    ].freeze
+
+    ALLOWED_CODES = (RUNTIME_ERROR_CODES + UI_ERROR_CODES).freeze
 
     JAPANESE_STATE = {
       "unknown" => "未確認",
@@ -19,21 +35,23 @@ module AiAuth
     }.freeze
 
     JAPANESE_CODE = {
-      "cli_missing" => "CLIまたは認証場所が見つかりません。workerのイメージとvolumeを確認してください。",
-      "auth_required" => "ログインが必要です。連携開始からログインしてください。",
-      "auth_expired" => "認証の有効期限が切れました。再度ログインしてください。",
-      "auth_denied" => "認証が拒否されました。承認操作を確認してもう一度お試しください。",
+      "invalid_provider" => "プロバイダーが不正です。もう一度お試しください。",
+      "invalid_argument" => "要求が不正です。もう一度お試しください。",
+      "spawn_failed" => "認証プロセスの起動に失敗しました。workerの状態を確認してください。",
       "timeout" => "処理がタイムアウトしました。もう一度お試しください。",
+      "unexpected_output" => "認証処理で想定外の応答がありました。もう一度お試しください。",
+      "output_capped" => "認証処理の出力が大きすぎます。もう一度お試しください。",
+      "challenge_rejected" => "認証案内の検証に失敗しました。もう一度お試しください。",
+      "auth_rejected" => "認証が拒否されました。承認操作を確認してもう一度お試しください。",
+      "callback_failed" => "認証処理中にエラーが発生しました。もう一度お試しください。",
+      "input_failed" => "コードの受け渡しに失敗しました。もう一度お試しください。",
+      "cancel_check_failed" => "取消確認に失敗しました。もう一度お試しください。",
+      "interrupted" => "処理が中断されました。もう一度お試しください。",
+      "unknown" => "認証処理で不明なエラーが発生しました。もう一度お試しください。",
       "cancelled" => "キャンセルされました。",
       "expired" => "期限切れです。もう一度お試しください。",
       "role_mismatch" => "workerの役割が一致しません。queue設定を確認してください。",
-      "invalid_request" => "要求が不正です。もう一度お試しください。",
-      "invalid_challenge" => "認証案内の検証に失敗しました。もう一度お試しください。",
-      "callback_failed" => "認証処理中にエラーが発生しました。もう一度お試しください。",
       "runtime_unavailable" => "認証ランタイムが利用できません。workerのデプロイを確認してください。",
-      "unavailable" => "一時的に利用できません。もう一度お試しください。",
-      "usage_limit" => "利用上限に達しました。しばらく待ってから再試行してください。",
-      "not_configured" => "workerの準備ができていません。設定を確認してください。",
       "provider_error" => "認証処理でエラーが発生しました。もう一度お試しください。"
     }.freeze
 
@@ -46,7 +64,7 @@ module AiAuth
       return nil if code == ""
 
       text = code.to_s
-      return text if text.match?(/\A[a-z0-9_]{1,64}\z/)
+      return text if ALLOWED_CODES.include?(text)
 
       GENERIC_CODE
     end

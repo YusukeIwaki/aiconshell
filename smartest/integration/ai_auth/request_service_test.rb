@@ -103,16 +103,44 @@ test("login enqueues the role queue, status enqueues the role queue") do |db:|
   expect(execution_job.arguments["arguments"].first).to eq(status_session.uuid)
 end
 
-test("cancel flags an active session and is idempotent on terminal rows") do |db:|
+test("cancel finishes queued rows immediately and frees the slot") do |db:|
   expect(db.transaction_open?).to eq(true)
   service = request_service
 
   session = service.request_login(provider: "claude", worker_role: "control")
+  session.update_columns(
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt({ "verification_uri" => "https://example.invalid/q" }),
+    updated_at: Time.current
+  )
   service.cancel(session_uuid: session.uuid)
-  expect(session.reload.cancel_requested).to eq(true)
-  expect(session.status).to eq("queued")
 
-  session.update!(status: "succeeded", finished_at: Time.current)
+  reloaded = session.reload
+  expect(reloaded.status).to eq("cancelled")
+  expect(reloaded.result_state).to eq("cancelled")
+  expect(reloaded.encrypted_challenge).to eq(nil)
+  expect(reloaded.encrypted_input_code).to eq(nil)
+
+  # The active-slot lock is released: the next operation starts fresh.
+  fresh = service.request_login(provider: "claude", worker_role: "control")
+  expect(fresh.uuid == session.uuid).to eq(false)
+  expect(fresh.status).to eq("queued")
+end
+
+test("cancel flags running rows and is idempotent on terminal rows") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  service = request_service
+
+  session = service.request_login(provider: "claude", worker_role: "control")
+  session.update_columns(status: "running", claim_token: SecureRandom.uuid,
+                         claimed_at: Time.current, heartbeat_at: Time.current,
+                         updated_at: Time.current)
+  service.cancel(session_uuid: session.uuid)
+
+  reloaded = session.reload
+  expect(reloaded.cancel_requested).to eq(true)
+  expect(reloaded.status).to eq("running")
+
+  reloaded.update!(status: "succeeded", finished_at: Time.current)
   again = service.cancel(session_uuid: session.uuid)
   expect(again.status).to eq("succeeded")
 end
@@ -169,14 +197,124 @@ test("code submit stores ciphertext only and rejects bad input") do |db:|
   service.submit_code(session_uuid: session.uuid, code: "  secret-code-123 ")
   reloaded = session.reload
   expect(reloaded.input_code_present?).to eq(true)
+  expect(reloaded.input_submitted_at.nil?).to eq(false)
   expect(reloaded.encrypted_input_code.include?("secret-code-123")).to eq(false)
   expect(reloaded.challenge["input_required"]).to eq(true)
+  # Decrypts to the stripped single line.
+  expect(AiAuth::SecretBox.default.decrypt(reloaded.encrypted_input_code)).to eq("secret-code-123")
 
+  empty_session = service.request_login(provider: "claude", worker_role: "execution")
+  empty_session.update_columns(
+    status: "waiting",
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://example.invalid/auth", "user_code" => nil, "input_required" => true }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
   begin
-    service.submit_code(session_uuid: session.uuid, code: "   ")
+    service.submit_code(session_uuid: empty_session.uuid, code: "   ")
     raise "expected InvalidRequest"
   rescue AiAuth::RequestService::InvalidRequest
     nil
+  end
+end
+
+test("code submit keeps #state, rejects multiline/control/non-string") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  service = request_service
+
+  session = service.request_login(provider: "claude", worker_role: "control")
+  session.update_columns(
+    status: "waiting",
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://claude.ai/oauth/test", "user_code" => nil, "input_required" => true }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
+
+  service.submit_code(session_uuid: session.uuid, code: "  authcode123#state456  ")
+  stored = AiAuth::SecretBox.default.decrypt(session.reload.encrypted_input_code)
+  expect(stored).to eq("authcode123#state456")
+
+  bad_session = service.request_login(provider: "codex", worker_role: "control")
+  bad_session.update_columns(
+    status: "waiting",
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://example.invalid/auth", "user_code" => nil, "input_required" => true }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
+  ["line1\nline2", "a\rb", "a\x00b", "a\x01b", "a\x7Fb"].each do |bad|
+    begin
+      service.submit_code(session_uuid: bad_session.uuid, code: bad)
+      raise "expected InvalidRequest for #{bad.inspect}"
+    rescue AiAuth::RequestService::InvalidRequest => e
+      expect(e.message.include?("1行")).to eq(true)
+    end
+  end
+  [nil, 123, { "code" => "x" }].each do |bad|
+    begin
+      service.submit_code(session_uuid: bad_session.uuid, code: bad)
+      raise "expected InvalidRequest for #{bad.inspect}"
+    rescue AiAuth::RequestService::InvalidRequest
+      nil
+    end
+  end
+  expect(bad_session.reload.input_code_present?).to eq(false)
+end
+
+test("code submit rejects double POST after receipt") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  service = request_service
+
+  session = service.request_login(provider: "claude", worker_role: "control")
+  session.update_columns(
+    status: "waiting",
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://example.invalid/auth", "user_code" => nil, "input_required" => true }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
+
+  service.submit_code(session_uuid: session.uuid, code: "first-code-1")
+  expect(session.reload.input_submitted_at.nil?).to eq(false)
+
+  begin
+    service.submit_code(session_uuid: session.uuid, code: "second-code-2")
+    raise "expected InvalidRequest"
+  rescue AiAuth::RequestService::InvalidRequest => e
+    expect(e.message.include?("受付済み")).to eq(true)
+  end
+  # First code is preserved, not overwritten.
+  expect(AiAuth::SecretBox.default.decrypt(session.reload.encrypted_input_code)).to eq("first-code-1")
+end
+
+test("code submit is rejected after cancel is requested") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  service = request_service
+
+  session = service.request_login(provider: "claude", worker_role: "control")
+  session.update_columns(
+    status: "waiting",
+    claim_token: SecureRandom.uuid,
+    encrypted_challenge: AiAuth::SecretBox.default.encrypt(
+      { "verification_uri" => "https://example.invalid/auth", "user_code" => nil, "input_required" => true }
+    ),
+    challenge_updated_at: Time.current,
+    updated_at: Time.current
+  )
+  service.cancel(session_uuid: session.uuid)
+  expect(session.reload.cancel_requested).to eq(true)
+
+  begin
+    service.submit_code(session_uuid: session.uuid, code: "late-code-1")
+    raise "expected InvalidRequest"
+  rescue AiAuth::RequestService::InvalidRequest => e
+    expect(e.message.include?("キャンセル")).to eq(true)
   end
 end
 

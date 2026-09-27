@@ -326,3 +326,161 @@ test("heartbeat writes are throttled to one per 10 seconds") do |db:|
     expect(session.reload.heartbeat_at.to_i).to eq((base + 11).to_i)
   end
 end
+
+test("settle converts stale connected to cancelled when cancel lands just before write") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_login(provider: "claude", role: "control")
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
+        # Simulate a cancel arriving after the runtime produced connected
+        # but before the final write: flag the row, then report connected.
+        AiAuthSession.where(id: session.id).update_all(cancel_requested: true, updated_at: Time.current)
+        { "state" => "connected", "error_code" => nil }
+      end
+    )
+
+    result = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
+
+    expect(result.ok).to eq(false)
+    expect(result.code).to eq(:cancelled)
+    reloaded = session.reload
+    expect(reloaded.status).to eq("cancelled")
+    expect(reloaded.result_state).to eq("cancelled")
+    expect(reloaded.encrypted_challenge).to eq(nil)
+    expect(reloaded.encrypted_input_code).to eq(nil)
+    expect(AiConnection.find_by(provider: "claude", worker_role: "control")).to eq(nil)
+  end
+end
+
+test("settle converts stale connected to expired when deadline lands just before write") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_login(provider: "codex", role: "control")
+    base = Time.current
+    fake_clock = Class.new do
+      attr_accessor :now_time
+      def current = now_time
+      def now = now_time
+    end.new
+    fake_clock.now_time = base
+
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
+        # Advance the clock past the deadline before the final write.
+        fake_clock.now_time = base + AiAuth::RequestService::LOGIN_TIMEOUT_SECONDS + 5
+        { "state" => "connected", "error_code" => nil }
+      end
+    )
+    service = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new, clock: fake_clock)
+
+    result = service.call(session.uuid)
+
+    expect(result.code).to eq(:expired)
+    reloaded = session.reload
+    expect(reloaded.status).to eq("expired")
+    expect(reloaded.encrypted_challenge).to eq(nil)
+    expect(AiConnection.find_by(provider: "codex", worker_role: "control")).to eq(nil)
+  end
+end
+
+test("unknown error codes collapse to provider_error and never persist raw text") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_status(provider: "muse", role: "control")
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "muse" => { "state" => "failed", "error_code" => "secret_sentinel_abc" } }
+    )
+
+    result = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
+
+    expect(result.ok).to eq(true)
+    reloaded = session.reload
+    expect(reloaded.result_error_code).to eq("provider_error")
+    snapshot = AiConnection.find_by(provider: "muse", worker_role: "control")
+    expect(snapshot.error_code).to eq("provider_error")
+    expect(snapshot.error_code.include?("sentinel")).to eq(false)
+  end
+end
+
+test("input consume keeps submitted stamp while clearing ciphertext once") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_login(provider: "claude", role: "control")
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      login_behavior: lambda do |provider:, timeout:, on_challenge:, input:, cancelled:|
+        on_challenge.call({
+          "verification_uri" => "https://claude.ai/oauth/authorize?code=stamp-test",
+          "user_code" => nil,
+          "input_required" => true
+        })
+        AiAuth::RequestService.new(event_sink: WorkflowFakes::FakeEventSink.new)
+          .submit_code(session_uuid: session.uuid, code: "code-with#state-keep")
+        first = input.call
+        stamp_after_first = session.reload.input_submitted_at
+        second = input.call
+        expect(first).to eq("code-with#state-keep")
+        expect(second).to eq(nil)
+        expect(stamp_after_first.nil?).to eq(false)
+        expect(session.reload.input_submitted_at.nil?).to eq(false)
+        expect(session.reload.encrypted_input_code).to eq(nil)
+        { "state" => "connected", "error_code" => nil }
+      end
+    )
+
+    result = AiAuth::WorkerService.new(runner: runner, event_sink: WorkflowFakes::FakeEventSink.new).call(session.uuid)
+
+    expect(result.ok).to eq(true)
+    expect(session.reload.input_submitted_at.nil?).to eq(false)
+    expect(session.reload.encrypted_input_code).to eq(nil)
+  end
+end
+
+test("snapshot fencing refuses an old write after a newer result") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    first = request_status(provider: "codex", role: "control")
+    connected = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "codex" => { "state" => "connected", "error_code" => nil } }
+    )
+    expect(AiAuth::WorkerService.new(runner: connected, event_sink: WorkflowFakes::FakeEventSink.new).call(first.uuid).ok).to eq(true)
+
+    second = request_status(provider: "codex", role: "control")
+    failing = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "codex" => { "state" => "failed", "error_code" => "spawn_failed" } }
+    )
+    expect(AiAuth::WorkerService.new(runner: failing, event_sink: WorkflowFakes::FakeEventSink.new).call(second.uuid).ok).to eq(true)
+    snapshot = AiConnection.find_by(provider: "codex", worker_role: "control")
+    expect(snapshot.state).to eq("failed")
+    expect(snapshot.last_session_id).to eq(second.id)
+
+    # A delayed write from the older session must not overwrite.
+    service = AiAuth::WorkerService.new(runner: connected, event_sink: WorkflowFakes::FakeEventSink.new)
+    service.send(:update_snapshot, first.reload, "connected", nil, Time.current)
+    after = AiConnection.find_by(provider: "codex", worker_role: "control")
+    expect(after.state).to eq("failed")
+    expect(after.last_session_id).to eq(second.id)
+  end
+end
+
+test("worker emits use coordination for control and execution for execution") do |db:|
+  expect(db.transaction_open?).to eq(true)
+  with_worker_role("control") do
+    session = request_status(provider: "claude", role: "control")
+    sink = WorkflowFakes::FakeEventSink.new
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "claude" => { "state" => "connected", "error_code" => nil } }
+    )
+    AiAuth::WorkerService.new(runner: runner, event_sink: sink).call(session.uuid)
+    expect(sink.events.last[:layer]).to eq("coordination")
+  end
+  with_worker_role("execution") do
+    session = request_status(provider: "claude", role: "execution")
+    sink = WorkflowFakes::FakeEventSink.new
+    runner = AiAuthTestSupport::FakeAuthRunner.new(
+      status_results: { "claude" => { "state" => "connected", "error_code" => nil } }
+    )
+    AiAuth::WorkerService.new(runner: runner, event_sink: sink).call(session.uuid)
+    expect(sink.events.last[:layer]).to eq("execution")
+  end
+end

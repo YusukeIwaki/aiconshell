@@ -12,20 +12,24 @@ module Admin
       snapshots = AiConnection.where(
         provider: AiConnection::PROVIDERS, worker_role: AiConnection::WORKER_ROLES
       ).index_by { |row| [row.provider, row.worker_role] }
-      actives = AiAuthSession.active.where(
-        provider: AiConnection::PROVIDERS, worker_role: AiConnection::WORKER_ROLES
-      ).index_by { |row| [row.provider, row.worker_role] }
+      # Latest session per pair, including terminal failures/cancels/expiry,
+      # so results stay visible with retry actions after the run ends.
+      latest = {}
+      AiConnection::PROVIDERS.product(AiConnection::WORKER_ROLES).each do |provider, role|
+        latest[[provider, role]] = AiAuthSession.where(provider: provider, worker_role: role)
+          .order(id: :desc).first
+      end
       @rows = AiConnection::PROVIDERS.product(AiConnection::WORKER_ROLES).map do |provider, role|
-        session = actives[[provider, role]]
+        session = latest[[provider, role]]
         {
           provider: provider,
           worker_role: role,
           snapshot: snapshots[[provider, role]],
           session: session,
-          challenge: session&.challenge
+          challenge: session&.active? ? session.challenge : nil
         }
       end
-      @has_active = actives.any?
+      @has_active = latest.values.any? { |row| row&.active? }
     end
 
     def login

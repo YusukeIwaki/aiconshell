@@ -1,7 +1,23 @@
 <% content_for(:title, "AIアカウント連携") %>
 <% if @has_active %>
   <% content_for :head do %>
-    <meta http-equiv="refresh" content="5">
+    <script>
+      // Poll without destroying typed codes: skip reload while any auth
+      // code input is present, rescheduling until the form disappears
+      // (submitted, cancelled, or finished).
+      (function () {
+        function schedule() {
+          setTimeout(function () {
+            if (document.querySelector('input[name="auth_code"]')) {
+              schedule();
+            } else {
+              location.reload();
+            }
+          }, 5000);
+        }
+        schedule();
+      })();
+    </script>
   <% end %>
 <% end %>
 <h1>AIアカウント連携</h1>
@@ -26,7 +42,7 @@
 
 <% if @has_active %>
   <div class="admin-card">
-    <p style="margin:0">進行中の操作があります。このページは5秒ごとに自動更新されます。手動で確認する場合は <%= link_to "更新する", admin_ai_connections_path %> を押してください。</p>
+    <p style="margin:0">進行中の操作があります。このページは5秒ごとに自動更新されます（コード入力中は入力を保護するため自動更新を停止します）。手動で確認する場合は <%= link_to "更新する", admin_ai_connections_path %> を押してください。</p>
   </div>
 <% end %>
 
@@ -53,7 +69,7 @@
       <p>前回の確認結果: <%= ai_error_text(snapshot.error_code) %></p>
     <% end %>
 
-    <% if session %>
+    <% if session&.active? %>
       <div class="admin-table-wrap">
         <table class="admin-table">
           <tr><th>操作</th><th>状態</th><th>期限</th></tr>
@@ -64,38 +80,76 @@
           </tr>
         </table>
       </div>
-      <% if session.status == "queued" %>
-        <p>workerの空きを待っています。workerが停止している場合は期限までこのままになります。成功扱いにはなりません。</p>
-      <% end %>
-      <% if challenge %>
-        <p>ブラウザで次の認証ページを開き、案内に従って承認してください。</p>
-        <p><%= link_to challenge["verification_uri"], challenge["verification_uri"], target: "_blank", rel: "noopener noreferrer" %></p>
-        <% if challenge["user_code"].present? %>
-          <p>ユーザーコード: <code class="admin-env"><%= challenge["user_code"] %></code></p>
+      <% if session.cancel_requested %>
+        <p>キャンセルを受け付けました。workerの終了をお待ちください。入力欄は非表示になっています。</p>
+      <% else %>
+        <% if session.status == "queued" %>
+          <p>workerの空きを待っています。workerが停止している場合は期限までこのままになります。成功扱いにはなりません。</p>
         <% end %>
-        <% if challenge["input_required"] %>
-          <p>認証ページで表示されたコードを入力してください。コードは一度だけworkerへ渡され、保存されません。</p>
-          <%= form_with url: code_admin_ai_connection_path(session.uuid), method: :post do %>
-            <div class="admin-form-grid">
-              <label for="auth_code_<%= session.uuid %>">認証コード</label>
-              <%= text_field_tag :auth_code, "", id: "auth_code_#{session.uuid}", autocomplete: "off", maxlength: 4096 %>
-            </div>
-            <div class="admin-actions">
-              <%= submit_tag "コードを送信", class: "admin-btn" %>
-            </div>
+        <% if challenge %>
+          <p>ブラウザで次の認証ページを開き、案内に従って承認してください。</p>
+          <p><%= link_to ai_verification_link_label(row[:provider]), challenge["verification_uri"], target: "_blank", rel: "noopener noreferrer" %></p>
+          <% if challenge["user_code"].present? %>
+            <p>ユーザーコード: <code class="admin-env"><%= challenge["user_code"] %></code></p>
+          <% end %>
+          <% if challenge["input_required"] %>
+            <% if session.input_submitted_at.present? %>
+              <p>認証コードは受付済みです。workerが処理を続けています。結果が出るまでお待ちください。</p>
+            <% else %>
+              <p>認証ページで表示されたコードを入力してください。入力中は暗号化して一時保存され、workerへ一度だけ渡した後に削除されます。</p>
+              <% if row[:provider] == "claude" %>
+                <p>Claudeの認証コードは authorizationCode#state 全体を1行で入力してください。#以降を取り除かないでください。</p>
+              <% end %>
+              <%= form_with url: code_admin_ai_connection_path(session.uuid), method: :post do %>
+                <div class="admin-form-grid">
+                  <label for="auth_code_<%= session.uuid %>">認証コード</label>
+                  <%= text_field_tag :auth_code, "", id: "auth_code_#{session.uuid}", autocomplete: "off", maxlength: 4096 %>
+                </div>
+                <div class="admin-actions">
+                  <%= submit_tag "コードを送信", class: "admin-btn" %>
+                </div>
+              <% end %>
+            <% end %>
+          <% else %>
+            <p>この手順ではコード入力は不要です。ブラウザで承認が終わるまでお待ちください。</p>
           <% end %>
         <% else %>
-          <p>この手順ではコード入力は不要です。ブラウザで承認が終わるまでお待ちください。</p>
+          <% if session.operation == "login" %>
+            <p>認証案内を準備しています。表示されるまでお待ちください。</p>
+          <% else %>
+            <p>workerが公式CLIで確認しています。結果が出るまでお待ちください。</p>
+          <% end %>
         <% end %>
-      <% else %>
-        <% if session.operation == "login" %>
-          <p>認証案内を準備しています。表示されるまでお待ちください。</p>
-        <% else %>
-          <p>workerが公式CLIで確認しています。結果が出るまでお待ちください。</p>
-        <% end %>
+        <div class="admin-actions">
+          <%= button_to "キャンセル", cancel_admin_ai_connection_path(session.uuid), method: :post, class: "admin-btn" %>
+        </div>
+      <% end %>
+    <% elsif session %>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <tr><th>操作</th><th>状態</th><th>終了</th></tr>
+          <tr>
+            <td><%= ai_operation_label(session.operation) %></td>
+            <td><span class="admin-badge <%= ai_session_badge(session.status) %>"><%= ai_session_label(session.status) %></span></td>
+            <td><%= session.finished_at || session.updated_at %></td>
+          </tr>
+        </table>
+      </div>
+      <% if session.status == "succeeded" %>
+        <p>完了しました。最新の接続状態は上記の通りです。</p>
+      <% elsif session.status == "failed" %>
+        <p>失敗しました。<%= session.result_error_code.present? ? ai_error_text(session.result_error_code) : "もう一度お試しください。" %></p>
+      <% elsif session.status == "cancelled" %>
+        <p>キャンセルされました。再試行できます。</p>
+      <% elsif session.status == "expired" %>
+        <p>期限切れです。再試行できます。</p>
+      <% end %>
+      <% if snapshot.nil? && session.result_error_code.present? %>
+        <p>workerの確認結果: <%= ai_error_text(session.result_error_code) %></p>
       <% end %>
       <div class="admin-actions">
-        <%= button_to "キャンセル", cancel_admin_ai_connection_path(session.uuid), method: :post, class: "admin-btn" %>
+        <%= button_to "状態確認", status_check_admin_ai_connections_path(provider: row[:provider], worker_role: row[:worker_role]), method: :post, class: "admin-btn" %>
+        <%= button_to "連携開始", login_admin_ai_connections_path(provider: row[:provider], worker_role: row[:worker_role]), method: :post, class: "admin-btn" %>
       </div>
     <% else %>
       <div class="admin-actions">

@@ -1,10 +1,23 @@
-<%# diagnosis: Admin::AiStatus.diagnosis の戻り値、または nil %>
+<%# diagnosis: Admin::AiStatus.diagnosis の戻り値、または nil。worker確認済みスナップショットを表示する。 %>
 <% if diagnosis.nil? %>
   <span class="admin-badge admin-badge-idle">―</span>
 <% elsif diagnosis[:available] == false %>
   <span class="admin-badge admin-badge-idle">診断不可</span>
-<% elsif diagnosis[:configured] %>
-  <span class="admin-badge admin-badge-good">設定済み</span>
 <% else %>
-  <span class="admin-badge admin-badge-warn">未設定（保存可・実行時要設定）</span>
+  <% state = diagnosis[:state].to_s.presence || "unknown" %>
+  <span class="admin-badge <%= ai_state_badge(state) %>"><%= ai_state_label(state) %></span>
+  <% if diagnosis[:worker_role].present? %>
+    <span><%= ai_role_label(diagnosis[:worker_role]) %></span>
+  <% end %>
+  <% if diagnosis[:checked_at].present? %>
+    <span>（<%= diagnosis[:checked_at] %>に確認）</span>
+  <% else %>
+    <span>（未確認・保存可）</span>
+  <% end %>
+  <% if diagnosis[:error_code].present? && state != "connected" && state != "unknown" %>
+    <br><span><%= ai_error_text(diagnosis[:error_code]) %></span>
+  <% end %>
+  <% if state != "connected" && diagnosis[:checked_at].present? %>
+    <span>（保存可）</span>
+  <% end %>
 <% end %>

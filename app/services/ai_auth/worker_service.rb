@@ -25,14 +25,18 @@ module AiAuth
     end
 
     def call(session_uuid)
-      claimed = claim(session_uuid)
-      return claimed if claimed.is_a?(Result)
+      # Long-running worker: bypass the query cache entirely so cancel and
+      # code input from other web/worker connections are always observed.
+      ActiveRecord::Base.uncached do
+        claimed = claim(session_uuid)
+        return claimed if claimed.is_a?(Result)
 
-      session_id, claim_token, provider, operation, worker_role, expires_at = claimed
-      if operation == "status_check"
-        run_status(session_id, claim_token, provider, worker_role)
-      else
-        run_login(session_id, claim_token, provider, worker_role, expires_at)
+        session_id, claim_token, provider, operation, worker_role, expires_at = claimed
+        if operation == "status_check"
+          run_status(session_id, claim_token, provider, worker_role)
+        else
+          run_login(session_id, claim_token, provider, worker_role, expires_at)
+        end
       end
     end
 
@@ -194,7 +198,9 @@ module AiAuth
     def cancelled_callback(session_id, claim_token)
       lambda do
         maybe_heartbeat(session_id, claim_token)
-        row = AiAuthSession.where(id: session_id).pick(:claim_token, :cancel_requested, :expires_at, :status)
+        row = ActiveRecord::Base.uncached do
+          AiAuthSession.where(id: session_id).pick(:claim_token, :cancel_requested, :expires_at, :status)
+        end
         return true if row.nil?
         return true unless row[0] == claim_token
         return true if row[1]
@@ -224,6 +230,10 @@ module AiAuth
     def settle(session_id, claim_token, status:, result_state:, result_error:, snapshot:)
       now_time = now
       session = nil
+      effective_status = status
+      effective_state = result_state
+      effective_error = result_error
+      effective_snapshot = snapshot
       AiAuthSession.transaction do
         row = AiAuthSession.lock.find_by(id: session_id)
         unless live_claim?(row, claim_token)
@@ -233,15 +243,32 @@ module AiAuth
           return Result.new(ok: false, code: :duplicate_delivery)
         end
 
-        finalize(row, status: status, result_state: result_state,
-                 result_error: result_error, now_time: now_time)
+        # Re-verify ownership window just before the final write: a cancel
+        # or deadline that landed while the runtime was producing its
+        # outcome must win over a stale "connected". Secrets are cleared
+        # and no snapshot is written for these terminals.
+        if row.expired_due?(now_time)
+          effective_status = "expired"
+          effective_state = "expired"
+          effective_error = "expired"
+          effective_snapshot = false
+        elsif row.cancel_requested
+          effective_status = "cancelled"
+          effective_state = "cancelled"
+          effective_error = "cancelled"
+          effective_snapshot = false
+        end
+
+        finalize(row, status: effective_status, result_state: effective_state,
+                 result_error: effective_error, now_time: now_time)
         session = row
       end
-      if snapshot && session && result_state && DEFINITIVE_SNAPSHOT_STATES.include?(result_state)
-        update_snapshot(session, result_state, result_error, now_time)
+      if effective_snapshot && session && effective_state &&
+          DEFINITIVE_SNAPSHOT_STATES.include?(effective_state)
+        update_snapshot(session, effective_state, effective_error, now_time)
       end
-      emit(session, status)
-      Result.new(ok: status == "succeeded", code: status.to_sym)
+      emit(session, effective_status)
+      Result.new(ok: effective_status == "succeeded", code: effective_status.to_sym)
     end
 
     def finalize(session, status:, result_state:, result_error:, now_time:, snapshot: nil)
@@ -258,16 +285,20 @@ module AiAuth
     end
 
     # An old job must never overwrite a newer session's snapshot.
+    # last_session_id fencing keeps the newest terminal result authoritative
+    # even when an old snapshot write lands after a newer one.
     def update_snapshot(session, state, error_code, now_time)
       AiConnection.transaction do
         snapshot = AiConnection.lock.find_by(provider: session.provider, worker_role: session.worker_role)
         if snapshot.nil?
           begin
-            snapshot = AiConnection.create!(
-              provider: session.provider, worker_role: session.worker_role,
-              state: state, error_code: error_code ? ErrorCodes.sanitize(error_code) : nil,
-              checked_at: now_time, last_session_uuid: session.uuid, last_session_id: session.id
-            )
+            AiConnection.transaction(requires_new: true) do
+              snapshot = AiConnection.create!(
+                provider: session.provider, worker_role: session.worker_role,
+                state: state, error_code: error_code ? ErrorCodes.sanitize(error_code) : nil,
+                checked_at: now_time, last_session_uuid: session.uuid, last_session_id: session.id
+              )
+            end
           rescue ActiveRecord::RecordNotUnique
             snapshot = AiConnection.lock.find_by(provider: session.provider, worker_role: session.worker_role)
           end
@@ -285,11 +316,14 @@ module AiAuth
       end
     end
 
+    # Worker ops results use coordination for control role and execution for
+    # execution role (valid Envelope layers; web intents use interaction).
     def emit(session, status)
       return unless session
 
+      layer = session.worker_role == "execution" ? "execution" : "coordination"
       @event_sink.emit(
-        layer: "control", kind: "auth.#{status}", message: "認証操作が#{status}になりました",
+        layer: layer, kind: "auth.#{status}", message: "認証操作が#{status}になりました",
         data: { provider: session.provider, worker_role: session.worker_role,
                 operation: session.operation, status: status }
       )

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_09_27_030001) do
+ActiveRecord::Schema[8.0].define(version: 2026_09_27_030002) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -34,10 +34,11 @@ ActiveRecord::Schema[8.0].define(version: 2026_09_27_030001) do
     t.datetime "finished_at"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.datetime "input_submitted_at"
     t.index ["claim_token"], name: "index_ai_auth_sessions_on_claim_token", unique: true
     t.index ["expires_at"], name: "index_ai_auth_sessions_on_expires_at"
     t.index ["provider", "worker_role", "status"], name: "index_ai_auth_sessions_on_provider_role_status"
-    t.index ["provider", "worker_role"], name: "index_ai_auth_sessions_one_active_per_provider_role", unique: true, where: "((status)::text = ANY ((ARRAY['queued'::character varying, 'running'::character varying, 'waiting'::character varying])::text[]))"
+    t.index ["provider", "worker_role"], name: "index_ai_auth_sessions_one_active_per_provider_role", unique: true, where: "((status)::text = ANY (ARRAY[('queued'::character varying)::text, ('running'::character varying)::text, ('waiting'::character varying)::text]))"
     t.index ["uuid"], name: "index_ai_auth_sessions_on_uuid", unique: true
   end
 
