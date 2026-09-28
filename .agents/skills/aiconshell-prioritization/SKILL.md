@@ -1,6 +1,6 @@
 ---
 name: aiconshell-prioritization
-description: Manage the priority and order of this repository's development backlog (開発タスクの優先度管理) on GitHub Issues — labels P0–P3, dependencies and what to start next. Not for the application's own task triage/priority feature (see docs/workflow.md for that).
+description: Manage the priority and order of this repository's development backlog (開発タスクの優先度管理) on GitHub Issues — labels P1–P4, dependencies and what to start next. Not for the application's own task triage/priority feature (see docs/workflow.md for that).
 ---
 
 # aiconshell backlog prioritization
@@ -12,15 +12,14 @@ it does not change the product's Coordination priority logic.
 
 | Label | Meaning |
 | --- | --- |
-| `P0` | Broken production path, security or data-loss risk. Start now; may interrupt other lanes. |
-| `P1` | Needed for the current goal or blocks other Issues. Next to start. |
-| `P2` | Planned improvement. Start when P0/P1 lanes are free. |
-| `P3` | Nice to have or idea. May stay open without schedule. |
+| `P1` | Broken production path, security or data-loss risk. Start now; may interrupt other lanes. |
+| `P2` | Needed for the current goal or blocks other Issues. Next to start. |
+| `P3` | Planned improvement. Start when P1/P2 lanes are free. |
+| `P4` | Nice to have or idea. May stay open without schedule. |
 
 Dependencies are written in the Issue body (`依存・設計資料`) as Issue numbers; a blocked
 Issue is not started before its dependency is merged, regardless of its label.
-If the labels do not exist yet, propose creating them (`gh label create P0 …`) and create
-them only after the requester agrees.
+The labels exist on GitHub. Keep exactly one of them on each open Issue that has been triaged.
 
 ## Steps
 
