@@ -76,13 +76,23 @@ module Aiconshell
         "additionalProperties" => false
       }.freeze
 
-      # send_message input (Teams): {"scope": "...", "body": "..."}.
-      SEND_MESSAGE_INPUT = {
+      # health_check input: {} (no scope; account-wide connectivity check).
+      HEALTH_CHECK_INPUT = {
         "type" => "object",
-        "required" => %w[scope body],
+        "properties" => {},
+        "additionalProperties" => false
+      }.freeze
+
+      # health_check output: {"ok": bool, ...}. "missing" lists ungranted
+      # "<permission>:<level>" entries (GitHub); "bot_id" identifies the
+      # authenticated bot (Discord). Both are optional per plugin.
+      HEALTH_CHECK_OUTPUT = {
+        "type" => "object",
+        "required" => %w[ok],
         "properties" => {
-          "scope" => { "type" => "string", "minLength" => 1 },
-          "body" => { "type" => "string", "minLength" => 1, "maxLength" => 65_536 }
+          "ok" => { "type" => "boolean" },
+          "missing" => { "type" => "array", "items" => { "type" => "string" } },
+          "bot_id" => { "type" => "string" }
         },
         "additionalProperties" => false
       }.freeze

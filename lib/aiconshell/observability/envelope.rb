@@ -24,7 +24,7 @@ module Aiconshell
     class SinkError < Error; end
 
     # Strict event envelope. Built (and redacted) before anything is stored,
-    # so the outbox, ClickHouse, and Teams only ever see validated data.
+    # so the outbox and ClickHouse only ever see validated data.
     module Envelope
       LAYERS = %w[interaction coordination execution].freeze
       KIND_PATTERN = /\A[a-z0-9][a-z0-9_.:\-]{0,127}\z/

@@ -29,7 +29,7 @@ module Aiconshell
     end
 
     # Operation is known but explicitly unsupported by the plugin
-    # (e.g. Teams create_issue). A subclass of UnknownOperation so generic
+    # (e.g. Discord create_issue). A subclass of UnknownOperation so generic
     # handlers keep working.
     class UnsupportedOperation < UnknownOperation
       attr_reader :reason

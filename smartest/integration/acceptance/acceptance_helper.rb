@@ -165,7 +165,8 @@ module AcceptanceHelper
         # Generated inside the test process; never leaves it.
         "GITHUB_PRIVATE_KEY" => OpenSSL::PKey::RSA.new(2048).to_pem
       }
-      registry = Aiconshell::Plugins::Registry.new(env: plugin_env, transport: transport, clock: Time)
+      persist_acceptance_account!(plugin_env)
+      registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport, clock: Time)
       registry.register(Aiconshell::Plugins::Github.new)
       yield Context.new(root: root, execution_root: execution_root, bin: built[:bin],
                         claude_home: built[:claude_home], evidence_path: built[:evidence],
@@ -202,6 +203,16 @@ module AcceptanceHelper
   end
 
   private
+
+  # Real database-backed account: services resolve credentials from the
+  # database exactly as in production (the registry env is never used).
+  def persist_acceptance_account!(plugin_env)
+    account = GithubAppsAccount.current
+    account.update!(app_id: plugin_env.fetch("GITHUB_APP_ID"),
+                    installation_id: plugin_env.fetch("GITHUB_INSTALLATION_ID"))
+    account.private_key = plugin_env.fetch("GITHUB_PRIVATE_KEY")
+    account.save!
+  end
 
   # Temporary executable fake subscription CLI. It answers the three layer
   # prompts with schema-valid structured output and records program/argv/

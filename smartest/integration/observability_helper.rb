@@ -12,15 +12,13 @@ class EventLogRailsFixture < Smartest::Fixture
   fixture :observability_config do
     config = Aiconshell::Observability.config
     snapshot = { outbox: config.outbox, search_backend: config.search_backend,
-                 logger: config.logger, clock: config.clock,
-                 default_teams_channel: config.default_teams_channel }
+                 logger: config.logger, clock: config.clock }
     on_teardown do
       Aiconshell::Observability.configure do |restored|
         restored.outbox = snapshot[:outbox]
         restored.search_backend = snapshot[:search_backend]
         restored.logger = snapshot[:logger]
         restored.clock = snapshot[:clock]
-        restored.default_teams_channel = snapshot[:default_teams_channel]
       end
     end
     snapshot

@@ -3,19 +3,18 @@
 Discord 用の in-process プラグイン。Bot トークンによる認証で Discord REST
 API v10（固定 origin `https://discord.com`）を使い、許可チャネルでの Bot
 へのメンション取得と、元投稿への返信・チャネル通知を行う。
-`create_issue` は非対応とし、課題作成は GitHub / Jira プラグインで行う。
+`create_issue` は非対応とし、課題作成は GitHub プラグインで行う。
 
-## 必要な環境変数
+## 認証情報（DB の Discord アカウント）
 
-| 変数 | 必須 | 説明 |
-| --- | --- | --- |
-| `DISCORD_BOT_TOKEN` | 必須 | Bot アカウントのトークン（Bot 認証のみ） |
+Bot アカウントのトークン（Bot 認証のみ）を管理画面のアカウントページで
+設定する。環境変数では渡さない。アダプターが受け取る環境形ハッシュの
+キーは `DISCORD_BOT_TOKEN` のまま。
 
-ユーザートークン・OAuth 委任・webhook 資格情報は使わない。Bot ID の環境
-変数は不要で、トークンで認証した `GET /users/@me` から自己 ID を確認する。
-`catalog` の `configured` はこのトークンの有無のみで判定し、未設定でも
-catalog・管理画面には表示される。トークン値は catalog・ログ・AI 入力・
-子プロセス環境へ出さない。
+ユーザートークン・OAuth 委任・webhook 資格情報は使わない。Bot ID の設定
+は不要で、トークンで認証した `GET /users/@me` から自己 ID を確認する。
+poll・送信の可否は DB アカウントの設定有無で判定する。トークン値は
+catalog・ログ・管理画面・AI 入力・子プロセス環境へ出さない。
 
 ## 最小権限・セットアップ
 
@@ -29,8 +28,8 @@ catalog・管理画面には表示される。トークン値は catalog・ロ�
    では Bot ロールへ明示の閲覧許可が必要。
 4. チャネル ID を取得する（Discord 設定で開発者モードを有効化し、チャネルを
    右クリックして「ID をコピー」）。
-5. `DISCORD_BOT_TOKEN` を設定し、poll / 送信の allowlist
-   `AICONSHELL_ALLOWED_SCOPES=discord:channel/<channelId>` を設定する。
+5. 管理画面のアカウントページで Bot トークンを設定し、poll / 送信の
+   allowlist `AICONSHELL_ALLOWED_SCOPES=discord:channel/<channelId>` を設定する。
 6. 対象チャネルで Bot にメンション付きで投稿し、Task が作られることを確認する。
 
 スレッド内の取得・投稿は、そのスレッド ID を `channel/<threadId>` として
@@ -76,6 +75,10 @@ Discord の Message Content Intent には例外があり、Bot へのメンシ�
   `channel:<channelId>`。チャネル・スレッドの新規作成は対象外。
 - `create_issue`: 非対応。catalog では `unsupported: true` で公開し、
   呼び出すと `UnsupportedOperation` になる。
+- `health_check`（`read_only: true`）: `GET /users/@me` で疎通確認し、
+  `{"ok": true, "bot_id": "..."}` を返す。入力は `{}`。管理画面の接続確認
+  から使い、AI の型付き読み取り対象にはしない（scope を持たないため
+  allowlist 検証で拒否される）。
 
 書き込み本文は Discord の上限に合わせ 1–2000 文字のみ受付し、超過・空・
 不正な本文は HTTP 送信前に `InputInvalid` として拒否する。拒否は送信開始

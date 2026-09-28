@@ -12,8 +12,9 @@ require_relative "../../support/scripted_ai"
 #
 # Composes the committed strict boundary fixtures (HTTP transport +
 # scripted AI process runner) with a NEW real plugins Registry holding
-# fresh real Github and Teams adapters. Final tests script finite
-# HTTP/AI answers here, then drive the real request path.
+# fresh real Github and Discord adapters, plus real database-backed
+# integration accounts and a real issued API token. Final tests script
+# finite HTTP/AI answers here, then drive the real request path.
 #
 # Only the two boundaries are fake: HTTP (no network) and AI process
 # spawn (no CLI, no subscription auth). Registry dispatch, adapters,
@@ -24,10 +25,11 @@ module RequestAcceptance
   # Issue-list GETs only (never issue comments); final tests assert the
   # semantic query, so per_page is deliberately not part of the match.
   GITHUB_ISSUES_PATTERN = %r{\Ahttps://api\.github\.com/repos/o/r/issues\?}
-  TEAMS_TOKEN_URL = "https://login.microsoftonline.com/fixture-tenant/oauth2/v2.0/token"
-  TEAMS_ACTIVITY_URL = "https://bot.example.test/v3/conversations/fixture-conversation/activities"
-  TEAMS_WRITE_TARGET = "channel:fixture-team/fixture-channel"
-  TEAMS_CHANNEL_SCOPE = "team/fixture-team/channel/fixture-channel"
+  DISCORD_CHANNEL_ID = "130000000000000001"
+  DISCORD_POST_URL = "https://discord.com/api/v10/channels/#{DISCORD_CHANNEL_ID}/messages"
+  DISCORD_WRITE_TARGET = "channel:#{DISCORD_CHANNEL_ID}"
+  DISCORD_CHANNEL_SCOPE = "channel/#{DISCORD_CHANNEL_ID}"
+  DISCORD_BOT_TOKEN = "discord-bot-token-synthetic"
 
   APP_ENV_KEYS = %w[
     ADMIN_USERNAME ADMIN_PASSWORD ADMIN_API_TOKEN AICONSHELL_ALLOWED_SCOPES
@@ -54,7 +56,7 @@ module RequestAcceptance
   # Live scenario wiring. Each expect_* scripts exactly one reply; the
   # strict transport fails on anything unexpected. No global call order
   # is enforced and prompts are never inspected here.
-  Context = Struct.new(:root, :execution_root, :teams_targets_path,
+  Context = Struct.new(:root, :execution_root,
                        :transport, :plugin_env, :registry, :clock, :ai,
                        keyword_init: true) do
     def runner = ai.runner
@@ -76,19 +78,14 @@ module RequestAcceptance
       self
     end
 
-    def expect_teams_token(token: "fixture-bot-token", expires_in: 3600)
-      transport.expect_json("POST", TEAMS_TOKEN_URL, body: { "access_token" => token, "expires_in" => expires_in })
+    def expect_discord_post(external_id:, status: 200)
+      transport.expect_json("POST", DISCORD_POST_URL, status: status, body: { "id" => external_id })
       self
     end
 
-    def expect_teams_post(external_id:, status: 200)
-      transport.expect_json("POST", TEAMS_ACTIVITY_URL, status: status, body: { "id" => external_id })
-      self
-    end
-
-    # Externally visible Teams activity POSTs only, never OAuth token POSTs.
-    def teams_posts
-      transport.requests_to(TEAMS_ACTIVITY_URL, method: "POST")
+    # Externally visible Discord message POSTs only.
+    def discord_posts
+      transport.requests_to(DISCORD_POST_URL, method: "POST")
     end
 
     # Every scripted HTTP reply and AI answer consumed exactly once,
@@ -111,10 +108,12 @@ module RequestAcceptance
       }
     end
 
-    # Fresh scenario: scoped synthetic app ENV, temp execution root and
-    # private Teams mapping, and a new Registry over with_ai. Tempdirs
-    # are removed and touched ENV keys restored even when the block
-    # raises. answers scripts the AI process boundary, one entry per call.
+    # Fresh scenario: scoped synthetic app ENV, temp execution root, real
+    # database-backed integration accounts, and a real issued API token
+    # (its plaintext is carried in ENV for the test HTTP client only; the
+    # application never reads it). Tempdirs are removed and touched ENV
+    # keys restored even when the block raises. answers scripts the AI
+    # process boundary, one entry per call.
     def with_context(answers: [], &block)
       raise ArgumentError, "with_context requires a block" unless block
 
@@ -122,16 +121,16 @@ module RequestAcceptance
       begin
         Dir.mktmpdir("request-acceptance-") do |root|
           execution_root = apply_app_env!(root)
-          targets_path = write_teams_targets!(root)
-          plugin_env = build_plugin_env(targets_path)
+          plugin_env = build_plugin_env
+          persist_accounts!(plugin_env)
           BoundaryFixtures.with_ai(answers: answers) do |ai|
             clock = Clock.new
             transport = BoundaryFixtures::HttpTransport.new(clock: clock)
-            registry = Aiconshell::Plugins::Registry.new(env: plugin_env, transport: transport, clock: clock)
+            registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport, clock: clock)
             registry.register(Aiconshell::Plugins::Github.new)
-            registry.register(Aiconshell::Plugins::Teams.new)
+            registry.register(Aiconshell::Plugins::Discord.new)
             yield Context.new(root: root, execution_root: execution_root,
-                              teams_targets_path: targets_path, transport: transport,
+                              transport: transport,
                               plugin_env: plugin_env, registry: registry,
                               clock: clock, ai: ai)
           end
@@ -148,8 +147,9 @@ module RequestAcceptance
       FileUtils.mkdir_p(execution_root)
       ENV["ADMIN_USERNAME"] = "acceptance-admin"
       ENV["ADMIN_PASSWORD"] = "acceptance-password-synthetic"
-      ENV["ADMIN_API_TOKEN"] = "acceptance-token-synthetic"
-      ENV["AICONSHELL_ALLOWED_SCOPES"] = "github:o/r,teams:#{TEAMS_CHANNEL_SCOPE}"
+      _record, plaintext = AdminApiToken.rotate!
+      ENV["ADMIN_API_TOKEN"] = plaintext
+      ENV["AICONSHELL_ALLOWED_SCOPES"] = "github:o/r,discord:#{DISCORD_CHANNEL_SCOPE}"
       ENV["AICONSHELL_EXECUTION_ROOT"] = execution_root
       ENV["AICONSHELL_AI_TIMEOUT_SECONDS"] = "60"
       ENV["AICONSHELL_LEASE_SECONDS"] = "300"
@@ -158,23 +158,23 @@ module RequestAcceptance
       execution_root
     end
 
-    def write_teams_targets!(root)
-      path = File.join(root, "teams-bot-targets.json")
-      mapping = { TEAMS_WRITE_TARGET => { "conversation_id" => "fixture-conversation" } }
-      File.write(path, JSON.generate(mapping))
-      File.chmod(0o600, path)
-      path
+    def persist_accounts!(plugin_env)
+      github = GithubAppsAccount.current
+      github.update!(app_id: plugin_env["GITHUB_APP_ID"],
+                     installation_id: plugin_env["GITHUB_INSTALLATION_ID"])
+      github.private_key = plugin_env["GITHUB_PRIVATE_KEY"]
+      github.save!
+      discord = DiscordAccount.current
+      discord.bot_token = plugin_env["DISCORD_BOT_TOKEN"]
+      discord.save!
     end
 
-    def build_plugin_env(targets_path)
+    def build_plugin_env
       {
         "GITHUB_APP_ID" => "123456", "GITHUB_INSTALLATION_ID" => "789",
         # Generated in memory per context; never written to disk.
         "GITHUB_PRIVATE_KEY" => OpenSSL::PKey::RSA.new(2048).to_pem,
-        "TEAMS_TENANT_ID" => "fixture-tenant", "TEAMS_CLIENT_ID" => "fixture-client-id",
-        "TEAMS_CLIENT_SECRET" => "fixture-client-secret-synthetic",
-        "TEAMS_BOT_APP_ID" => "fixture-bot-app-id", "TEAMS_BOT_APP_PASSWORD" => "fixture-bot-password-synthetic",
-        "TEAMS_SERVICE_URL" => "https://bot.example.test", "TEAMS_BOT_TARGETS_FILE" => targets_path
+        "DISCORD_BOT_TOKEN" => DISCORD_BOT_TOKEN
       }
     end
   end

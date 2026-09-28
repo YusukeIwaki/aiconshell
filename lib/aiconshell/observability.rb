@@ -5,7 +5,6 @@ require_relative "observability/redaction"
 require_relative "observability/envelope"
 require_relative "observability/outbox"
 require_relative "observability/clickhouse_adapter"
-require_relative "observability/teams_sink"
 require_relative "observability/delivery_service"
 
 # NOTE: lib/aiconshell/observability/postgres_outbox.rb is intentionally not
@@ -17,10 +16,10 @@ module Aiconshell
   # EventLog port (docs/architecture.md contract). emit writes a redacted,
   # validated envelope to the outbox spool without touching the network, so
   # logging can never roll back the surrounding business update. Delivery to
-  # ClickHouse / Teams happens asynchronously via DeliveryService.
+  # ClickHouse happens asynchronously via DeliveryService.
   module Observability
     class Config
-      attr_accessor :outbox, :search_backend, :logger, :clock, :default_teams_channel
+      attr_accessor :outbox, :search_backend, :logger, :clock
 
       def initialize
         @outbox = MemoryOutbox.new
@@ -50,9 +49,9 @@ module Aiconshell
       # Never raises: validation, outbox, and redaction failures are logged
       # (sanitized) and reported as nil so business transactions survive.
       def emit(layer:, kind:, message:, task_id: nil, correlation_id: nil,
-               data: {}, event_id: nil, occurred_at: nil, teams_channel: nil)
+               data: {}, event_id: nil, occurred_at: nil)
         emit!(layer:, kind:, message:, task_id:, correlation_id:, data:,
-              event_id:, occurred_at:, teams_channel:)
+              event_id:, occurred_at:)
       rescue StandardError => e
         begin
           config.logger.warn("observability emit dropped: #{Redaction.sanitize_error(e)}")
@@ -66,13 +65,12 @@ module Aiconshell
       # Strict variant: raises ValidationError on bad input. Still performs
       # no network I/O; delivery stays asynchronous.
       def emit!(layer:, kind:, message:, task_id: nil, correlation_id: nil,
-                data: {}, event_id: nil, occurred_at: nil, teams_channel: nil)
-        teams_channel = config.default_teams_channel if teams_channel.nil?
+                data: {}, event_id: nil, occurred_at: nil)
         envelope = Envelope.build(
           layer:, kind:, message:, task_id:, correlation_id:, data:,
           event_id:, occurred_at:, clock: config.clock
         )
-        config.outbox.enqueue(envelope, teams_channel:)
+        config.outbox.enqueue(envelope)
         envelope
       end
 

@@ -15,9 +15,7 @@ module Aiconshell
 
       COLUMNS = %w[
         id event_id envelope layer kind task_id correlation_id occurred_at
-        teams_channel
         clickhouse_delivered_at clickhouse_attempts clickhouse_next_retry_at clickhouse_last_error clickhouse_skipped_at
-        teams_delivered_at teams_attempts teams_next_retry_at teams_last_error teams_skipped_at
         created_at updated_at
       ].freeze
 
@@ -25,17 +23,17 @@ module Aiconshell
         @connection = connection
       end
 
-      def enqueue(envelope, teams_channel: nil)
+      def enqueue(envelope)
         params = [
           envelope.fetch("event_id"), JSON.generate(envelope),
           envelope["layer"], envelope["kind"], envelope["task_id"],
-          envelope["correlation_id"], envelope["occurred_at"], teams_channel
+          envelope["correlation_id"], envelope["occurred_at"]
         ]
         @connection.exec_params(<<~SQL, params)
           INSERT INTO event_deliveries
-            (event_id, envelope, layer, kind, task_id, correlation_id, occurred_at, teams_channel,
+            (event_id, envelope, layer, kind, task_id, correlation_id, occurred_at,
              created_at, updated_at)
-          VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7::timestamptz, $8, NOW(), NOW())
+          VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7::timestamptz, NOW(), NOW())
           ON CONFLICT (event_id) DO NOTHING
         SQL
         find_by_event_id(envelope.fetch("event_id"))
@@ -43,14 +41,12 @@ module Aiconshell
 
       def pending(destination, limit:, now:)
         destination = Outbox.destination!(destination)
-        extra = destination == "teams" ? "AND teams_channel IS NOT NULL AND teams_channel <> ''" : ""
         rows = @connection.exec_params(<<~SQL, [now.utc.iso8601(3), limit]).to_a
           SELECT #{COLUMNS.join(", ")}
           FROM event_deliveries
           WHERE #{destination}_delivered_at IS NULL
             AND #{destination}_skipped_at IS NULL
             AND (#{destination}_next_retry_at IS NULL OR #{destination}_next_retry_at <= $1::timestamptz)
-            #{extra}
           ORDER BY id ASC
           LIMIT $2
         SQL
@@ -100,8 +96,6 @@ module Aiconshell
           DELETE FROM event_deliveries
           WHERE created_at < $1::timestamptz
             AND (clickhouse_delivered_at IS NOT NULL OR clickhouse_skipped_at IS NOT NULL)
-            AND (teams_channel IS NULL OR teams_channel = ''
-                 OR teams_delivered_at IS NOT NULL OR teams_skipped_at IS NOT NULL)
         SQL
         result.cmd_tuples
       end
@@ -120,9 +114,7 @@ module Aiconshell
           "id" => row["id"].to_i,
           "event_id" => row["event_id"],
           "envelope" => JSON.parse(row["envelope"].to_s),
-          "teams_channel" => row["teams_channel"],
           "clickhouse" => destination_state(row, "clickhouse"),
-          "teams" => destination_state(row, "teams"),
           "created_at" => parse_time(row["created_at"])
         }
       end

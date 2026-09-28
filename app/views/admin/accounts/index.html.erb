@@ -1,0 +1,112 @@
+<% content_for(:title, "アカウント") %>
+<h1>アカウント</h1>
+<p>AIエンジニアが利用する外部サービスのアカウント（GitHub Apps / Discord）を管理します。認証情報はこの画面でのみ設定し、値自体は表示しません。</p>
+
+<div class="admin-card">
+  <h2 style="margin-top:0">
+    GitHub Apps
+    <% if @github.configured? %>
+      <span class="admin-badge admin-badge-good">設定済み</span>
+    <% else %>
+      <span class="admin-badge admin-badge-warn">未設定</span>
+    <% end %>
+  </h2>
+  <% state = @github.health_check_state %>
+  <p>ヘルスチェック:
+    <span class="admin-badge <%= account_health_badge(state&.status || "unchecked") %>"><%= account_health_label(state&.status || "unchecked") %></span>
+    <% if state %>
+      （最終確認: <%= state.updated_at %>）
+      <% if state.error_code.present? %>
+        <%= account_health_error_label(state.error_code) %>
+      <% end %>
+    <% else %>
+      （まだ確認していません）
+    <% end %>
+  </p>
+  <p>必要なインストール権限: Issues（読み書き）、Pull requests（読み書き）、Actions（読み取り）。ヘルスチェックでは疎通に加えて権限の有無も確認します。</p>
+  <%= form_with model: @github, url: github_admin_accounts_path, method: :patch, scope: :github_apps_account, multipart: true do |form| %>
+    <div class="admin-form-grid">
+      <%= form.label :app_id, "App ID" %>
+      <%= form.text_field :app_id, maxlength: 64, autocomplete: "off" %>
+      <%= form.label :installation_id, "Installation ID" %>
+      <%= form.text_field :installation_id, maxlength: 64, autocomplete: "off" %>
+      <%= form.label :api_url, "API URL（空で既定値）" %>
+      <%= form.text_field :api_url, maxlength: 512, placeholder: "https://api.github.com", autocomplete: "off" %>
+      <%= form.label :private_key_file, "秘密鍵ファイル（.pem）" %>
+      <span>
+        <%= form.file_field :private_key_file, accept: ".pem" %>
+        <span class="admin-form-hint">
+          <% if @github.private_key? %>
+            設定済み（指紋: <code class="admin-env"><%= @github.private_key_fingerprint %></code>）。ファイルを選んだ場合のみ置き換えます。
+          <% else %>
+            未設定。GitHub App の秘密鍵ファイルをアップロードしてください。
+          <% end %>
+        </span>
+      </span>
+    </div>
+    <div class="admin-actions">
+      <%= form.submit "保存する", class: "admin-btn" %>
+    </div>
+  <% end %>
+  <%= button_to "接続確認する", health_check_admin_accounts_path(provider: "github"), method: :post, class: "admin-btn" %>
+</div>
+
+<div class="admin-card">
+  <h2 style="margin-top:0">
+    Discord
+    <% if @discord.configured? %>
+      <span class="admin-badge admin-badge-good">設定済み</span>
+    <% else %>
+      <span class="admin-badge admin-badge-warn">未設定</span>
+    <% end %>
+  </h2>
+  <% dstate = @discord.health_check_state %>
+  <p>ヘルスチェック:
+    <span class="admin-badge <%= account_health_badge(dstate&.status || "unchecked") %>"><%= account_health_label(dstate&.status || "unchecked") %></span>
+    <% if dstate %>
+      （最終確認: <%= dstate.updated_at %>）
+      <% if dstate.error_code.present? %>
+        <%= account_health_error_label(dstate.error_code) %>
+      <% end %>
+    <% else %>
+      （まだ確認していません）
+    <% end %>
+  </p>
+  <p>Bot トークンのみを使用します。メンションの取り込みとチャンネルへの返信・通知に使います。</p>
+  <%= form_with model: @discord, url: discord_admin_accounts_path, method: :patch, scope: :discord_account do |form| %>
+    <div class="admin-form-grid">
+      <%= form.label :bot_token, "Bot トークン" %>
+      <span>
+        <%= form.password_field :bot_token, value: "", maxlength: 256, autocomplete: "new-password", placeholder: @discord.bot_token? ? "設定済み（変更時のみ入力）" : "未設定" %>
+        <span class="admin-form-hint">
+          <% if @discord.bot_token? %>
+            設定済み。空のまま保存すると現在の値を維持します。
+          <% else %>
+            未設定。
+          <% end %>
+        </span>
+      </span>
+      <%= form.label :clear_token, "トークン削除" %>
+      <span><%= form.check_box :clear_token %> 保存時にトークンを削除する</span>
+    </div>
+    <div class="admin-actions">
+      <%= form.submit "保存する", class: "admin-btn" %>
+    </div>
+  <% end %>
+  <%= button_to "接続確認する", health_check_admin_accounts_path(provider: "discord"), method: :post, class: "admin-btn" %>
+</div>
+
+<div class="admin-card">
+  <h2 style="margin-top:0">管理APIキー</h2>
+  <p>このアプリを外部から呼び出す <code class="admin-env">/api/admin/task_requests</code> 用のキーです。再発行すると古いキーは無効になります。</p>
+  <% if flash[:shown_api_token].present? %>
+    <p><span class="admin-badge admin-badge-warn">今回のみ表示</span></p>
+    <p><code class="admin-env" id="rotated-api-token"><%= flash[:shown_api_token] %></code></p>
+    <p>この値は再表示されません。安全な場所に控えてください。</p>
+  <% elsif @api_token %>
+    <p>発行済み（先頭: <code class="admin-env"><%= @api_token.prefix %>…</code>、更新: <%= @api_token.updated_at %>）。値自体は表示しません。</p>
+  <% else %>
+    <p>未発行。この API は現在すべての呼び出しを拒否します。</p>
+  <% end %>
+  <%= button_to @api_token ? "再発行する" : "発行する", rotate_api_token_admin_accounts_path, method: :post, class: "admin-btn" %>
+</div>

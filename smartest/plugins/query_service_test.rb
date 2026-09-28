@@ -3,6 +3,7 @@
 require_relative "plugins_test_helper"
 
 ROOT = File.expand_path("../..", __dir__) unless defined?(ROOT)
+require File.join(ROOT, "app/services/accounts")
 require File.join(ROOT, "app/services/interaction/plugin_access")
 require File.join(ROOT, "app/services/interaction/query_service")
 
@@ -14,8 +15,21 @@ def qs_token_stub(transport)
                       body: { "token" => "ghs_test", "expires_at" => "2026-09-26T13:00:00Z" })
 end
 
-def qs_service(registry, scopes = { "github" => ["o/r"] })
-  Interaction::QueryService.new(registry: registry, allowed_scopes: scopes, event_sink: nil)
+# Standalone stand-in for the database-backed Accounts source (unit tests
+# never touch the database): the same env hash the registry was built with.
+class FakeCredentialSource
+  def initialize(env)
+    @env = env
+  end
+
+  def env_for(_plugin)
+    @env
+  end
+end
+
+def qs_service(registry, scopes = { "github" => ["o/r"] }, env = {})
+  Interaction::QueryService.new(registry: registry, allowed_scopes: scopes, event_sink: nil,
+    credential_source: FakeCredentialSource.new(env))
 end
 
 def qs_issue(number, title: "t", body: "b")
@@ -23,8 +37,8 @@ def qs_issue(number, title: "t", body: "b")
     "state" => "open", "labels" => [], "html_url" => "https://github.com/o/r/issues/#{number}" }
 end
 
-test("query validate preflights without I/O and call returns typed data") do |registry:, transport:|
-  service = qs_service(registry)
+test("query validate preflights without I/O and call returns typed data") do |registry:, transport:, plugin_env:|
+  service = qs_service(registry, { "github" => ["o/r"] }, plugin_env)
 
   preflight = service.validate(plugin: "github", operation: "list_issues",
                                input: { "scope" => "o/r" })
@@ -62,8 +76,8 @@ test("query rejects writes, unknown, and unsupported before transport") do |regi
                       input: { "scope" => "o/r" }).code).to eq(:unknown_plugin)
   expect(service.call(plugin: "github", operation: "destroy",
                       input: {}).code).to eq(:unknown_operation)
-  expect(service.call(plugin: "teams", operation: "create_issue",
-                      input: { "scope" => "x", "title" => "t", "body" => "b" }).code)
+  expect(service.call(plugin: "discord", operation: "create_issue",
+                      input: { "scope" => "channel:123", "title" => "t", "body" => "b" }).code)
     .to eq(:unsupported_operation)
   expect(transport.requests).to eq([])
 end
@@ -162,8 +176,8 @@ test("query rejects a declared operation without complete schemas") do
   expect(service.validate(plugin: "invalid_contract", operation: "inspect", input: { "scope" => "target" }).code).to eq(:schema_invalid)
 end
 
-test("query failures never include upstream text") do |registry:, transport:|
-  service = qs_service(registry)
+test("query failures never include upstream text") do |registry:, transport:, plugin_env:|
+  service = qs_service(registry, { "github" => ["o/r"] }, plugin_env)
   qs_token_stub(transport)
   transport.stub_json("GET", QS_URL, status: 500, body: { "message" => "secret leak attempt" })
 
@@ -180,7 +194,8 @@ test("query event metadata does not echo unknown AI supplied operation names") d
   sink = Object.new
   events = []
   sink.define_singleton_method(:emit) { |**event| events << event }
-  service = Interaction::QueryService.new(registry: registry, allowed_scopes: {}, event_sink: sink)
+  service = Interaction::QueryService.new(registry: registry, allowed_scopes: {},
+    event_sink: sink, credential_source: FakeCredentialSource.new({}))
   expect(service.call(plugin: "secret request text", operation: "private message", input: {}).code).to eq(:unknown_plugin)
   expect(events.size).to eq(1)
   expect(events.first[:data]).to eq({ plugin: "unknown", operation: "unknown", code: "unknown_plugin" })
@@ -191,13 +206,27 @@ test("query catalog helpers expose schemas without credentials") do |registry:|
 
   readonly = service.read_only_catalog
   github = readonly.find { |entry| entry["id"] == "github" }
-  expect(github["operations"].map { |op| op["name"] }.sort).to eq(%w[latest_events list_issues])
+  expect(github["operations"].map { |op| op["name"] }.sort).to eq(%w[health_check latest_events list_issues])
   expect(github["operations"][0]["input_schema"]["type"]).to eq("object")
 
   serialized = JSON.generate(readonly) + JSON.generate(service.catalog)
   expect(serialized).not_to include("ghs_test")
   expect(service.allowed_targets("github")).to eq(["o/r"])
   expect(service.allowed_targets["github"]).to eq(["o/r"])
+end
+
+test("query uses the credential source only, never registry env") do |registry:, transport:|
+  # The registry itself carries full fake credentials; an empty source must
+  # still fail closed: the registry environment is never a fallback.
+  service = qs_service(registry)
+  qs_token_stub(transport)
+  transport.stub_json("GET", QS_URL, body: [])
+
+  result = service.call(plugin: "github", operation: "list_issues",
+                        input: { "scope" => "o/r" })
+  expect(result.ok?).to eq(false)
+  expect(result.code).to eq(:credentials_missing)
+  expect(transport.requests).to eq([])
 end
 
 test("query service performs no polling state writes") do

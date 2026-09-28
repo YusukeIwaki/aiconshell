@@ -12,15 +12,6 @@ Rails.application.routes.draw do
   # Public entry page; operational data remains behind admin authentication.
   root "home#index"
 
-  # User-delegated OAuth provider callback (issue #23). Public on
-  # purpose: the provider redirects the operator's browser here without
-  # admin credentials, and the session-bound one-time state is the
-  # forgery guard. The provider name is fixed by this constraint; token
-  # URLs, redirect URIs, and tenants always come from fixed
-  # configuration, never from callback input.
-  get "oauth/:provider/callback", to: "oauth_callbacks#show", as: :oauth_callback,
-      constraints: { provider: /atlassian|microsoft/ }
-
   # Admin console (issue #7). Route details live in config/routes/admin.rb.
   draw(:admin)
 

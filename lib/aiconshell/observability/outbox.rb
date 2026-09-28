@@ -7,18 +7,17 @@ module Aiconshell
     # Outbox port: PostgreSQL-backed spool of not-yet-delivered events.
     #
     # The outbox is a delivery spool, not a log archive. Each record carries
-    # one redacted envelope plus independent per-destination delivery state
-    # ("clickhouse", "teams"), so a Teams failure never re-sends to
-    # ClickHouse and a ClickHouse failure never blocks Teams.
+    # one redacted envelope plus per-destination delivery state
+    # ("clickhouse").
     #
     # Record shape (String keys; times are Time in UTC or nil):
-    #   { "id", "event_id", "envelope", "teams_channel",
+    #   { "id", "event_id", "envelope",
     #     "clickhouse" => { "delivered_at", "attempts", "next_retry_at", "last_error" },
-    #     "teams" => { ...same, plus "skipped_at" }, "created_at" }
+    #     "created_at" }
     module Outbox
-      DESTINATIONS = %w[clickhouse teams].freeze
+      DESTINATIONS = %w[clickhouse].freeze
 
-      def enqueue(_envelope, teams_channel: nil)
+      def enqueue(_envelope)
         raise NotImplementedError
       end
 
@@ -83,7 +82,7 @@ module Aiconshell
         @sequence = 0
       end
 
-      def enqueue(envelope, teams_channel: nil)
+      def enqueue(envelope)
         @monitor.synchronize do
           existing = @records.find { |record| record["event_id"] == envelope["event_id"] }
           return deep_dup(existing) if existing
@@ -93,9 +92,7 @@ module Aiconshell
             "id" => @sequence,
             "event_id" => envelope.fetch("event_id"),
             "envelope" => deep_dup(envelope),
-            "teams_channel" => teams_channel,
             "clickhouse" => fresh_state,
-            "teams" => fresh_state,
             "created_at" => @clock.now.utc
           }
           @records << record
@@ -107,8 +104,6 @@ module Aiconshell
         destination = Outbox.destination!(destination)
         @monitor.synchronize do
           selected = @records.select do |record|
-            next false if destination == "teams" && (record["teams_channel"].nil? || record["teams_channel"].empty?)
-
             Outbox.due?(record[destination], now)
           end
           selected.sort_by { |record| record["id"] }.first(limit).map { |record| deep_dup(record) }
@@ -142,9 +137,7 @@ module Aiconshell
         @monitor.synchronize do
           before_count = @records.size
           @records.reject! do |record|
-            record["created_at"] < before &&
-              Outbox.terminal?(record["clickhouse"]) &&
-              teams_terminal_or_unrequested?(record)
+            record["created_at"] < before && Outbox.terminal?(record["clickhouse"])
           end
           before_count - @records.size
         end
@@ -173,13 +166,6 @@ module Aiconshell
       def fresh_state
         { "delivered_at" => nil, "skipped_at" => nil, "attempts" => 0,
           "next_retry_at" => nil, "last_error" => nil }
-      end
-
-      def teams_terminal_or_unrequested?(record)
-        channel = record["teams_channel"]
-        return true if channel.nil? || channel.empty?
-
-        Outbox.terminal?(record["teams"])
       end
 
       def mutate(id, destination)

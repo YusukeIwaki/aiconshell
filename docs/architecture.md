@@ -6,14 +6,13 @@ Web とバックグラウンドワーカーは PostgreSQL を共有する。Soli
 
 ```mermaid
 flowchart TB
-  Human[人間 / Teams / Jira / GitHub / Discord / 管理画面] <--> I[Interaction: 取得・正規化・対話]
+  Human[人間 / GitHub / Discord / 管理画面] <--> I[Interaction: 取得・正規化・対話]
   I <--> C[Coordination: 整理・優先度・状態・dispatch]
   C <--> E[Execution: lease・隔離 workspace・AI CLI]
   I --> O[EventLog outbox]
   C --> O
   E --> O
   O --> CH[ClickHouse / 管理画面検索]
-  O --> T[任意の Teams 通知チャネル]
   I <--> DB[(PostgreSQL + Solid Queue)]
   C <--> DB
   E <--> DB
@@ -36,7 +35,10 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 
 | モデル | 主な情報 / 制約 |
 | --- | --- |
-| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にし（委任OAuthはprovider resource space単位で世代非依存、Task結合は取得世代別）、親スナップショットは改訂を鎖状に識別する |
+| ExternalEvent | plugin、event_id、fingerprint、resource_id、actor、occurred_at、payload、processed_at、source_fingerprint / source_updated_at。plugin+event_id+fingerprint を一意にする。親スナップショットは改訂を鎖状に識別する |
+| GithubAppsAccount / DiscordAccount | singleton の外部サービスアカウント。認証情報は暗号化保存。対応する HealthCheckState を has_one で持つ |
+| GithubAppsHealthCheckState / DiscordHealthCheckState | 最新の接続確認結果（status / error_code）。`updated_at` が最終確認日時で `created_at` は持たない |
+| AdminApiToken | JSON 管理 API 用の singleton トークン。SHA256 ダイジェストのみ保存し、平文は発行・再発行時に1回だけ返す |
 | TaskRequest | 管理画面・管理APIの依頼受付。公開UUID、UI/API別の冪等キー、title/description、固有のExternalEventへの参照。受付とイベントを同じtransactionで保存する |
 | IntegrationCursor | plugin と scope ごとの cursor JSON、lease、last_polled_at、error。全ページの durable ingest 完了後のみ更新 |
 | Task | title、description、status、priority、source reference、next_action_at、lock_version、coordination_result、delivery_batch_key。状態更新は Coordination のみ |
@@ -44,9 +46,7 @@ AI の自然言語指示は業務判断を補助する。スコープ・状態�
 | TaskRun | task、provider/model/effort/instructions snapshot、status、lease token/expiry、result、error、開始/終了時刻 |
 | LayerPolicy | layer（interaction/coordination/execution）、provider（claude/codex/muse）、model、effort、instructions、enabled。layer一意 |
 | OutboundAction | plugin、operation、validated input、idempotency key、status、external_id、attempts、error、delivery_batch_key。Coordination が作り Interaction が送る |
-| OauthConnection | provider ごとの委任接続1件。世代・外部principal・tenant/cloud・付与scope・状態・期限・安全な分類コード。token は専用 salt の認証付き暗号化のみ。provider 一意 |
-| OauthAuthAttempt | 短 TTL の認証試行。state は SHA256 digest のみ保持しブラウザ session に結合。code 保持なし、PKCE verifier（Microsoft のみ）は暗号化。一回消費、state_digest 一意 |
-| EventDelivery | redacted envelope、event_id、宛先別配信/再試行状態。配信済みの短期 retention |
+| EventDelivery | redacted envelope、event_id、ClickHouse 配信/再試行状態。配信済みの短期 retention |
 
 Task 状態は `inbox`, `ready`, `running`, `waiting_human`, `waiting_review`, `waiting_delivery`, `done`, `failed`, `cancelled`。priority は大きい値を優先。未定義の遷移を拒否し、row lock と fencing token により古い実行結果が最新状態を上書きしない。AI 呼出しの間に DB transaction を維持しない。
 
@@ -68,7 +68,7 @@ registry.invoke(plugin: "github", operation: "latest_events",
                 context: { "scopes" => ["github:read"] })
 ```
 
-`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams と Discord は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
+`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。対応 plugin は `github` と `discord` のみ（Teams / Jira は後から同じアカウント方式で再サポートする）。operation は原則 `latest_events`, `reply`, `create_issue`。Discord は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。両 plugin は疎通確認の `health_check` を持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
 
 `latest_events` の入力: `{"scope": "...", "cursor": null または object}`。
 返却: `{"events": [...], "cursor": object}`。
@@ -78,16 +78,15 @@ registry.invoke(plugin: "github", operation: "latest_events",
 `create_issue` の入力: `{"scope": "...", "title": "...", "body": "..."}`。
 `send_message` の入力: `{"scope": "...", "body": "..."}`。
 書込結果: `{"external_id": "...", "url": null または string}`。
+`health_check` の入力: `{}`。返却: `{"ok": bool, ...}`（GitHub は不足権限の `missing`、Discord は `bot_id` を付す）。scope を持たないため AI の型付き読み取り対象にはならない。
 
-HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検証。秘密は ENV または private ファイルから読む。catalog は値を表示しない。プラグイン登録は信頼されたコードのみ。MCP wire protocol の互換サーバーは初期スコープに含めない。
+HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検証。認証情報は DB のアカウント（`GithubAppsAccount` / `DiscordAccount`）から組み立てた環境形ハッシュで渡し、プロセス環境は fallback にしない。catalog は値を表示しない。プラグイン登録は信頼されたコードのみ。MCP wire protocol の互換サーバーは初期スコープに含めない。
 
 `Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
 
-GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write、Discord は Bot token（`DISCORD_BOT_TOKEN` のみ）。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+GitHub は App installation token、Discord は Bot token。戻り cursor/next link の host を検証する。各 plugin README に最小権限、認証情報の所在、paging・retry・送信の制約を記す。AI/Plugin の JSON Schema に credential や接続権限は含めない。
 
-ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。委任版 `jira_oauth` / `teams_oauth` は default registry へ登録済み（#26）であり、pure Ruby の登録と Rails の credential provider 注入を分離する。`catalog.configured` は `OAUTH_*` 設定の有無のみを示し、接続成功との区別は管理画面・業務統合が表示する。AI/Plugin の JSON Schema に credential や接続権限は含めない。
-
-運用名義は (1) 既存サービスアカウント/Bot 名義の Bot 運用（`jira` service account / `teams` Graph application + Bot を維持）と (2) 同意した特定ユーザー名義の OAuth2 代理運用（`jira_oauth` / `teams_oauth`）の2種類である。個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT fallback は追加しない。`jira` / `jira_oauth`、`teams` / `teams_oauth` の allowlist は別 namespace であり、旧許可を委任版へ自動転用しない。poll/query/outbound は同じ信頼された `oauth_binding` / `oauth_credential_provider` 境界を使い、binding をユーザー/AI が指定できない。接続 ID・世代・principal・tenant/cloud の snapshot は信頼されたアプリ側で固定し、refresh では世代を変えない。callback/refresh/送信の競合は fencing で扱い、既に開始した HTTP は取り消せないため成功不明の書込は `uncertain` として再送しない。自己投稿は確定 receipt（provider resource・外部 ID・実際に送った内容）の永続照合でのみ抑制し、手動発言は対象とする。詳細は [workflow](workflow.md) を参照。
+個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin は追加しない。既に開始した HTTP は取り消せないため成功不明の書込は `uncertain` として再送しない。詳細は [workflow](workflow.md) を参照。
 
 ### 管理依頼の read / result / receipt
 
@@ -98,7 +97,7 @@ GitHub は App installation token、Jira は service account、Teams は Graph r
 ```
 
 ```json
-{"rulings":[{"task_id":123,"result":{"summary":"高優先度の issue が 1 件見つかったため通知を依頼する。","actions":[{"plugin":"teams","operation":"send_message","input":{"scope":"channel:team-id/channel-id","body":"確認が必要な issue があります。"}}]}}]}
+{"rulings":[{"task_id":123,"result":{"summary":"高優先度の issue が 1 件見つかったため通知を依頼する。","actions":[{"plugin":"discord","operation":"send_message","input":{"scope":"channel:123456789","body":"確認が必要な issue があります。"}}]}}]}
 ```
 
 `Interaction::QueryService` は登録済み read-only operation の正確な入出力スキーマと宛先を検証する。読み取り上限は 3 ラウンド・合計 10 件、同一ラウンド内の Task 重複は禁止。クエリ失敗は内容を含まない分類コードでその処理を終了し、結果保存や通知を行わない。成功した観測は `OBSERVATIONS` JSON として次の AI 呼出しへ渡す。`list_issues` は open issue の 1 ページのみを返し、PR を除外する。`complete` / `next_cursor` / `truncated` / `limit_reached` と各項目の省略フラグを必ず解釈する。ページ数上限では未完了かつ継続 cursor なしとなり、全件確認済みとは扱わない。可変な外部一覧の時点一貫性は保証しない。詳細は [GitHub plugin](../plugins/github/README.md) と [workflow](workflow.md) を参照。
@@ -139,7 +138,7 @@ Aiconshell::Observability.search(
 
 emit は外部ネットワークを同期で呼ばない。失敗によって業務更新を rollback させない。outbox 障害は sanitized local log に記録し、失われ得る条件を説明する。schema validation と redaction は保存前に実施する。AI prompt、raw CLI output、Authorization header、token を記録しない。
 
-ClickHouse と Teams の retry は独立。ClickHouse は event_id で重複を除く。Teams など external API に idempotency 保証がない場合、成功直後の crash 等で exactly-once を保証しないことを記す。配信失敗を EventLog 自身へ無限に再投入しない。
+ClickHouse は event_id で重複を除く。成功直後の crash 等で exactly-once を保証しないことを記す。配信失敗を EventLog 自身へ無限に再投入しない。
 
 ## 管理画面
 

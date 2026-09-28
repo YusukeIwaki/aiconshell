@@ -14,7 +14,6 @@ Rails.application.config.to_prepare do
   Aiconshell::Observability.configure do |config|
     config.outbox = EventLogging::OutboxAdapter.new
     config.search_backend = EventLogging::Delivery.clickhouse_adapter
-    config.default_teams_channel = ENV["EVENT_LOG_TEAMS_CHANNEL"].presence
     config.logger = Rails.logger if Rails.logger
   end
 end

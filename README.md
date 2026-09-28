@@ -1,6 +1,6 @@
 # aiconshell
 
-AI エンジニア基盤。外部サービス（GitHub / Jira / Teams）のイベントを
+AI エンジニア基盤。外部サービス（GitHub / Discord）のイベントを
 取り込み、タスク化・優先度付け・AI 実行し、結果を EventLog に残す。
 設計は [docs/architecture.md](docs/architecture.md)、運用手順は
 [docs/deployment.md](docs/deployment.md)。
@@ -69,7 +69,7 @@ AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    #
 | `TEST_DATABASE_URL` | integration suite 用（`*_test` 必須） | `DATABASE_URL`、無ければ localhost の `_test` |
 | `SECRET_KEY_BASE` | Rails secret | compose は開発用ダミー。共有環境では必須 |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | 管理画面の Basic 認証 | 未設定では fail closed |
-| `ADMIN_API_TOKEN` | JSON 管理 API（`/api/admin/task_requests`）の Bearer 認証（[docs/task-requests.md](docs/task-requests.md)） | 未設定では fail closed |
+| 管理APIキー | JSON 管理 API（`/api/admin/task_requests`）の Bearer 認証。管理画面のアカウントページで発行（[docs/task-requests.md](docs/task-requests.md)） | 未発行では fail closed |
 | `AICONSHELL_EXECUTION_ROOT` | AI 作業領域ルート（production 必須） | compose は `/workspaces` volume |
 | `AICONSHELL_ALLOWED_SCOPES` | 取り込み/送信対象の `plugin:scope` 一覧 | 空（何も対象にしない） |
 | `AICONSHELL_LEASE_SECONDS` / `AICONSHELL_AI_TIMEOUT_SECONDS` | 実行 lease / AI 実行上限（lease > timeout + 10 が必須） | `1800` / `600` |
@@ -81,7 +81,7 @@ AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    #
 管理画面の「タスク依頼を作成する」、または管理 API から依頼できる。例:
 
 > owner/repo の未完了 Issue を確認し、障害の影響とラベルから優先度を判断してください。
-> 緊急の Issue があれば Teams の指定チャネルへ要約を送り、なければ通知せず結果を残してください。
+> 緊急の Issue があれば Discord の指定チャネルへ要約を送り、なければ通知せず結果を残してください。
 > 取得範囲が一部なら、その範囲を要約に明記してください。
 
 整理層の AI ポリシーを有効にし、provider・model・effort を設定する。
@@ -89,27 +89,21 @@ AICONSHELL_WORKER_ROLE=execution RAILS_MAX_THREADS=15 bin/jobs --mode=async    #
 起動中の execution worker が必要。未設定 provider も選択できるが、実行時に
 分類済みエラーをタスク詳細と受付 API に表示する。API キー課金へは切り替えない。
 
-連携には次の設定が必要（秘密値は private 環境変数・ファイルで渡す）:
+連携には次の設定が必要:
 
-- UI は `ADMIN_USERNAME` / `ADMIN_PASSWORD`、API は別の `ADMIN_API_TOKEN`。
-- GitHub App の `GITHUB_APP_ID` / `GITHUB_INSTALLATION_ID` と
-  `GITHUB_PRIVATE_KEY` または `GITHUB_PRIVATE_KEY_FILE`。
+- UI は `ADMIN_USERNAME` / `ADMIN_PASSWORD`、API は管理画面のアカウントページで
+  発行する別の管理APIキー。
+- GitHub App の App ID / installation ID と秘密鍵ファイル（`.pem` アップロード）。
   権限は [GitHub 設定](plugins/github/README.md) を参照。
-- Teams の tenant / app / Bot 認証、実際の `TEAMS_SERVICE_URL` と
-  `TEAMS_BOT_TARGETS_FILE`。Bot を対象へ導入し、実際の conversation 参照を
-  [Teams 設定](plugins/teams/README.md) に従って対応付ける。対応表は自動生成しない。
+- Discord の Bot トークン。Bot を対象サーバーへ導入し、[Discord 設定](plugins/discord/README.md)
+  に従って権限を付与する。
 - 許可対象の例は
-  `AICONSHELL_ALLOWED_SCOPES=github:owner/repo,teams:team/TEAM_ID/channel/CHANNEL_ID`。
-  Teams 送信入力の宛先は `channel:TEAM_ID/CHANNEL_ID` である。
-- 運用名義は既存サービスアカウント/Bot 名義の Bot 運用と同意ユーザー名義の
-  OAuth2 代理運用（`jira_oauth` / `teams_oauth`、`OAUTH_*` 設定）の2種類のみ。
-  個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin・OAuth 失敗時の PAT
-  fallback は提供しない。委任版の許可は別 namespace（例
-  `jira_oauth:PROJ`、`teams_oauth:team/TEAM_ID/channel/CHANNEL_ID`）で指定し、
-  旧許可の自動転用はしない。詳細は [OAuth 接続](docs/oauth-connections.md) と
-  各 plugin README を参照。
+  `AICONSHELL_ALLOWED_SCOPES=github:owner/repo,discord:channel/CHANNEL_ID`。
+  Discord 送信入力の宛先は `channel:CHANNEL_ID` である。
+- 個人 PAT による代理運用・PAT 入力 UI・PAT 専用 plugin は提供しない。
+  Teams / Jira は後から同じアカウント方式で再サポートする予定。
 
-サーバーに設定したトークンを手元の `ADMIN_API_TOKEN` に設定して実行する:
+管理画面のアカウントページで発行したキーを手元の `ADMIN_API_TOKEN` に設定して実行する:
 
 ```sh
 curl -i -X POST http://127.0.0.1:3000/api/admin/task_requests \
@@ -117,7 +111,7 @@ curl -i -X POST http://127.0.0.1:3000/api/admin/task_requests \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: open-issues-review-001" \
   --data-binary @- <<'JSON'
-{"title":"未完了Issueの確認","description":"owner/repoの未完了Issueを確認し、緊急ならTeamsのchannel:TEAM_ID/CHANNEL_IDへ要約を送ってください。なければ通知せず、取得範囲も結果に残してください。"}
+{"title":"未完了Issueの確認","description":"owner/repoの未完了Issueを確認し、緊急ならDiscordのchannel:CHANNEL_IDへ要約を送ってください。なければ通知せず、取得範囲も結果に残してください。"}
 JSON
 
 # POST の request_id を設定する（Idempotency-Key とは別のサーバー発行 UUID）

@@ -13,7 +13,7 @@ module EventLogging
     # PostgreSQL write error (unique conflict, check violation, ...) rolls
     # back only the savepoint. A rescued error must never poison the
     # caller's surrounding business transaction.
-    def enqueue(envelope, teams_channel: nil)
+    def enqueue(envelope)
       record = nil
       begin
         EventDelivery.transaction(requires_new: true) do
@@ -24,8 +24,7 @@ module EventLogging
             kind: envelope["kind"],
             task_id: envelope["task_id"],
             correlation_id: envelope["correlation_id"],
-            occurred_at: envelope["occurred_at"],
-            teams_channel:
+            occurred_at: envelope["occurred_at"]
           )
         end
       rescue ActiveRecord::RecordNotUnique
@@ -42,7 +41,6 @@ module EventLogging
     def pending(destination, limit:, now:)
       scope = case Aiconshell::Observability::Outbox.destination!(destination)
               when "clickhouse" then EventDelivery.clickhouse_pending(now)
-              when "teams" then EventDelivery.teams_pending(now)
               end
       scope.limit(limit).map { |record| to_record(record) }
     end
@@ -92,9 +90,7 @@ module EventLogging
         "id" => record.id,
         "event_id" => record.event_id,
         "envelope" => record.envelope,
-        "teams_channel" => record.teams_channel,
         "clickhouse" => destination_state(record, "clickhouse"),
-        "teams" => destination_state(record, "teams"),
         "created_at" => record.created_at
       }
     end

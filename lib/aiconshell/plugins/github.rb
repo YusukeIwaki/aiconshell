@@ -45,9 +45,20 @@ module Aiconshell
                 input_schema: Schemas::CREATE_ISSUE_INPUT,
                 output_schema: Schemas::WRITE_OUTPUT,
                 scope: "github:write"
+      operation "health_check",
+                input_schema: Schemas::HEALTH_CHECK_INPUT,
+                output_schema: Schemas::HEALTH_CHECK_OUTPUT,
+                scope: "github:read",
+                read_only: true
 
       API_URL_DEFAULT = "https://api.github.com"
       API_VERSION = "2022-11-28"
+      # Installation permissions the workflows need: issue/PR reads and
+      # writes plus workflow run reads. Metadata is auto-granted.
+      REQUIRED_INSTALLATION_PERMISSIONS = {
+        "issues" => "write", "pull_requests" => "write", "actions" => "read"
+      }.freeze
+      PERMISSION_RANK = { "read" => 1, "write" => 2 }.freeze
       SCOPE_PATTERN = %r{\A(?<owner>[A-Za-z0-9_-]+)/(?<repo>[A-Za-z0-9_.-]+)\z}
       RESOURCE_PATTERN = %r{\A(?<kind>issue|pr):(?<owner>[^/\s#]+)/(?<repo>[^/\s#]+)#(?<number>\d+)\z}
       MAX_PAGES = 25
@@ -382,6 +393,48 @@ module Aiconshell
         end
 
         { "external_id" => payload["id"].to_s, "url" => payload["html_url"] }
+      end
+
+      # Account connectivity plus installation permission check. Reads the
+      # installation (JWT auth, no installation token needed) and reports
+      # which required "<permission>:<level>" entries are ungranted. A
+      # transport/auth failure raises; insufficient permissions return ok:false.
+      def handle_health_check(_input, ctx)
+        env = ctx.env
+        app_id = env["GITHUB_APP_ID"].to_s
+        installation_id = env["GITHUB_INSTALLATION_ID"].to_s
+        key = secret_from(env, "GITHUB_PRIVATE_KEY", "GITHUB_PRIVATE_KEY_FILE")
+        missing = []
+        missing << "GITHUB_APP_ID" unless present?(app_id)
+        missing << "GITHUB_INSTALLATION_ID" unless present?(installation_id)
+        missing << "GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_FILE" if key.nil? || key.empty?
+        require_credentials!(missing)
+        unless installation_id.match?(/\A\d+\z/)
+          raise CredentialsMissing.new(plugin: plugin_id,
+                                       missing: ["GITHUB_INSTALLATION_ID (must be numeric)"])
+        end
+
+        api = api_base(env)
+        jwt = app_jwt(app_id, key, ctx.clock)
+        response = ctx.transport.request(
+          method: "GET", url: "#{api}/app/installations/#{installation_id}",
+          headers: {
+            "Authorization" => "Bearer #{jwt}",
+            "Accept" => "application/vnd.github+json",
+            "X-GitHub-Api-Version" => API_VERSION
+          },
+          body: nil
+        )
+        payload = Http.strict_json!(response.body, plugin: plugin_id, operation: "health_check")
+        permissions = payload.is_a?(Hash) ? payload["permissions"] : nil
+        unless permissions.is_a?(Hash)
+          raise OutputInvalid.new(plugin: plugin_id, operation: "health_check",
+                                  details: ["GitHub installation response had an unexpected shape"])
+        end
+        lacking = REQUIRED_INSTALLATION_PERMISSIONS.filter_map do |name, level|
+          PERMISSION_RANK.fetch(permissions[name].to_s, 0) >= PERMISSION_RANK.fetch(level) ? nil : "#{name}:#{level}"
+        end
+        { "ok" => lacking.empty?, "missing" => lacking }
       end
 
       def handle_create_issue(input, ctx)

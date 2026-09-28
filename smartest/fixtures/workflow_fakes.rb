@@ -21,8 +21,7 @@ module WorkflowFakes
     # production schemas and destination formats separately.
     FAKE_CATALOG = {
       "github" => %w[latest_events reply create_issue],
-      "jira" => %w[latest_events reply create_issue],
-      "teams" => %w[latest_events reply send_message create_issue]
+      "discord" => %w[latest_events reply send_message create_issue]
     }.freeze
 
     def initialize(events_by_scope: {}, errors: {})
@@ -93,9 +92,9 @@ module WorkflowFakes
         "scope" => "#{plugin}:#{name == 'latest_events' ? 'read' : 'write'}",
         "read_only" => name == "latest_events"
       }
-      if plugin == "teams" && name == "create_issue"
+      if plugin == "discord" && name == "create_issue"
         entry["unsupported"] = true
-        entry["reason"] = "Teams has no issue tracker"
+        entry["reason"] = "Discord has no issue tracker"
       end
       entry
     end
@@ -156,6 +155,23 @@ module WorkflowFakes
       human_event(event_id: event_id, fingerprint: fingerprint, resource_id: resource_id,
                   actor_id: "aiconshell-bot", body: "automated status ping")
         .merge("actor_type" => "bot")
+    end
+  end
+
+  # Scripted credential source standing in for the database-backed
+  # Accounts module. Maps plugin id to an env-shaped credential hash;
+  # unknown plugins read as unconfigured (empty env).
+  class FakeCredentialSource
+    def initialize(envs = {})
+      @envs = envs.transform_keys(&:to_s)
+    end
+
+    def env_for(plugin)
+      @envs.fetch(plugin.to_s, {})
+    end
+
+    def configured?(plugin)
+      !env_for(plugin).empty?
     end
   end
 

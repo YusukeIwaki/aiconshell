@@ -35,7 +35,7 @@ def core_feedback(task, body)
 end
 
 def core_event(id, resource:, actor: "human", payload: { "body" => "update" })
-  ExternalEvent.create!(plugin: "jira", event_id: id, fingerprint: id, event_type: "jira.change",
+  ExternalEvent.create!(plugin: "github", event_id: id, fingerprint: id, event_type: "github.issue_comment",
                         resource_id: resource, actor_id: "reviewer", actor_type: actor,
                         occurred_at: Time.current, payload: payload)
 end
@@ -276,7 +276,7 @@ end
 
 test("completed source receives a new open task and PostgreSQL prevents duplicate open sources") do |db:|
   with_workflow_env(scopes: "") do
-    closed = core_task(status: "done", source_plugin: "jira", source_resource_id: "issue:CORE-4")
+    closed = core_task(status: "done", source_plugin: "github", source_resource_id: "issue:CORE-4")
     event = core_event("new", resource: "issue:CORE-4")
     Coordination::TriageService.new(ai_runner: Object.new).call
     expect(event.reload.task_id == closed.id).to eq(false)
@@ -284,7 +284,7 @@ test("completed source receives a new open task and PostgreSQL prevents duplicat
     blocked = false
     begin
       Task.transaction(requires_new: true) do
-        core_task(source_plugin: "jira", source_resource_id: "issue:CORE-4")
+        core_task(source_plugin: "github", source_resource_id: "issue:CORE-4")
       end
     rescue ActiveRecord::RecordNotUnique
       blocked = true
@@ -396,7 +396,7 @@ end
 test("late external event ownership prevents reopening an older completed source") do |db:|
   with_workflow_env(scopes: "") do
     core_policy("coordination")
-    old = core_task(status: "done", source_plugin: "jira", source_resource_id: "issue:CORE-LATE")
+    old = core_task(status: "done", source_plugin: "github", source_resource_id: "issue:CORE-LATE")
     feedback = core_feedback(old, "continue this discussion")
     event = nil
     ai = CoreBlockRunner.new do
@@ -410,6 +410,6 @@ test("late external event ownership prevents reopening an older completed source
     expect(old.reload.status).to eq("done")
     expect(feedback.reload.processed?).to eq(false)
     expect(event.reload.task_id == old.id).to eq(false)
-    expect(Task.open_status.where(source_plugin: "jira", source_resource_id: "issue:CORE-LATE").count).to eq(1)
+    expect(Task.open_status.where(source_plugin: "github", source_resource_id: "issue:CORE-LATE").count).to eq(1)
   end
 end

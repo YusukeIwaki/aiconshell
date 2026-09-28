@@ -1,8 +1,9 @@
 # 外部サービスプラグインの追加
 
-組み込みプラグインの設定は [GitHub](github/README.md)、[Teams](teams/README.md)、
-[Jira](jira/README.md)、[Discord](discord/README.md) を参照してください。必要な環境変数の名前は管理画面にも表示されます。
-値や認証情報はリポジトリに保存しません。
+組み込みプラグインの設定は [GitHub](github/README.md)、[Discord](discord/README.md)
+を参照してください。認証情報は DB のアカウントに持ち、管理画面のアカウント
+ページで設定します。値や認証情報はリポジトリに保存しません。
+Teams / Jira は後から同じアカウント方式で再サポートする予定です。
 
 プラグインは信頼された Ruby コードとして登録します。MCP のように操作一覧と入出力スキーマを
 公開しますが、MCP の通信プロトコルを実装するサーバーではありません。
@@ -47,10 +48,12 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
 ```
 
 この名前空間は明示的に require するため、プラグインのコードを変更した場合は Rails を
-再起動します。同じ ID の重複登録はエラーです。環境変数を設定し、
+再起動します。同じ ID の重複登録はエラーです。認証情報を用意し、
 `AICONSHELL_ALLOWED_SCOPES=example:inbox` のように取得対象を許可すると、
 定期ジョブが設定済みプラグインの `latest_events` を呼びます。操作の入力スキーマで
 許容する scope を具体的に定義すると、スケジューラーでも検証されます。
+組み込みプラグインの認証情報は DB のアカウントから渡し、プロセス環境は
+認証情報の fallback にしません。
 
 ## 契約
 
@@ -63,9 +66,11 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
   このフックは `validate_input` と `invoke` の両方で呼ばれます。
   認証情報・HTTP・DB・変更可能なアプリケーション状態に依存せず、純粋な検証に限定し、
   不正入力では `InputInvalid` を送出してください。ハンドラーの処理を先取りしません。
-  組み込みの書込操作も宛先の構文をここで検証します。Teams の Bot 対応表や認証情報の
-  読み込みは実行時に行うため、preflight の成功は外部配信の成功を保証しません。
-- `required_env` と `configured?` は診断用です。実行時の認証情報確認もハンドラーで行います。
+  組み込みの書込操作も宛先の構文をここで検証します。認証情報の読み込みは
+  実行時に行うため、preflight の成功は外部配信の成功を保証しません。
+- `required_env` と `configured?` は診断用です。アダプターは環境形ハッシュを
+  受け取りますが、組み込み運用ではその内容を DB のアカウントから組み立てます。
+  実行時の認証情報確認もハンドラーで行います。
   値とファイルの選択肢がある場合は `configured?` を実装し、README に説明します。
 - 操作権限 `context["scopes"]` と投稿先の allowlist は別です。Interaction は許可された
   操作と宛先を確認します。カスタムプラグインの返信先は既定では `resource_id` 自体を
@@ -73,7 +78,7 @@ Aiconshell::Plugins::Registry.default.register(Aiconshell::Plugins::Example.new)
 - イベントの `event_id` は外部オブジェクトごとに安定させ、`fingerprint` で内容の変更を
   区別します。親の更新日時だけで別イベントにすると、自分の返信が再び依頼になる場合が
   あるため、親の内容変更と子のコメントを区別します。
-  組み込みの `github.issue` / `jira.issue` / `teams.message` / `teams.reply` は、
+  組み込みの `github.issue` / `discord.message` は、
   PollService が現在のスナップショットと比較して A→B→A の復元も別の改訂として保存します。
   カスタムイベント型は `event_id` と `fingerprint` の組で重複排除されるため、
   復元も区別したい場合は外部サービスの改訂 ID などを fingerprint に含めます。

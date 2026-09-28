@@ -31,12 +31,18 @@ module TaskRequestTestSupport
     end
   end
 
+  # Issues a real database-backed API token for the block. Blank or nil
+  # leaves no issued token, so every request fails closed (401). Rows are
+  # created inside the test transaction and roll back afterwards.
   def self.with_api_token(token)
-    old = ENV["ADMIN_API_TOKEN"]
-    ENV["ADMIN_API_TOKEN"] = token
-    yield
-  ensure
-    ENV["ADMIN_API_TOKEN"] = old
+    AdminApiToken.delete_all
+    if token.to_s.empty?
+      yield
+    else
+      AdminApiToken.create!(token_digest: AdminApiToken.digest_for(token.to_s),
+                            prefix: token.to_s[0, AdminApiToken::PREFIX_CHARS])
+      yield
+    end
   end
 
   def self.api_post(http, payload, key:, token: API_TOKEN, content_type: "application/json", path: "/api/admin/task_requests")

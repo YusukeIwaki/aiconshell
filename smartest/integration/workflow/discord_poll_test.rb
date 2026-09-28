@@ -18,10 +18,15 @@ DISCORD_ME_URL = "#{DISCORD_API}/users/@me"
 DISCORD_LIST_URL = "#{DISCORD_API}/channels/#{DISCORD_CHANNEL}/messages?limit=100"
 DISCORD_POST_URL = "#{DISCORD_API}/channels/#{DISCORD_CHANNEL}/messages"
 
+DISCORD_TEST_ENV = { "DISCORD_BOT_TOKEN" => "integration-bot-token" }.freeze
+
 def discord_registry(transport)
-  env = { "DISCORD_BOT_TOKEN" => "integration-bot-token" }
-  Aiconshell::Plugins::Registry.new(env: env, transport: transport)
+  Aiconshell::Plugins::Registry.new(env: {}, transport: transport)
     .register(Aiconshell::Plugins::Discord.new)
+end
+
+def discord_credentials
+  WorkflowFakes::FakeCredentialSource.new("discord" => DISCORD_TEST_ENV)
 end
 
 def discord_event_message(id, content: "please help <@#{DISCORD_BOT_ID}>", mentions: [DISCORD_BOT_ID],
@@ -46,11 +51,12 @@ def stub_discord_poll(transport, messages)
 end
 
 def discord_poller(registry, sink)
-  Interaction::PollService.new(registry: registry, event_sink: sink)
+  Interaction::PollService.new(registry: registry, event_sink: sink, credential_source: discord_credentials)
 end
 
 def discord_sender(registry, sink, ai)
-  Interaction::OutboundService.new(registry: registry, ai_runner: ai, event_sink: sink)
+  Interaction::OutboundService.new(registry: registry, ai_runner: ai, event_sink: sink,
+    credential_source: discord_credentials)
 end
 
 test("discord mention flows from poll to task to triage reply to sent delivery") do |db:|
@@ -78,7 +84,8 @@ test("discord mention flows from poll to task to triage reply to sent delivery")
 
     # 2. Coordination ingests the mention into a task (no policy yet, so no
     # AI ruling and no backoff), then rules a reply once enabled.
-    triage = Coordination::TriageService.new(ai_runner: ai, registry: registry, event_sink: sink)
+    triage = Coordination::TriageService.new(ai_runner: ai, registry: registry, event_sink: sink,
+      credential_source: discord_credentials)
     expect(triage.call.ingested).to eq(1)
     task = Task.last
     expect(task.source_plugin).to eq("discord")
@@ -252,6 +259,28 @@ test("overlong discord replies fail before any request and never go uncertain") 
     expect(outcome.ok).to eq(false)
     expect(action.reload.status).to eq("failed")
     expect(transport.requests).to eq([])
+
+    transport.assert_consumed!
+  end
+end
+
+test("poll uses database-backed account credentials without injection") do |db:|
+  with_workflow_env(scopes: "discord:channel/#{DISCORD_CHANNEL}") do
+    sink = WorkflowFakes::FakeEventSink.new
+    transport = BoundaryFixtures::HttpTransport.new
+    registry = discord_registry(transport)
+
+    account = DiscordAccount.current
+    account.bot_token = "db-bot-token"
+    account.save!
+
+    stub_discord_poll(transport, [discord_event_message("130000000000000010")])
+    poll = Interaction::PollService.new(registry: registry, event_sink: sink)
+      .call(plugin: "discord", scope: "channel/#{DISCORD_CHANNEL}")
+    expect(poll.ok).to eq(true)
+    expect(poll.ingested).to eq(1)
+    auth = transport.requests_to(DISCORD_ME_URL).first[:headers]["Authorization"]
+    expect(auth).to eq("Bot db-bot-token")
 
     transport.assert_consumed!
   end

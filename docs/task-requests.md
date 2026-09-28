@@ -19,8 +19,8 @@ See [the workflow contract](workflow.md) for limits and failure handling.
 | GET | `/admin/task_requests/new` | UI Basic | HTML form with server UUID key |
 | POST | `/admin/task_requests` | UI Basic + CSRF | 302 to receipt, or 422/409 form |
 | GET | `/admin/task_requests/:id` | UI Basic | HTML receipt (`:id` is request UUID) |
-| POST | `/api/admin/task_requests` | Bearer `ADMIN_API_TOKEN` | 202 JSON receipt |
-| GET | `/api/admin/task_requests/:id` | Bearer `ADMIN_API_TOKEN` | 200 JSON receipt |
+| POST | `/api/admin/task_requests` | Bearer 管理APIキー | 202 JSON receipt |
+| GET | `/api/admin/task_requests/:id` | Bearer 管理APIキー | 200 JSON receipt |
 
 The board (`/admin/tasks`) links to the new-request form. The UI is Japanese;
 API status/error codes stay English machine values (`accepted`, `processed`,
@@ -31,12 +31,14 @@ API status/error codes stay English machine values (`accepted`, `processed`,
 - UI reuses `Admin::BaseController` Basic auth (`ADMIN_USERNAME` /
   `ADMIN_PASSWORD`, fail closed when blank) and keeps Rails CSRF protection.
   No CSRF bypass was added.
-- API uses a separate `ADMIN_API_TOKEN` environment variable, fail closed
-  when blank or missing. Only `Authorization: Bearer <token>` is accepted,
-  compared in constant time (SHA256 digests). Basic auth and cookies are
-  never accepted as API fallback. The API ancestry is
-  `Api::Admin::BaseController < ActionController::API`, so UI protection
-  cannot be bypassed through the API.
+- API uses the database-backed `AdminApiToken` singleton (SHA256 digest
+  only), issued and rotated on the admin アカウント page and separate from
+  the UI Basic credentials. Unissued fails closed (401). Only
+  `Authorization: Bearer <token>` is accepted, compared in constant time
+  (SHA256 digests). Basic auth and cookies are never accepted as API
+  fallback. The API ancestry is `Api::Admin::BaseController <
+  ActionController::API`, so UI protection cannot be bypassed through the
+  API. Plaintext is shown once at rotation and never stored.
 - Auth runs before body validation: a malformed or oversized body with bad
   credentials still returns 401 `unauthorized`.
 
@@ -173,6 +175,7 @@ are visible on the admin Task detail and in authenticated API receipts.
 ## API examples
 
 ```sh
+# ADMIN_API_TOKEN は管理画面のアカウントページで発行した値を入れる。
 curl -i -X POST http://127.0.0.1:3000/api/admin/task_requests \
   -H "Authorization: Bearer $ADMIN_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -188,7 +191,7 @@ curl -sS "http://127.0.0.1:3000/api/admin/task_requests/$REQUEST_ID" \
 # {"request_id":"<uuid>","status":"processed","task_id":123,"task_status":"waiting_delivery","coordination_result":{"summary":"One urgent issue; notification queued.","action_count":1},"last_error":null}
 ```
 
-For a connector request example and required GitHub/Teams/AI setup, see
+For a connector request example and required GitHub/Discord/AI setup, see
 [the README](../README.md#自然言語で依頼する). An HTTP 202 receipt does not
 promise a successful AI judgment or external delivery.
 
@@ -214,5 +217,6 @@ API errors (all content-free JSON):
 - `config/initializers/filter_parameter_logging.rb`
   (`:title`, `:description`, `:body`)
 - `smartest/integration/admin/support/task_request_test_support.rb`
-- `.env.example`, `compose.yml` (web `ADMIN_API_TOKEN`), `README.md`,
-  `docs/deployment.md` (Railway `ADMIN_API_TOKEN`)
+- `app/models/admin_api_token.rb`,
+  `app/controllers/admin/accounts_controller.rb`（発行・再発行）
+- `.env.example`, `compose.yml`, `README.md`, `docs/deployment.md`

@@ -1,9 +1,9 @@
-# EventLog (ClickHouse + outbox + Teams)
+# EventLog (ClickHouse + outbox)
 
 Each layer emits structured events. `emit` writes a redacted, validated
 envelope to the PostgreSQL outbox spool and returns; a recurring job drains
-the spool into ClickHouse (searchable history) and, for opted-in events, a
-Teams channel. Logging failures never roll back business updates.
+the spool into ClickHouse (searchable history). Logging failures never roll
+back business updates.
 
 ```ruby
 Aiconshell::Observability.emit(
@@ -33,8 +33,7 @@ cannot evict or corrupt neighbors.
 
 ## Redaction
 
-Applied before validation, so only redacted bytes are stored, searched, or
-posted to Teams:
+Applied before validation, so only redacted bytes are stored or searched:
 
 - Keys: password/passwd, secret, token, authorization, credential,
   cookie, session, bearer, `*_key` patterns (`api_key`, `access_key`,
@@ -56,10 +55,9 @@ carrier-key list is a backstop, not permission.
 
 ## Outbox spool (PostgreSQL)
 
-Table `event_deliveries` (migration `db/migrate/20260926000005_*`): the
-envelope plus `teams_channel` and independent per-destination state
+Table `event_deliveries`: the envelope plus per-destination state
 (`*_delivered_at`, `*_skipped_at`, `*_attempts`, `*_next_retry_at`,
-`*_last_error`) for `clickhouse` and `teams`. `event_id` is unique, so
+`*_last_error`) for `clickhouse`. `event_id` is unique, so
 double-enqueue (e.g. business-transaction retry) stores one row.
 
 Delivery (`Aiconshell::Observability::DeliveryService`, run by
@@ -67,31 +65,23 @@ Delivery (`Aiconshell::Observability::DeliveryService`, run by
 
 - ClickHouse rows are claimed in batches and inserted with one JSONEachRow
   request; the delivered mark is written only after the insert succeeds.
-- Teams rows are posted one message per row through the plugins port
-  (`teams` / `send_message`); when the sink is disabled the rows are marked
-  skipped, not retried.
-- Failures back off exponentially (2 min × 2^(attempts−1), capped at 6 h)
-  per destination, bounded at 25 attempts: a row that keeps failing is
-  marked skipped (terminal, prunable) so a long outage cannot grow the
-  spool without bound. Skipped ClickHouse rows never reach history —
-  alert on `*_skipped_at` growth. ClickHouse success followed by Teams
-  failure never re-inserts into ClickHouse.
-- Each sink run is isolated: a failure listing, inserting, posting, or
-  marking rows for one destination is counted and logged while the other
-  destination still runs. No DB transaction is held over HTTP calls.
+- Failures back off exponentially (2 min × 2^(attempts−1), capped at 6 h),
+  bounded at 25 attempts: a row that keeps failing is marked skipped
+  (terminal, prunable) so a long outage cannot grow the spool without
+  bound. Skipped ClickHouse rows never reach history —
+  alert on `*_skipped_at` growth.
+- A failure listing, inserting, or marking rows is counted and logged in
+  the run summary. No DB transaction is held over HTTP calls.
 - Delivered rows are pruned after 7 days (`prune_retention_days:`); rows
-  terminal in both destinations (delivered or skipped) are prunable. The
+  terminal (delivered or skipped) are prunable. The
   spool is not an archive: history lives in ClickHouse.
 
 One delivery job runs at a time (Solid Queue `limits_concurrency`, `to:
-1`, conflicting runs block and reschedule); concurrent runs are safe for
-ClickHouse (idempotent by `event_id`) but could double-post Teams, so
-they are serialized. A dedicated PostgreSQL session advisory lock also
-guards jobs that outlive the queue semaphore duration; a contending job
-skips that tick. This reserves one extra pool connection without a long
-transaction. Session loss releases the lock and cannot fence an already
-in-flight remote request. A crash between a Teams post and its delivered mark
-can still double-post on redelivery (see below).
+1`, conflicting runs block and reschedule). A dedicated PostgreSQL session
+advisory lock also guards jobs that outlive the queue semaphore duration;
+a contending job skips that tick. This reserves one extra pool connection
+without a long transaction. Session loss releases the lock and cannot fence
+an already in-flight remote request.
 
 ## ClickHouse
 
@@ -128,32 +118,11 @@ class) and watch `system.merges` and query latency before scaling. No
 sharding or replicas in the initial topology; add replicas only when
 measured availability needs them.
 
-## Teams delivery
-
-Set `EVENT_LOG_TEAMS_CHANNEL=channel:<teamId>/<channelId>` to send each
-layer's events to one operator-configured channel. Leave it empty to keep
-history searchable without Teams notifications. Configure the Teams plugin's
-credentials and `TEAMS_BOT_TARGETS_FILE` conversation mapping as described in
-`plugins/teams/README.md`; Graph channel IDs are not Bot conversation IDs.
-The destination is captured on each outbox row when the event is emitted.
-An internal caller may pass an explicit `teams_channel` to override it.
-
-`TeamsSink` calls `registry.invoke(plugin: "teams", operation:
-"send_message", input: {"scope", "body"})` with a ≤1000-char
-`[layer/kind] message (task #id)` body. It is disabled when no registry is
-injected or the Teams plugin catalog entry reports unconfigured. The sink
-logs through its injected logger only and never emits events, so a Teams
-outage cannot recurse into the outbox.
-
 ## Duplication guarantees
 
 - ClickHouse: at-least-once delivery, exactly-once reads. Replays collapse
   by `event_id` (background merges eventually; `FINAL` reads exactly).
   `search(event_id:)` re-reads one logical event idempotently.
-- Teams: at-least-once with no provider idempotency. Success followed by a
-  crash before the delivered mark can double-post; loss of the advisory-lock
-  connection during an in-flight request can do the same. Treat Teams as
-  notification, not the source of record.
 - Outbox: `event_id` unique; `enqueue` is idempotent.
 
 ## Failure behavior and loss conditions
@@ -170,13 +139,10 @@ outage cannot recurse into the outbox.
   outage are lost — the documented trade-off for "logging never breaks
   business updates".
 - ClickHouse down: rows stay pending with backoff for up to 25 attempts;
-  persistent failures then become skipped as described above. Teams
-  delivery continues independently.
+  persistent failures then become skipped as described above.
 - ClickHouse unconfigured (`CLICKHOUSE_URL` unset): rows stay pending and
   each run logs an error. This is a deploy misconfiguration — alert on it,
   do not let the spool grow silently.
-- Teams disabled/failing: rows are skipped (disabled) or retried with
-  backoff (failing); ClickHouse delivery is unaffected.
 - Delivery-job crash between sink success and delivered mark: redelivery
   (see duplication guarantees). The job itself never emits events, so
   delivery failures cannot loop back into the spool.

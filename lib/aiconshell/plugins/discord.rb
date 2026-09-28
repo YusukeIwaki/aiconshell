@@ -68,7 +68,12 @@ module Aiconshell
                 output_schema: Schemas::WRITE_OUTPUT,
                 scope: "discord:write",
                 unsupported: true,
-                reason: "Discord has no issue tracker; create issues via the github or jira plugin"
+                reason: "Discord has no issue tracker; create issues via the github plugin"
+      operation "health_check",
+                input_schema: Schemas::HEALTH_CHECK_INPUT,
+                output_schema: Schemas::HEALTH_CHECK_OUTPUT,
+                scope: "discord:read",
+                read_only: true
 
       API_ORIGIN = "https://discord.com"
       API_BASE = "https://discord.com/api/v10"
@@ -187,6 +192,12 @@ module Aiconshell
         post_message(ctx, match[:channel], input["body"].to_s, "reply", reply_to: match[:message])
       end
 
+      # Account connectivity check: resolves the bot's own user id with
+      # the configured Bot token. Transport/auth failures raise.
+      def handle_health_check(_input, ctx)
+        { "ok" => true, "bot_id" => fetch_self_id(ctx, operation: "health_check") }
+      end
+
       def handle_send_message(input, ctx)
         match = SEND_SCOPE_PATTERN.match(input["scope"].to_s)
         unless match && self.class.valid_snowflake?(match[:channel])
@@ -226,12 +237,12 @@ module Aiconshell
 
       # Resolve the bot's own user id with the configured Bot token. Never
       # inferred from message text.
-      def fetch_self_id(ctx)
+      def fetch_self_id(ctx, operation: "latest_events")
         response = ctx.transport.request(method: "GET", url: "#{API_BASE}/users/@me",
                                          headers: auth_headers(ctx.env), body: nil)
-        payload = Http.strict_json!(response.body, plugin: plugin_id, operation: "latest_events")
+        payload = Http.strict_json!(response.body, plugin: plugin_id, operation: operation)
         unless payload.is_a?(Hash) && self.class.valid_snowflake?(payload["id"])
-          raise OutputInvalid.new(plugin: plugin_id, operation: "latest_events",
+          raise OutputInvalid.new(plugin: plugin_id, operation: operation,
                                   details: ["Discord user response had an unexpected shape"])
         end
         payload["id"].to_s

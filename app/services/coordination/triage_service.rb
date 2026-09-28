@@ -76,23 +76,14 @@ module Coordination
     }.freeze
 
     def initialize(ai_runner: nil, registry: Aiconshell::Plugins::Registry.default,
-                   event_sink: WorkflowEvents, clock: Time, oauth_credential_provider: nil)
+                   event_sink: WorkflowEvents, clock: Time, credential_source: nil)
       @ai_runner = ai_runner || default_runner
       @registry = registry
       @query_service = Interaction::QueryService.new(registry: registry, event_sink: event_sink,
-        oauth_credential_provider: oauth_credential_provider)
+        credential_source: credential_source)
       @action_validator = Interaction::ActionValidator.new(registry: registry)
       @event_sink = event_sink
       @clock = clock
-      @oauth_credential_provider = oauth_credential_provider
-    end
-
-    def oauth_provider
-      @oauth_credential_provider ||= begin
-        Oauth::CredentialProvider.new(event_sink: @event_sink)
-      rescue StandardError
-        nil
-      end
     end
 
     def call(batch_limit: 50)
@@ -121,17 +112,9 @@ module Coordination
 
             # Serialize different event rows for one external source. The
             # partial unique index also protects callers outside this path.
-            # OAuth Task joins isolate by fetching generation
-            # (`oauth_source_key`); legacy sources keep the global
-            # plugin/resource lock. A new post or edit from another
-            # generation never joins this Task (handled revisions never
-            # re-create events at all: event dedup is generation-free).
-            source_key = event.respond_to?(:oauth_source_key) ? event.oauth_source_key : nil
-            key = Digest::SHA256.digest("#{event.plugin}\0#{source_key}\0#{event.resource_id}").unpack1("q>")
+            key = Digest::SHA256.digest("#{event.plugin}\0#{event.resource_id}").unpack1("q>")
             Task.connection.execute("SELECT pg_advisory_xact_lock(#{key})")
-            task_scope = Task.open_status.lock.where(source_plugin: event.plugin, source_resource_id: event.resource_id)
-            task_scope = task_scope.where(oauth_source_key: source_key) if Task.column_names.include?("oauth_source_key")
-            task = task_scope.first
+            task = Task.open_status.lock.where(source_plugin: event.plugin, source_resource_id: event.resource_id).first
             if task
               if event.actor_type == "human"
                 TaskFeedback.create!(task: task, body: body_from(event), author: event.actor_id.to_s, author_type: "human")
@@ -139,22 +122,8 @@ module Coordination
               task.update!(next_action_at: now)
               task.touch(time: now)
             else
-              # The new Task keeps the event's fetch-time source binding
-              # (never the current connection): a later reply is fenced
-              # against the connection that produced the event. An
-              # existing open Task keeps the binding it was created with.
-              # Same resource IDs on other connections create their own
-              # Tasks instead of joining this one.
-              attrs = { title: title_from(event), description: body_from(event), status: "inbox", priority: 0,
-                        source_plugin: event.plugin, source_resource_id: event.resource_id }
-              if Task.column_names.include?("oauth_binding") && event.respond_to?(:oauth_binding) &&
-                  !event.oauth_binding.nil?
-                attrs[:oauth_binding] = event.oauth_binding
-              end
-              if Task.column_names.include?("oauth_source_key") && event.respond_to?(:oauth_source_key)
-                attrs[:oauth_source_key] = source_key
-              end
-              task = Task.create!(attrs)
+              task = Task.create!(title: title_from(event), description: body_from(event), status: "inbox", priority: 0,
+                source_plugin: event.plugin, source_resource_id: event.resource_id)
             end
             event.update!(task: task, processed_at: now, last_error: nil)
             count += 1
@@ -195,19 +164,7 @@ module Coordination
                          data: { error_code: answer[:code].to_s })
         return [0, 0]
       end
-      apply_rulings(snapshots, answer[:rulings], now, policy, answer[:oauth_bindings])
-    end
-
-    def oauth_snapshots_current?(oauth_snapshots)
-      return true if oauth_snapshots.nil? || oauth_snapshots.empty?
-
-      oauth_snapshots.all? do |plugin, snapshot|
-        next true if snapshot.nil?
-
-        Interaction::OauthContext.snapshot_current?(snapshot, plugin, credential_provider: oauth_provider)
-      end
-    rescue StandardError
-      false
+      apply_rulings(snapshots, answer[:rulings], now, policy)
     end
 
     def snapshot(task)
@@ -229,24 +186,8 @@ module Coordination
       observations = []
       rounds = 0
       reads = 0
-      # Trusted OAuth snapshots fixed server-side (never from AI). Reads
-      # reuse the same snapshot; results verify it still holds so a
-      # disconnect/replacement between read and result stops instead of
-      # continuing as another principal. Refresh never bumps the generation.
-      oauth_snapshots = {}
-      snapshots.each do |entry|
-        plugin = entry[:task].source_plugin.to_s
-        next unless Interaction::OauthContext.oauth_plugin?(plugin) && !oauth_snapshots.key?(plugin)
-
-        begin
-          oauth_snapshots[plugin] = @query_service.oauth_snapshot(plugin)
-        rescue Oauth::CredentialProvider::NotConnected, Aiconshell::Oauth::Error, ArgumentError
-          oauth_snapshots[plugin] = nil
-        end
-      end
       loop do
         return { ok: false, code: :stale_decision } unless snapshots_current?(snapshots, policy)
-        return { ok: false, code: :stale_decision } unless oauth_snapshots_current?(oauth_snapshots)
 
         prompt = decision_prompt(snapshots, observations)
         return { ok: false, code: :prompt_too_large } if prompt.bytesize > MAX_PROMPT_BYTES
@@ -260,12 +201,9 @@ module Coordination
           return { ok: false, code: :provider_invalid_output }
         end
         if value.key?("rulings")
-          return { ok: false, code: :stale_decision } unless oauth_snapshots_current?(oauth_snapshots)
-
-          return { ok: true, rulings: value.fetch("rulings"), oauth_bindings: oauth_snapshots }
+          return { ok: true, rulings: value.fetch("rulings") }
         end
         return { ok: false, code: :stale_decision } unless snapshots_current?(snapshots, policy)
-        return { ok: false, code: :stale_decision } unless oauth_snapshots_current?(oauth_snapshots)
 
         requests = value.fetch("read_requests")
         return { ok: false, code: :read_limit } if rounds >= MAX_READ_ROUNDS || reads + requests.length > MAX_READ_REQUESTS
@@ -283,25 +221,8 @@ module Coordination
         rounds += 1
         requests.each do |request|
           return { ok: false, code: :stale_decision } unless snapshots_current?(snapshots, policy)
-          return { ok: false, code: :stale_decision } unless oauth_snapshots_current?(oauth_snapshots)
 
-          keywords = query_keywords(request)
-          if Interaction::OauthContext.oauth_plugin?(keywords[:plugin].to_s)
-            plugin = keywords[:plugin].to_s
-            unless oauth_snapshots.key?(plugin) && !oauth_snapshots[plugin].nil?
-              begin
-                oauth_snapshots[plugin] = @query_service.oauth_snapshot(plugin)
-              rescue Oauth::CredentialProvider::NotConnected, Aiconshell::Oauth::Error, ArgumentError => error
-                code = error.is_a?(Oauth::CredentialProvider::NotConnected) || error.is_a?(Aiconshell::Oauth::Error) ? :not_connected : :credentials_missing
-                return { ok: false, code: code }
-              end
-              if oauth_snapshots[plugin].nil?
-                return { ok: false, code: :not_connected }
-              end
-            end
-            keywords = keywords.merge(binding: oauth_snapshots[plugin])
-          end
-          result = @query_service.call(**keywords)
+          result = @query_service.call(**query_keywords(request))
           reads += 1
           return { ok: false, code: result.code } unless result.ok?
 
@@ -365,10 +286,8 @@ module Coordination
         failed notification without considering the delivery history and new feedback.
         A done or cancelled task with new feedback must first use the existing
         transition to inbox before a later result can be applied.
-        Use only supported write schemas and operator-allowed destinations. Teams
-        send_message uses input_scope channel:team/channel (teams_oauth channel
-        team/t/channel/c maps to channel:t/c, chat/c maps to chat:c), not its
-        permission_scope. Discord send_message and reply bodies are limited to
+        Use only supported write schemas and operator-allowed destinations.
+        Discord send_message and reply bodies are limited to
         2000 characters; Discord send_message uses channel:<channelId> for both
         its permission and input scopes.
         waiting_delivery is server-owned and cannot be requested or changed by AI.
@@ -381,28 +300,11 @@ module Coordination
     end
 
     # Maps an operator-allowlisted permission scope to the write input
-    # scope the AI must use. Legacy `teams` channels and delegated
-    # `teams_oauth` channels/chats poll as `team/t/channel/c` or `chat/c`
-    # but send as `channel:t/c` or `chat:c`. Jira project scopes and all
-    # other plugins use the same string for poll and write. Read/poll
-    # permission scopes themselves are unchanged.
+    # scope the AI must use. Discord channels poll as `channel/<id>` but
+    # send as `channel:<id>`. GitHub scopes use the same string for poll
+    # and write. Read/poll permission scopes themselves are unchanged.
     def input_scope_for(plugin, scope)
       scope = scope.to_s
-      if plugin.to_s == "teams"
-        match = %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
-        return "channel:#{match[1]}/#{match[2]}" if match
-
-        return scope
-      end
-      if plugin.to_s == "teams_oauth"
-        channel = %r{\Ateam/([^/]+)/channel/([^/]+)\z}.match(scope)
-        return "channel:#{channel[1]}/#{channel[2]}" if channel
-
-        chat = %r{\Achat/([^/]+)\z}.match(scope)
-        return "chat:#{chat[1]}" if chat
-
-        return scope
-      end
       if plugin.to_s == "discord"
         discord = %r{\Achannel/([^/]+)\z}.match(scope)
         return "channel:#{discord[1]}" if discord
@@ -430,12 +332,12 @@ module Coordination
       end
     end
 
-    def apply_rulings(snapshots, rulings, now, policy, oauth_bindings = nil)
+    def apply_rulings(snapshots, rulings, now, policy)
       by_id = snapshots.index_by { |entry| entry[:task].id }
       # New result rounds are atomic, including any legacy rulings beside them.
       # Legacy-only rounds retain the established sequential duplicate behavior.
       if rulings.any? { |ruling| ruling.key?("result") }
-        return apply_result_round(snapshots, rulings, by_id, now, policy, oauth_bindings)
+        return apply_result_round(snapshots, rulings, by_id, now, policy)
       end
 
       triaged = 0
@@ -448,14 +350,14 @@ module Coordination
           next
         end
         seen[ruling["task_id"]] = true
-        apply_ruling(entry, ruling, now, policy, oauth_bindings) ? triaged += 1 : rejected += 1
+        apply_ruling(entry, ruling, now, policy) ? triaged += 1 : rejected += 1
       end
       @event_sink.emit(layer: "coordination", kind: "triage.completed", message: "Coordination rulings applied",
                        data: { triaged: triaged, rejected: rejected })
       [triaged, rejected]
     end
 
-    def apply_result_round(snapshots, rulings, by_id, now, policy, oauth_bindings = nil)
+    def apply_result_round(snapshots, rulings, by_id, now, policy)
       return [0, rulings.size] unless valid_references?(rulings, by_id)
       return [0, rulings.size] unless rulings.all? { |ruling| preflight_result_ruling(by_id.fetch(ruling["task_id"]), ruling) }
 
@@ -463,10 +365,9 @@ module Coordination
       Task.transaction(requires_new: true) do
         Task.where(id: rulings.map { |ruling| ruling["task_id"] }).order(:id).lock.load
         raise ActiveRecord::Rollback unless snapshots_current?(snapshots, policy)
-        raise ActiveRecord::Rollback unless oauth_snapshots_current?(oauth_bindings)
 
         rulings.each do |ruling|
-          raise ActiveRecord::Rollback unless apply_ruling(by_id.fetch(ruling["task_id"]), ruling, now, policy, oauth_bindings)
+          raise ActiveRecord::Rollback unless apply_ruling(by_id.fetch(ruling["task_id"]), ruling, now, policy)
         end
         applied = true
       end
@@ -495,12 +396,11 @@ module Coordination
       end
     end
 
-    def apply_ruling(entry, ruling, now, policy, oauth_bindings = nil)
+    def apply_ruling(entry, ruling, now, policy)
       if ruling.key?("result")
-        outcome = ResultService.new(registry: @registry, event_sink: @event_sink, clock: @clock,
-          oauth_credential_provider: oauth_provider).apply(
+        outcome = ResultService.new(registry: @registry, event_sink: @event_sink, clock: @clock).apply(
           task_id: entry[:task].id, task_version: entry[:version], feedback_ids: entry[:feedback_ids],
-          policy: policy, result: ruling.fetch("result"), oauth_bindings: oauth_bindings)
+          policy: policy, result: ruling.fetch("result"))
         return false unless outcome.ok
 
         Task.find(entry[:task].id).update!(priority: ruling["priority"]) if ruling.key?("priority")
@@ -514,13 +414,6 @@ module Coordination
         next false if task.status == "waiting_delivery" || ruling["status"] == "waiting_delivery"
         next false unless LayerPolicy.where(id: policy.id, enabled: true, updated_at: policy.updated_at).exists?
         next false unless valid_reply?(task, ruling["reply"])
-        # Fence stale OAuth replies before any mutation: a disconnect or
-        # replacement between fetch and reply rejects with no Task change,
-        # no dispatch, and no feedback acknowledgement. `next false` here
-        # commits nothing because nothing changed yet.
-        if ruling["reply"]
-          next false unless oauth_reply_current?(task, oauth_bindings)
-        end
 
         target = ruling.fetch("status", task.status)
         dispatch = ruling["dispatch"] == true
@@ -528,9 +421,6 @@ module Coordination
           next false if entry[:feedback_ids].empty?
           if target == "inbox" && task.source_plugin.present? && task.source_resource_id.present?
             reopen_scope = Task.open_status.where(source_plugin: task.source_plugin, source_resource_id: task.source_resource_id)
-            if Task.column_names.include?("oauth_source_key") && task.respond_to?(:oauth_source_key)
-              reopen_scope = reopen_scope.where(oauth_source_key: task.oauth_source_key)
-            end
             next false if reopen_scope.where.not(id: task.id).exists?
           end
         end
@@ -562,12 +452,7 @@ module Coordination
           raise ActiveRecord::Rollback unless run
         end
         if ruling["reply"]
-          # Re-fence after mutations but before the write: a replacement
-          # that landed while waiting for locks rolls everything back
-          # instead of partially committing Task/dispatch state.
-          raise ActiveRecord::Rollback unless oauth_reply_current?(task, oauth_bindings)
-
-          create_reply_action(task, ruling["reply"], entry[:version], oauth_bindings) or raise ActiveRecord::Rollback
+          create_reply_action(task, ruling["reply"], entry[:version]) or raise ActiveRecord::Rollback
         end
         # These exact rows were in the input snapshot; new arrivals and
         # rejected/omitted tasks remain pending for another coordination pass.
@@ -588,48 +473,12 @@ module Coordination
         (!reply.key?("operation") || reply["operation"] == "reply")
     end
 
-    # External-event Task → reply fencing: an OAuth reply proceeds only
-    # when the Task's own fetch-time source binding still matches the
-    # current connection. The binding was fixed when the poll fetched
-    # the event and stored on the Task at creation; it is never re-taken
-    # at triage start, so a disconnect/replacement between fetch and
-    # reply stops instead of sending as another principal. Each Task is
-    # fenced by its own binding: same-provider Tasks from different
-    # generations never mix through one plugin-wide snapshot.
-    # The triage-start snapshot argument is kept for the admin-result
-    # path; replies ignore it.
-    def oauth_reply_current?(task, _oauth_bindings = nil)
-      plugin = task.source_plugin.to_s
-      return true unless Interaction::OauthContext.oauth_plugin?(plugin)
-      return false unless Task.column_names.include?("oauth_binding")
-
-      stored = task.oauth_binding
-      return false unless stored.is_a?(Hash)
-
-      begin
-        current = Interaction::OauthContext.snapshot_binding(plugin, credential_provider: oauth_provider)
-      rescue StandardError
-        return false
-      end
-      current_hash = current.is_a?(Hash) ? current : current.to_h
-      Aiconshell::Oauth::Binding.from_h(stored).matches?(current_hash)
-    rescue StandardError
-      false
-    end
-
-    def create_reply_action(task, reply, version, oauth_bindings = nil)
-      attrs = { plugin: task.source_plugin, operation: "reply", task: task,
+    def create_reply_action(task, reply, version)
+      OutboundAction.create!(
+        plugin: task.source_plugin, operation: "reply", task: task,
         input: { "resource_id" => task.source_resource_id, "body" => reply.fetch("body") },
-        idempotency_key: "triage-#{task.id}-#{version}", status: "pending" }
-      if Interaction::OauthContext.oauth_plugin?(task.source_plugin.to_s)
-        # The enqueue-time snapshot is the Task's fetch-time binding so
-        # delivery fences against the connection that produced the event.
-        stored = task.oauth_binding
-        return false unless stored.is_a?(Hash)
-
-        attrs[:oauth_binding] = stored if OutboundAction.column_names.include?("oauth_binding")
-      end
-      OutboundAction.create!(attrs)
+        idempotency_key: "triage-#{task.id}-#{version}", status: "pending"
+      )
       true
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
       false

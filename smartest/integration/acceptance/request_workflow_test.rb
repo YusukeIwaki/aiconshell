@@ -4,13 +4,13 @@ require_relative "request_workflow_support"
 
 # Real PostgreSQL, controllers, Coordination, Registry/adapters, AI Runner,
 # schemas and EventLog. Only HTTP and the AI process boundary are scripted.
-test("admin API request reads GitHub and completes only after one Teams delivery") do |http:|
+test("admin API request reads GitHub and completes only after one Discord delivery") do |http:|
   RequestAcceptance.with_context do |ctx|
     flow = RequestAcceptance::Workflow
     expect(Aiconshell::Observability.config.outbox.is_a?(EventLogging::OutboxAdapter)).to eq(true)
     payload = {
       title: "Urgent open issues",
-      description: "Read o/r issues. Post urgent items to the configured Teams channel."
+      description: "Read o/r issues. Post urgent items to the configured Discord channel."
     }
     receipt_body = flow.api_post(http, payload, key: "urgent-review")
     expect(http.last_response.status).to eq(202)
@@ -41,7 +41,7 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     message = "Urgent: #42 Login outage — https://github.com/o/r/issues/42"
     summary = "Reviewed open issues and queued one urgent-issue notification."
     ctx.process_runner.enqueue(->(call) do
-      flow.result_answer(call, summary: summary, actions: [flow.teams_action(message)])
+      flow.result_answer(call, summary: summary, actions: [flow.discord_action(message)])
     end)
 
     triage = flow.triage(ctx)
@@ -56,12 +56,12 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     expect(event.reload.processed?).to eq(true)
     action = task.outbound_actions.sole
     expect(action.status).to eq("pending")
-    expect(action.plugin).to eq("teams")
+    expect(action.plugin).to eq("discord")
     expect(action.operation).to eq("send_message")
-    expect(action.input).to eq({ "scope" => RequestAcceptance::TEAMS_WRITE_TARGET, "body" => message })
+    expect(action.input).to eq({ "scope" => RequestAcceptance::DISCORD_WRITE_TARGET, "body" => message })
     expect(action.delivery_batch_key).to eq(task.delivery_batch_key)
     expect(task.delivery_batch_key.present?).to eq(true)
-    expect(ctx.teams_posts).to eq([])
+    expect(ctx.discord_posts).to eq([])
 
     calls = ctx.process_runner.calls
     expect(calls.size).to eq(2)
@@ -79,15 +79,15 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     })
     targets = flow.prompt_data(calls.first, "CAPABILITIES").fetch("allowed_targets")
     expect(targets.include?({
-      "plugin" => "teams", "permission_scope" => RequestAcceptance::TEAMS_CHANNEL_SCOPE,
-      "input_scope" => RequestAcceptance::TEAMS_WRITE_TARGET
+      "plugin" => "discord", "permission_scope" => RequestAcceptance::DISCORD_CHANNEL_SCOPE,
+      "input_scope" => RequestAcceptance::DISCORD_WRITE_TARGET
     })).to eq(true)
     calls.each do |call|
       expect(call[:argv].first.end_with?("/claude")).to eq(true)
       expect(call[:argv][call[:argv].index("--model") + 1]).to eq("fixture-model")
       expect(call[:argv][call[:argv].index("--effort") + 1]).to eq("max")
       expect(call[:argv].include?(call[:stdin_data])).to eq(false)
-      %w[DATABASE_URL TEST_DATABASE_URL GITHUB_PRIVATE_KEY TEAMS_CLIENT_SECRET TEAMS_BOT_APP_PASSWORD
+      %w[DATABASE_URL TEST_DATABASE_URL
          ADMIN_USERNAME ADMIN_PASSWORD ADMIN_API_TOKEN].each do |key|
         expect(call[:env].key?(key)).to eq(false)
       end
@@ -108,17 +108,18 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     expect(triage.call.triaged).to eq(0)
     expect(task.outbound_actions.count).to eq(1)
 
-    ctx.expect_teams_token
-    ctx.expect_teams_post(external_id: "fixture-activity-42")
+    ctx.expect_discord_post(external_id: "140000000000000042")
     delivery = Interaction::OutboundService.new(registry: ctx.registry, ai_runner: ctx.runner, clock: ctx.clock)
     expect(delivery.call(action.id).ok).to eq(true)
     expect(action.reload.status).to eq("sent")
-    expect(action.external_id).to eq("fixture-activity-42")
+    expect(action.external_id).to eq("140000000000000042")
     expect(task.reload.status).to eq("waiting_delivery")
-    expect(ctx.teams_posts.size).to eq(1)
-    wire = ctx.teams_posts.sole
-    expect(JSON.parse(wire[:body])).to eq({ "type" => "message", "text" => message })
-    expect(wire[:headers]["Authorization"]).to eq("Bearer fixture-bot-token")
+    expect(ctx.discord_posts.size).to eq(1)
+    wire = ctx.discord_posts.sole
+    expect(JSON.parse(wire[:body])).to eq({
+      "content" => message, "allowed_mentions" => { "parse" => [], "replied_user" => false }
+    })
+    expect(wire[:headers]["Authorization"]).to eq("Bot #{RequestAcceptance::DISCORD_BOT_TOKEN}")
 
     reconciler = Coordination::DeliveryReconciler.new(clock: ctx.clock)
     expect(reconciler.reconcile(task_id: task.id).code).to eq(:settled_done)
@@ -129,7 +130,7 @@ test("admin API request reads GitHub and completes only after one Teams delivery
     expect(triage.call.triaged).to eq(0)
     expect(flow.api_post(http, payload, key: "urgent-review")["request_id"]).to eq(receipt.request_id)
     expect([TaskRequest.count, ExternalEvent.count, Task.count, OutboundAction.count, TaskRun.count]).to eq([1, 1, 1, 1, 0])
-    expect(ctx.teams_posts.size).to eq(1)
+    expect(ctx.discord_posts.size).to eq(1)
     expect(ctx.process_runner.calls.size).to eq(2)
 
     %w[triage.ingested query.completed result.applied outbound.sent delivery.settled].each do |kind|
@@ -140,7 +141,7 @@ test("admin API request reads GitHub and completes only after one Teams delivery
       expect(row.envelope["kind"]).to eq(row.kind)
     end
     serialized = flow.event_text
-    ["ghs_fixture_installation_token", "fixture-bot-token", "TASKS:", "OBSERVATIONS:",
+    ["ghs_fixture_installation_token", RequestAcceptance::DISCORD_BOT_TOKEN, ENV.fetch("ADMIN_API_TOKEN"),
      "structured_output", payload[:description], message].each do |private_text|
       expect(serialized.include?(private_text)).to eq(false)
     end
@@ -188,7 +189,7 @@ test("admin UI submits a CSRF-protected request through the same real intake") d
       expect(prompt["description"]).to eq(description)
       expect(prompt["admin_request"]).to eq(true)
       expect(task.outbound_actions.count).to eq(0)
-      expect(ctx.teams_posts).to eq([])
+      expect(ctx.discord_posts).to eq([])
       ctx.assert_consumed!
     ensure
       ActionController::Base.allow_forgery_protection = previous_csrf
@@ -196,7 +197,7 @@ test("admin UI submits a CSRF-protected request through the same real intake") d
   end
 end
 
-test("a complete GitHub page with no urgent issues finishes with zero Teams writes") do |http:|
+test("a complete GitHub page with no urgent issues finishes with zero Discord writes") do |http:|
   RequestAcceptance.with_context do |ctx|
     flow = RequestAcceptance::Workflow
     receipt = flow.submit(http)
@@ -219,8 +220,7 @@ test("a complete GitHub page with no urgent issues finishes with zero Teams writ
     expect(observed["issues"].sole["labels"]).to eq(["priority:low"])
     expect(OutboundAction.count).to eq(0)
     expect(TaskRun.count).to eq(0)
-    expect(ctx.teams_posts).to eq([])
-    expect(ctx.transport.requests_to(RequestAcceptance::TEAMS_TOKEN_URL)).to eq([])
+    expect(ctx.discord_posts).to eq([])
     ctx.assert_consumed!
   end
 end
@@ -251,7 +251,7 @@ test("partial and truncated GitHub results reach the next AI decision unchanged"
     expect(task.status).to eq("done")
     expect(task.coordination_result["summary"]).to eq(summary)
     expect(OutboundAction.count).to eq(0)
-    expect(ctx.teams_posts).to eq([])
+    expect(ctx.discord_posts).to eq([])
     expect(ctx.transport.requests_to(RequestAcceptance::GITHUB_ISSUES_PATTERN, method: "GET").size).to eq(1)
     ctx.assert_consumed!
   end

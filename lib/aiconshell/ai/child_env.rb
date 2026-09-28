@@ -6,7 +6,7 @@ module Aiconshell
   module Ai
     # Builds the controlled environment for AI CLI subprocesses. The child
     # environment is constructed from scratch: application credentials
-    # (database, GitHub, Jira, Teams, API keys, ...) are never inherited.
+    # (database, integration accounts, API keys, ...) are never inherited.
     # Only a minimal locale/PATH set plus the calling provider's subscription
     # credential home is exposed.
     module ChildEnv

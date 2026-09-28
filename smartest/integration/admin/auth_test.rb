@@ -11,7 +11,7 @@ test("unauthenticated admin GET routes all return 401") do |http:|
       /admin/tasks/1
       /admin/layer_policies
       /admin/layer_policies/coordination/edit
-      /admin/plugins
+      /admin/accounts
       /admin/event_logs
     ].each do |path|
       http.get path
@@ -52,7 +52,7 @@ test("fail closed: blank password denies all") do |http:|
   AdminTestSupport.with_env(AdminTestSupport::USERNAME, "") do
     http.header "Host", AdminTestSupport::HOST
     http.basic_authorize AdminTestSupport::USERNAME, ""
-    http.get "/admin/plugins"
+    http.get "/admin/accounts"
     expect(http.last_response.status).to eq(401)
   end
 end
@@ -64,7 +64,7 @@ test("authenticated admin pages return 200") do |http:|
       /admin/tasks
       /admin/layer_policies
       /admin/layer_policies/coordination/edit
-      /admin/plugins
+      /admin/accounts
       /admin/event_logs
     ].each do |path|
       http.get path

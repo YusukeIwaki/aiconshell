@@ -154,7 +154,7 @@ end
 
 test("validated batch persists atomically with stable idempotency keys") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_workflow_env(scopes: "github:owner/repo,teams:team/t1/channel/c1") do
+  with_workflow_env(scopes: "github:owner/repo,discord:channel/130000000000000001") do
     sink = WorkflowFakes::FakeEventSink.new
     policy = result_policy!
     task = admin_task!("req-batch", status: "ready")
@@ -168,8 +168,8 @@ test("validated batch persists atomically with stable idempotency keys") do |db:
         "actions" => [
           { "plugin" => "github", "operation" => "reply",
             "input" => { "resource_id" => "issue:owner/repo#1", "body" => "noted" } },
-          { "plugin" => "teams", "operation" => "send_message",
-            "input" => { "scope" => "channel:t1/c1", "body" => "urgent work exists" } }
+          { "plugin" => "discord", "operation" => "send_message",
+            "input" => { "scope" => "channel:130000000000000001", "body" => "urgent work exists" } }
         ] }
     )
 
@@ -184,7 +184,7 @@ test("validated batch persists atomically with stable idempotency keys") do |db:
     expect(actions.map(&:delivery_batch_key).uniq).to eq(["result-#{task.id}-#{version}"])
     expect(actions.map(&:status).uniq).to eq(["pending"])
     expect(actions.map { |a| [a.plugin, a.operation] }).to eq(
-      [["github", "reply"], ["teams", "send_message"]])
+      [["github", "reply"], ["discord", "send_message"]])
     expect(feedback.reload.processed_at.nil?).to eq(false)
     expect(TaskRun.where(task_id: task.id).count).to eq(0)
     expect(SolidQueue::Job.where(class_name: "ExecutionRunJob").count).to eq(jobs_before)
@@ -255,16 +255,16 @@ end
 
 test("unsupported, non-write, and unknown operations reject before mutation") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_workflow_env(scopes: "teams:team/t1/channel/c1,github:owner/repo") do
+  with_workflow_env(scopes: "discord:channel/130000000000000001,github:owner/repo") do
     sink = WorkflowFakes::FakeEventSink.new
     policy = result_policy!
 
     unsupported = admin_task!("req-unsupported")
     outcome = apply_result(
       result_service(sink), unsupported, policy,
-      { "summary" => "Teams cannot file issues",
-        "actions" => [{ "plugin" => "teams", "operation" => "create_issue",
-                        "input" => { "scope" => "team/t1/channel/c1", "title" => "t", "body" => "b" } }] })
+      { "summary" => "Discord cannot file issues",
+        "actions" => [{ "plugin" => "discord", "operation" => "create_issue",
+                        "input" => { "scope" => "channel:130000000000000001", "title" => "t", "body" => "b" } }] })
     expect(outcome.code).to eq(:unsupported_operation)
     expect(unsupported.reload.status).to eq("ready")
 

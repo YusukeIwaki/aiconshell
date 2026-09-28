@@ -4,25 +4,22 @@ require_relative "plugins_test_helper"
 
 Plugins = Aiconshell::Plugins
 
-test("default registry exposes the github/jira/teams/oauth/discord capability catalog") do
+test("default registry exposes the github/discord capability catalog") do
   catalog = Plugins::Registry.default.catalog
   by_id = catalog.to_h { |entry| [entry["id"], entry] }
 
-  expect(by_id.keys.sort).to eq(%w[discord github jira jira_oauth teams teams_oauth])
+  expect(by_id.keys.sort).to eq(%w[discord github])
   expect(by_id["github"]["operations"].map { |op| op["name"] })
-    .to eq(%w[latest_events list_issues reply create_issue])
-  expect(by_id["teams"]["operations"].map { |op| op["name"] })
-    .to eq(%w[latest_events reply send_message create_issue])
-  expect(by_id["jira_oauth"]["operations"].map { |op| op["name"] }.sort)
-    .to eq(%w[create_issue latest_events reply])
-  expect(by_id["teams_oauth"]["operations"].map { |op| op["name"] }.sort)
-    .to eq(%w[create_issue latest_events reply send_message])
+    .to eq(%w[latest_events list_issues reply create_issue health_check])
   expect(by_id["discord"]["operations"].map { |op| op["name"] })
-    .to eq(%w[latest_events reply send_message create_issue])
+    .to eq(%w[latest_events reply send_message create_issue health_check])
 
-  unsupported = by_id["teams"]["operations"].find { |op| op["name"] == "create_issue" }
-  expect(unsupported["unsupported"]).to eq(true)
-  expect(unsupported["reason"]).to match(/no issue tracker/i)
+  github_health = by_id["github"]["operations"].find { |op| op["name"] == "health_check" }
+  expect(github_health["read_only"]).to eq(true)
+  expect(github_health["scope"]).to eq("github:read")
+  discord_health = by_id["discord"]["operations"].find { |op| op["name"] == "health_check" }
+  expect(discord_health["read_only"]).to eq(true)
+  expect(discord_health["scope"]).to eq("discord:read")
 
   discord_unsupported = by_id["discord"]["operations"].find { |op| op["name"] == "create_issue" }
   expect(discord_unsupported["unsupported"]).to eq(true)
@@ -47,7 +44,7 @@ end
 
 test("catalog reports configured flags without exposing values") do |registry:, plugin_env:|
   catalog = registry.catalog
-  expect(catalog.map { |entry| entry["configured"] }).to eq([true, true, true, true])
+  expect(catalog.map { |entry| entry["configured"] }).to eq([true, true])
 
   plugin_env.delete("GITHUB_PRIVATE_KEY")
   by_id = registry.catalog.to_h { |entry| [entry["id"], entry] }
@@ -58,9 +55,6 @@ test("catalog reports configured flags without exposing values") do |registry:, 
   expect(by_id["discord"]["configured"]).to eq(false)
 
   serialized = JSON.generate(registry.catalog)
-  expect(serialized).not_to include("jira-api-token")
-  expect(serialized).not_to include("client-secret")
-  expect(serialized).not_to include("bot-password")
   expect(serialized).not_to include("discord-bot-token")
 end
 
@@ -76,12 +70,12 @@ test("invoke rejects unknown plugin and unknown operation") do |registry:|
   end.to raise_error(Plugins::UnknownOperation, /destroy/)
 end
 
-test("invoke rejects unsupported teams create_issue") do |registry:|
+test("invoke rejects unsupported discord create_issue") do |registry:|
   expect do
-    registry.invoke(plugin: "teams", operation: "create_issue",
+    registry.invoke(plugin: "discord", operation: "create_issue",
                     input: { "scope" => "x", "title" => "t", "body" => "b" },
                     context: {})
-  end.to raise_error(Plugins::UnsupportedOperation, /github or jira/i)
+  end.to raise_error(Plugins::UnsupportedOperation, /github plugin/i)
 end
 
 test("invoke enforces scopes only when context carries them") do |registry:, transport:|
@@ -118,13 +112,13 @@ test("input is schema-validated before any external I/O") do |registry:, transpo
   expect(transport.requests).to eq([])
 
   expect do
-    registry.invoke(plugin: "jira", operation: "reply",
-                    input: { "resource_id" => "issue:X-1" }, context: {})
+    registry.invoke(plugin: "discord", operation: "reply",
+                    input: { "resource_id" => "message:1/2" }, context: {})
   end.to raise_error(Plugins::InputInvalid, /body/)
   expect(transport.requests).to eq([])
 
   expect do
-    registry.invoke(plugin: "teams", operation: "latest_events",
+    registry.invoke(plugin: "discord", operation: "latest_events",
                     input: "not-a-hash", context: {})
   end.to raise_error(Plugins::InputInvalid, /object/)
   expect(transport.requests).to eq([])
@@ -138,10 +132,9 @@ test("plugin-level shape checks raise InputInvalid without I/O") do |registry:, 
   expect(transport.requests).to eq([])
 
   expect do
-    registry.invoke(plugin: "jira", operation: "create_issue",
-                    input: { "scope" => "lowercase", "title" => "t", "body" => "b" },
-                    context: {})
-  end.to raise_error(Plugins::InputInvalid, /project key/)
+    registry.invoke(plugin: "discord", operation: "latest_events",
+                    input: { "scope" => "channel:abc" }, context: {})
+  end.to raise_error(Plugins::InputInvalid, /channel/)
   expect(transport.requests).to eq([])
 end
 
