@@ -9,6 +9,27 @@ Give it the Issue URL as the task entrypoint. Review independently before the au
 main merge/push/closure. Do not create PRs. Work already assigned to an issue worktree
 stays in that implementation lane; do not delegate it again just to satisfy this default.
 
+## Skills by phase
+
+Procedures live in project skills under `.agents/skills/` (read by Codex and Muse Code).
+Open the one for the current phase; each is short and links to the canonical documents.
+
+| Phase | Skill | Typical actor |
+| --- | --- | --- |
+| Requirements (要件の整理) | [aiconshell-requirements](.agents/skills/aiconshell-requirements/SKILL.md) | coordinator |
+| Investigation (現状調査) | [aiconshell-investigation](.agents/skills/aiconshell-investigation/SKILL.md) | any, read-only |
+| Issue planning (タスク化) | [aiconshell-issue-planning](.agents/skills/aiconshell-issue-planning/SKILL.md) | coordinator |
+| Prioritization (優先度管理) | [aiconshell-prioritization](.agents/skills/aiconshell-prioritization/SKILL.md) | coordinator |
+| Design and implementation (設計・実装) | [aiconshell-issue](.agents/skills/aiconshell-issue/SKILL.md) | implementation lane |
+| Testing (テスト) | [aiconshell-testing](.agents/skills/aiconshell-testing/SKILL.md) | implementation lane, reviewer |
+| Review and acceptance (検収) | [aiconshell-review](.agents/skills/aiconshell-review/SKILL.md) | coordinator |
+
+When updating rules, put each rule in one place: hard constraints in this file, phase
+procedures in the skill, standing product contracts in `docs/` (entry: `docs/development.md`).
+Skills link to documents instead of copying them. Keep the `name` in the frontmatter equal to
+the directory name, and confirm detection with
+`muse skills list --source project --trust-workspace --json` after adding or renaming a skill.
+
 ## Start an implementation
 
 When assigned a GitHub Issue, read it with `gh issue view NUMBER --json number,title,body,comments`.

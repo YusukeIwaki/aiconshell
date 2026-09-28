@@ -8,6 +8,12 @@ Issueには今回の変更理由、観測できる期待動作、対象外、依
 実装方針を逐一Issueへ複製する必要はない。
 この手順をIssueだけで引き継いだ [Muse実装試行の記録](issue-workflow-verification.md) も参照できる。
 
+各フェーズの手順は `.agents/skills/` のskillにある（一覧は [AGENTS.md](../AGENTS.md#skills-by-phase)）。
+要件の整理 `aiconshell-requirements`、現状調査 `aiconshell-investigation`、
+タスク化 `aiconshell-issue-planning`、優先度管理 `aiconshell-prioritization`、
+設計・実装 `aiconshell-issue`、テスト `aiconshell-testing`、検収 `aiconshell-review`。
+skillは手順のチェックリストで、正となる手順・契約は本書と各設計資料に置く。
+
 ## 準備する人（コーディネーター）
 
 実装と動作確認は原則Muse Codeに委譲し、コーディネーターが独立して検収する。
