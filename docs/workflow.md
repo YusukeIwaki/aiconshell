@@ -90,8 +90,9 @@ transaction; the current token is checked under the cursor lock before events
 and the cursor are committed atomically. Duplicate fingerprint inserts are
 idempotent. Invalid output or a stale lease cannot advance the cursor.
 
-`github.issue`, `jira.issue`, `teams.message`, and `teams.reply` are semantic
-snapshots. Their adapter fingerprint is preserved as `source_fingerprint`;
+`github.issue`, `jira.issue`, `teams.message`, `teams.reply`, and
+`discord.message` are semantic snapshots. Their adapter fingerprint is
+preserved as `source_fingerprint`;
 the inbox `fingerprint` chains it to the preceding persisted revision. Thus
 observed A → B → A changes create three revisions, while consecutive A
 snapshots only advance `source_updated_at`, the greatest provider `occurred_at`
@@ -199,8 +200,14 @@ Read/poll permission scopes themselves are unchanged.
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a
 reply's scope from its resource ID, checks the operator allowlist, and passes
-operation permission arrays to the real plugin registry. Enabled interaction
-policies may draft the body. Plugin inputs and outputs remain schema validated.
+operation permission arrays to the real plugin registry. Write scopes use each
+plugin's own shape (`channel:<team>/<channel>` for Teams, `channel:<channelId>`
+for Discord) while the allowlist keeps the poll shape (`team/<team>/<channel>`
+and `channel/<channelId>`). Enabled interaction policies may draft the body.
+Plugin inputs and outputs remain schema validated. Discord bodies are limited
+to 2000 characters and overlong bodies are rejected before any request starts,
+so they fail instead of becoming `uncertain`; replies use `message_reference`
+and `allowed_mentions` never pings anyone.
 
 A bounded retry follows a 429 Retry-After response. Transport ambiguity or a
 crash after a remote request started becomes `uncertain` and is not automatically
@@ -355,7 +362,7 @@ injected only in tests. Web, workers, and Solid Queue share PostgreSQL.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AICONSHELL_EXECUTION_ROOT` | `tmp/ai_workspaces` outside production | Canonical root for policy and task/run workspaces; required in production |
-| `AICONSHELL_ALLOWED_SCOPES` | empty | Comma-separated plugin destinations, e.g. `github:owner/repo` |
+| `AICONSHELL_ALLOWED_SCOPES` | empty | Comma-separated plugin destinations, e.g. `github:owner/repo`, `discord:channel/<channelId>` |
 | `AICONSHELL_SELF_ACTOR_IDS` | empty | Known self actors as `plugin:id,...` |
 | `JIRA_SERVICE_ACCOUNT_ID` | unset | Jira self actor identity required for outbound writes |
 | `AICONSHELL_LEASE_SECONDS` | `1800` | Must exceed AI timeout plus ten seconds |

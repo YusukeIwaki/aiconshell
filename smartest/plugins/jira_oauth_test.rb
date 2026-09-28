@@ -134,7 +134,7 @@ test("jira_oauth catalog uses independent scopes and env without registering def
   # Business wiring (#26) registers the delegated adapters in the default
   # registry with pure-Ruby instances (no Rails provider held).
   expect(JoPlugins::Registry.default.catalog.map { |item| item["id"] }.sort).to eq(
-    %w[github jira jira_oauth teams teams_oauth]
+    %w[discord github jira jira_oauth teams teams_oauth]
   )
   transport.assert_consumed!
 end

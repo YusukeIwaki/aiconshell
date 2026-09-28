@@ -38,6 +38,7 @@ module Aiconshell
           # connection success (shown by #23/#26 status).
           registry.register(JiraOauth.new)
           registry.register(TeamsOauth.new)
+          registry.register(Discord.new)
           registry
         end
       end

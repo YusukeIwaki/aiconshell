@@ -203,7 +203,7 @@ test("default registry registers delegated plugins with separate scopes and no s
   expect(db.transaction_open?).to eq(true)
   catalog = Aiconshell::Plugins::Registry.default.catalog
   by_id = catalog.to_h { |entry| [entry["id"], entry] }
-  expect(by_id.keys.sort).to eq(%w[github jira jira_oauth teams teams_oauth])
+  expect(by_id.keys.sort).to eq(%w[discord github jira jira_oauth teams teams_oauth])
 
   jira_oauth = by_id["jira_oauth"]
   teams_oauth = by_id["teams_oauth"]

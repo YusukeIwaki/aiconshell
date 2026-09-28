@@ -380,6 +380,7 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 | `RAILS_ENV` | web / execution に `production` |
 | `EVENT_LOG_TEAMS_CHANNEL` | web / execution に同じ `channel:<team>/<channel>`。空なら通知しない |
 | `TEAMS_BOT_TARGETS_FILE` | execution の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |
+| `DISCORD_BOT_TOKEN` | web / execution に Discord Bot のトークン。poll（`discord:channel/<channelId>`）・返信・通知に使う。値型の環境変数で渡し、Git に入れない（Bot 作成・招待・権限は `plugins/discord/README.md`） |
 | `AICONSHELL_EXECUTION_ROOT` | execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
 | ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は web / execution に同じ値 |
 | 連携資格情報 | execution / web（`GITHUB_*`・`JIRA_*`・`TEAMS_*`・委任 OAuth `OAUTH_*`）。AI CLI 子プロセスには継承させない（`ChildEnv` の契約）。`migrate` には付けない |
@@ -642,7 +643,7 @@ execution 枠の占有中も control 処理が進むことは、実 provider・�
 - Railway への実デプロイ・実ドメイン公開。
 - ngrok の実公開・外部 Webhook 受信。
 - 各 CLI のサブスクリプションログイン・トークン更新。
-- 実 GitHub / Jira / Teams への投稿・取得。
+- 実 GitHub / Jira / Teams / Discord への投稿・取得。
 
 ## 11. トラブルシュート
 

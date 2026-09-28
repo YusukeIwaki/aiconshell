@@ -4,11 +4,11 @@ require_relative "plugins_test_helper"
 
 Plugins = Aiconshell::Plugins
 
-test("default registry exposes the github/jira/teams/oauth capability catalog") do
+test("default registry exposes the github/jira/teams/oauth/discord capability catalog") do
   catalog = Plugins::Registry.default.catalog
   by_id = catalog.to_h { |entry| [entry["id"], entry] }
 
-  expect(by_id.keys.sort).to eq(%w[github jira jira_oauth teams teams_oauth])
+  expect(by_id.keys.sort).to eq(%w[discord github jira jira_oauth teams teams_oauth])
   expect(by_id["github"]["operations"].map { |op| op["name"] })
     .to eq(%w[latest_events list_issues reply create_issue])
   expect(by_id["teams"]["operations"].map { |op| op["name"] })
@@ -17,10 +17,24 @@ test("default registry exposes the github/jira/teams/oauth capability catalog") 
     .to eq(%w[create_issue latest_events reply])
   expect(by_id["teams_oauth"]["operations"].map { |op| op["name"] }.sort)
     .to eq(%w[create_issue latest_events reply send_message])
+  expect(by_id["discord"]["operations"].map { |op| op["name"] })
+    .to eq(%w[latest_events reply send_message create_issue])
 
   unsupported = by_id["teams"]["operations"].find { |op| op["name"] == "create_issue" }
   expect(unsupported["unsupported"]).to eq(true)
   expect(unsupported["reason"]).to match(/no issue tracker/i)
+
+  discord_unsupported = by_id["discord"]["operations"].find { |op| op["name"] == "create_issue" }
+  expect(discord_unsupported["unsupported"]).to eq(true)
+  expect(discord_unsupported["reason"]).to match(/no issue tracker/i)
+
+  discord_read = by_id["discord"]["operations"].find { |op| op["name"] == "latest_events" }
+  expect(discord_read["scope"]).to eq("discord:read")
+  expect(discord_read["read_only"]).to eq(true)
+  discord_write = by_id["discord"]["operations"].find { |op| op["name"] == "reply" }
+  expect(discord_write["scope"]).to eq("discord:write")
+  expect(discord_write["read_only"]).to eq(false)
+  expect(by_id["discord"]["required_env"]).to eq(["DISCORD_BOT_TOKEN"])
 
   by_id.each_value do |entry|
     expect(entry["required_env"].empty?).to eq(false)
@@ -33,16 +47,21 @@ end
 
 test("catalog reports configured flags without exposing values") do |registry:, plugin_env:|
   catalog = registry.catalog
-  expect(catalog.map { |entry| entry["configured"] }).to eq([true, true, true])
+  expect(catalog.map { |entry| entry["configured"] }).to eq([true, true, true, true])
 
   plugin_env.delete("GITHUB_PRIVATE_KEY")
   by_id = registry.catalog.to_h { |entry| [entry["id"], entry] }
   expect(by_id["github"]["configured"]).to eq(false)
 
+  plugin_env.delete("DISCORD_BOT_TOKEN")
+  by_id = registry.catalog.to_h { |entry| [entry["id"], entry] }
+  expect(by_id["discord"]["configured"]).to eq(false)
+
   serialized = JSON.generate(registry.catalog)
   expect(serialized).not_to include("jira-api-token")
   expect(serialized).not_to include("client-secret")
   expect(serialized).not_to include("bot-password")
+  expect(serialized).not_to include("discord-bot-token")
 end
 
 test("invoke rejects unknown plugin and unknown operation") do |registry:|

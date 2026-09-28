@@ -6,7 +6,7 @@ Web とバックグラウンドワーカーは PostgreSQL を共有する。Soli
 
 ```mermaid
 flowchart TB
-  Human[人間 / Teams / Jira / GitHub / 管理画面] <--> I[Interaction: 取得・正規化・対話]
+  Human[人間 / Teams / Jira / GitHub / Discord / 管理画面] <--> I[Interaction: 取得・正規化・対話]
   I <--> C[Coordination: 整理・優先度・状態・dispatch]
   C <--> E[Execution: lease・隔離 workspace・AI CLI]
   I --> O[EventLog outbox]
@@ -68,7 +68,7 @@ registry.invoke(plugin: "github", operation: "latest_events",
                 context: { "scopes" => ["github:read"] })
 ```
 
-`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
+`context` は信頼できるアプリケーション側で構築し、operation の permission 配列を渡す。宛先の allowlist は Interaction が別途検証し、ユーザー入力から権限を構築しない。operation は原則 `latest_events`, `reply`, `create_issue`。Teams と Discord は `send_message` / `reply` を持ち、`create_issue` は非対応として catalog で表す。GitHub は `list_issues` も持つ。operation の `read_only` は既定 `false` で、型付きクエリは明示的な `true` のみを許可する。
 
 `latest_events` の入力: `{"scope": "...", "cursor": null または object}`。
 返却: `{"events": [...], "cursor": object}`。
@@ -83,7 +83,7 @@ HTTP/env/clock は inject 可能。input/output 両方を毎回スキーマ検�
 
 `Registry#validate_input(plugin:, operation:, input:, context:)` は `invoke` と同じスキーマ・permission・意味検証を副作用なしで行う。プラグインの任意拡張 `validate_operation_input(operation, input)` は純粋な検証に限定し、HTTP・認証情報読み取り・DB・可変なアプリ状態を参照しない。未実装時はスキーマ検証だけを行う。Coordination はこれを通して全提案を先に検証できる。Outbound 配信は正確な登録済み入出力スキーマを検証し、カスタム必須フィールドを保持する。
 
-GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
+GitHub は App installation token、Jira は service account、Teams は Graph read + Bot proactive write、Discord は Bot token（`DISCORD_BOT_TOKEN` のみ）。戻り cursor/next link の host を検証する。各 plugin README に最小権限、env 名、paging・retry・送信の制約を記す。
 
 ユーザー委任 OAuth（Atlassian / Microsoft の同意ユーザー）は Task/TaskRun と独立した運用接続であり、[oauth-connections.md](oauth-connections.md) が正とする。接続・試行・世代・秘密なし binding・token 取得の公開契約は `Aiconshell::Oauth::*` と `Oauth::AuthService` / `TokenService` / `CredentialProvider` が担い、Interaction / Coordination / Execution の責務は変えない。委任版 `jira_oauth` / `teams_oauth` は default registry へ登録済み（#26）であり、pure Ruby の登録と Rails の credential provider 注入を分離する。`catalog.configured` は `OAUTH_*` 設定の有無のみを示し、接続成功との区別は管理画面・業務統合が表示する。AI/Plugin の JSON Schema に credential や接続権限は含めない。
 

@@ -41,7 +41,8 @@ class PluginsTestFixtures < Smartest::Fixture
       "TEAMS_CLIENT_SECRET" => "client-secret",
       "TEAMS_BOT_APP_ID" => "bot-app-id",
       "TEAMS_BOT_APP_PASSWORD" => "bot-password",
-      "TEAMS_SERVICE_URL" => "https://service.example"
+      "TEAMS_SERVICE_URL" => "https://service.example",
+      "DISCORD_BOT_TOKEN" => "discord-bot-token"
     }
   end
 
@@ -52,6 +53,7 @@ class PluginsTestFixtures < Smartest::Fixture
     registry.register(Aiconshell::Plugins::Github.new)
     registry.register(Aiconshell::Plugins::Jira.new)
     registry.register(Aiconshell::Plugins::Teams.new)
+    registry.register(Aiconshell::Plugins::Discord.new)
     registry
   end
 end

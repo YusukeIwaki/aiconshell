@@ -19,7 +19,7 @@ module Interaction
   # stay `uncertain` and are never auto-resent (see OutboundService).
   class PollService
     Result = Struct.new(:ok, :code, :ingested, :skipped, :retryable, keyword_init: true)
-    SNAPSHOT_TYPES = %w[github.issue jira.issue teams.message teams.reply].freeze
+    SNAPSHOT_TYPES = %w[github.issue jira.issue teams.message teams.reply discord.message].freeze
     # Delegated Teams polls emit namespaced types analogous to the legacy
     # snapshots. JiraOauth reuses the legacy `jira.*` types (with
     # plugin=jira_oauth for isolation), so no extra jira entries belong here:

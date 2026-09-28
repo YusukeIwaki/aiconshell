@@ -25,6 +25,7 @@ require_relative "plugins/jira"
 require_relative "plugins/teams"
 require_relative "plugins/jira_oauth"
 require_relative "plugins/teams_oauth"
+require_relative "plugins/discord"
 
 module Aiconshell
   module Plugins

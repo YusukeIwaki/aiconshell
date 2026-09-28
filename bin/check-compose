@@ -52,8 +52,8 @@ AI_VARS = %w[
 ].freeze
 
 INTEGRATION_VARS = %w[
-  GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID GITHUB_API_URL TEAMS_GRAPH_URL
-  TEAMS_BOT_TARGETS_FILE
+  GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID DISCORD_BOT_TOKEN GITHUB_API_URL
+  TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE
   OAUTH_ATLASSIAN_CLIENT_ID OAUTH_MICROSOFT_CLIENT_ID
 ].freeze
 
@@ -155,7 +155,7 @@ check(failures, "web has credentials but no polling-only vars; migrate has neith
     assert(!env_of.call("web").key?(var), "web must not carry #{var} (worker control-pool only)")
   end
   forbidden = env_of.call("migrate").keys.select do |key|
-    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|OAUTH_|CLICKHOUSE_)/) || POLLING_VARS.include?(key)
+    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|DISCORD_|OAUTH_|CLICKHOUSE_)/) || POLLING_VARS.include?(key)
   end
   assert(forbidden.empty?, "forbidden keys on migrate: #{forbidden.join(", ")}")
 end

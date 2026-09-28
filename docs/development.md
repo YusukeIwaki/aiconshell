@@ -11,7 +11,7 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
 | --- | --- | --- |
 | 管理画面・APIからの依頼、受付と重複 | [task-requests.md](task-requests.md)、[admin.md](admin.md) | `app/services/interaction/`、`app/controllers/{admin,api}/`、`smartest/integration/acceptance/` |
 | タスク状態・優先度・dispatch・外部送信 | [workflow.md](workflow.md) | `app/services/{interaction,coordination,execution}/`、`smartest/integration/workflow/` |
-| GitHub / Teams / Jira の操作 | [architecture.md の Plugins](architecture.md#plugins)、[各 plugin README](../plugins/) | `lib/aiconshell/plugins/`、`plugins/`、`smartest/plugins/` |
+| GitHub / Teams / Jira / Discord の操作 | [architecture.md の Plugins](architecture.md#plugins)、[各 plugin README](../plugins/) | `lib/aiconshell/plugins/`、`plugins/`、`smartest/plugins/` |
 | AIの仕事・provider/model/effort・process分離 | [ai-providers.md](ai-providers.md) | `lib/aiconshell/ai/`、`smartest/ai/` |
 | AIポリシーの接続表示・ログイン・状態確認 | [ai-connections.md](ai-connections.md)、CLI変更時は [ai-auth-protocol.md](ai-auth-protocol.md) | `Admin::AiStatus`、`AiAuth::RequestService` / `WorkerService`、`AiConnection` / `AiAuthSession`、`smartest/integration/ai_auth/`、`smartest/integration/admin/` |
 | ユーザー委任OAuthの接続・token管理 | [oauth-connections.md](oauth-connections.md) | `Aiconshell::Oauth::*`、`Oauth::AuthService` / `TokenService` / `CredentialProvider`、`OauthConnection` / `OauthAuthAttempt`、`smartest/unit/oauth/`、`smartest/integration/oauth/` |

@@ -58,6 +58,9 @@ module Interaction
 
           target
         end
+      when "discord"
+        match = /\A(?:message|channel):([^\/]+)(?:\/[^\/]+)?\z/.match(target)
+        match ? "channel/#{match[1]}" : target
       else
         target # custom plugins can use an exact operator-allowlisted resource
       end

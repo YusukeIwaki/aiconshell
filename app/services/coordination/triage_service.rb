@@ -368,7 +368,9 @@ module Coordination
         Use only supported write schemas and operator-allowed destinations. Teams
         send_message uses input_scope channel:team/channel (teams_oauth channel
         team/t/channel/c maps to channel:t/c, chat/c maps to chat:c), not its
-        permission_scope.
+        permission_scope. Discord send_message and reply bodies are limited to
+        2000 characters; Discord send_message uses channel:<channelId> for both
+        its permission and input scopes.
         waiting_delivery is server-owned and cannot be requested or changed by AI.
         Allowed transitions: #{JSON.generate(Task::TRANSITIONS)}
         Return only JSON matching the supplied schema.
@@ -398,6 +400,12 @@ module Coordination
 
         chat = %r{\Achat/([^/]+)\z}.match(scope)
         return "chat:#{chat[1]}" if chat
+
+        return scope
+      end
+      if plugin.to_s == "discord"
+        discord = %r{\Achannel/([^/]+)\z}.match(scope)
+        return "channel:#{discord[1]}" if discord
 
         return scope
       end

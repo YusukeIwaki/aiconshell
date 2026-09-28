@@ -40,8 +40,8 @@ def snapshot_poll(events, plugin: "github", scope: "inbox", **options)
 end
 
 test("semantic issue and message snapshots preserve observed content reversions without metadata work") do |db:|
-  with_workflow_env(scopes: "github:inbox,jira:inbox,teams:inbox") do
-    %w[github.issue jira.issue teams.message teams.reply].each do |type|
+  with_workflow_env(scopes: "github:inbox,jira:inbox,teams:inbox,discord:inbox") do
+    %w[github.issue jira.issue teams.message teams.reply discord.message].each do |type|
       plugin = type.split(".").first
       events = [
         snapshot_event("open", seconds: 0, type: type, event_id: type),
