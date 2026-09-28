@@ -53,15 +53,15 @@ test("real AI schema rejects mixed read and result decisions without connector c
   end
 end
 
-test("a forbidden Teams target rejects the whole result before any write") do |http:|
+test("a forbidden Discord target rejects the whole result before any write") do |http:|
   RequestAcceptance.with_context do |ctx|
     flow = RequestAcceptance::Workflow
     receipt = flow.submit(http)
     flow.configure_policy
     ctx.process_runner.enqueue(->(call) do
       flow.result_answer(call, summary: "Must reject both actions", actions: [
-        flow.teams_action("Allowed action must not escape"),
-        flow.teams_action("Forbidden action", scope: "channel:foreign-team/foreign-channel")
+        flow.discord_action("Allowed action must not escape"),
+        flow.discord_action("Forbidden action", scope: "channel:999000111222333444")
       ])
     end)
 
@@ -87,7 +87,7 @@ end
       flow.configure_policy
       ctx.process_runner.enqueue(->(call) do
         first = flow.result_answer(call, summary: "First valid result",
-                                  actions: [flow.teams_action("Must not be sent")]).fetch("rulings").sole
+                                  actions: [flow.discord_action("Must not be sent")]).fetch("rulings").sole
         second_id = reference == "duplicate" ? first.fetch("task_id") : first.fetch("task_id") + 1_000_000
         {
           "rulings" => [
@@ -112,7 +112,7 @@ end
   end
 end
 
-test("GitHub rate limiting aborts the attempt before a second AI decision or Teams write") do |http:|
+test("GitHub rate limiting aborts the attempt before a second AI decision or Discord write") do |http:|
   RequestAcceptance.with_context do |ctx|
     flow = RequestAcceptance::Workflow
     receipt = flow.submit(http)
@@ -132,7 +132,7 @@ test("GitHub rate limiting aborts the attempt before a second AI decision or Tea
     expect(ctx.process_runner.calls.size).to eq(1)
     expect(ctx.transport.requests_to(RequestAcceptance::GITHUB_ISSUES_PATTERN, method: "GET").size).to eq(1)
     expect(OutboundAction.count).to eq(0)
-    expect(ctx.teams_posts).to eq([])
+    expect(ctx.discord_posts).to eq([])
     expect(EventDelivery.where(kind: "query.failed").exists?).to eq(true)
     expect(flow.event_text.include?(canary)).to eq(false)
     ctx.assert_consumed!
@@ -146,7 +146,7 @@ test("a partially failed delivery waits for the remaining action without replann
     flow.configure_policy
     ctx.process_runner.enqueue(->(call) do
       flow.result_answer(call, summary: "Two requested notifications", actions: [
-        flow.teams_action("First notification"), flow.teams_action("Second notification")
+        flow.discord_action("First notification"), flow.discord_action("Second notification")
       ])
     end)
     triage = flow.triage(ctx)
@@ -155,11 +155,10 @@ test("a partially failed delivery waits for the remaining action without replann
     first, second = task.outbound_actions.order(:id).to_a
     expect(task.coordination_result["action_count"]).to eq(2)
     batch = task.delivery_batch_key
-    canary = "UPSTREAM-TEAMS-PRIVATE-DETAIL"
-    ctx.expect_teams_token
-    ctx.transport.expect_json("POST", RequestAcceptance::TEAMS_ACTIVITY_URL,
-                              status: 400, body: { "error" => canary })
-    ctx.expect_teams_post(external_id: "second-activity")
+    canary = "UPSTREAM-DISCORD-PRIVATE-DETAIL"
+    ctx.transport.expect_json("POST", RequestAcceptance::DISCORD_POST_URL,
+                              status: 400, body: { "message" => canary })
+    ctx.expect_discord_post(external_id: "140000000000000043")
     delivery = Interaction::OutboundService.new(registry: ctx.registry, ai_runner: ctx.runner, clock: ctx.clock)
     expect(delivery.call(first.id).ok).to eq(false)
     expect(first.reload.status).to eq("failed")
@@ -187,7 +186,7 @@ test("a partially failed delivery waits for the remaining action without replann
     expect(task.delivery_batch_key).to eq(batch)
     expect(task.outbound_actions.count).to eq(2)
     expect(TaskRun.count).to eq(0)
-    expect(ctx.teams_posts.size).to eq(2)
+    expect(ctx.discord_posts.size).to eq(2)
     expect(flow.event_text.include?(canary)).to eq(false)
     ctx.assert_consumed!
   end

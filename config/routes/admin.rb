@@ -13,13 +13,14 @@ namespace :admin do
       post :connection_check
     end
   end
-  resources :oauth_connections, only: %i[index] do
+  resources :accounts, only: %i[index] do
     collection do
-      post :connect
-      post :disconnect
+      patch :github
+      patch :discord
+      post :health_check
+      post :rotate_api_token
     end
   end
-  resources :plugins, only: %i[index]
   resources :event_logs, only: %i[index]
   resources :task_requests, only: %i[new create show]
   resources :ai_connections, only: %i[index] do

@@ -8,10 +8,10 @@
 # Verifies the contracts docs/deployment.md promises: one shared DATABASE_URL,
 # the unified execution worker's three separated pools (control / execution /
 # ai_auth_execution) plus the recurring scheduler on that same worker, the
-# explicit worker role, integration/ClickHouse settings on the worker's Rails
+# explicit worker role, ClickHouse/polling settings on the worker's Rails
 # parent (never in AI child envs), explicit workflow settings on every Rails
-# process, the EventLog channel default on every emitting Rails process, Teams
-# targets path on web/worker only, recurring schedules targeting control,
+# process, no database-backed or removed integration variables on any
+# service, recurring schedules targeting control,
 # ClickHouse-independent startup (SQL migrate vs clickhouse-init split),
 # AI auth only on the worker, persisted workspaces outside app source,
 # image role targets (app web/migrate/clickhouse-init, ai worker with an
@@ -51,23 +51,26 @@ AI_VARS = %w[
   AICONSHELL_CLAUDE_BIN AICONSHELL_CODEX_BIN AICONSHELL_MUSE_BIN
 ].freeze
 
-INTEGRATION_VARS = %w[
-  GITHUB_APP_ID JIRA_EMAIL TEAMS_TENANT_ID DISCORD_BOT_TOKEN GITHUB_API_URL
-  TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE
-  OAUTH_ATLASSIAN_CLIENT_ID OAUTH_MICROSOFT_CLIENT_ID
-].freeze
-
-OAUTH_VARS = %w[
-  OAUTH_ATLASSIAN_CLIENT_ID OAUTH_ATLASSIAN_CLIENT_SECRET
-  OAUTH_ATLASSIAN_CLIENT_SECRET_FILE OAUTH_ATLASSIAN_CLOUD_ID
-  OAUTH_ATLASSIAN_REDIRECT_URI
-  OAUTH_MICROSOFT_CLIENT_ID OAUTH_MICROSOFT_CLIENT_SECRET
-  OAUTH_MICROSOFT_CLIENT_SECRET_FILE OAUTH_MICROSOFT_TENANT_ID
-  OAUTH_MICROSOFT_REDIRECT_URI
+# Integration account credentials live in the database (issue #28); no
+# service may receive them as environment. Teams/Jira support will be
+# re-added later under the account model.
+REMOVED_INTEGRATION_VARS = %w[
+  GITHUB_APP_ID GITHUB_INSTALLATION_ID GITHUB_PRIVATE_KEY GITHUB_PRIVATE_KEY_FILE GITHUB_API_URL
+  DISCORD_BOT_TOKEN
+  JIRA_EMAIL JIRA_API_TOKEN JIRA_API_TOKEN_FILE JIRA_SITE_URL JIRA_CLOUD_ID JIRA_BASE_URL
+  JIRA_SERVICE_ACCOUNT_ID
+  TEAMS_TENANT_ID TEAMS_CLIENT_ID TEAMS_CLIENT_SECRET TEAMS_CLIENT_SECRET_FILE
+  TEAMS_BOT_APP_ID TEAMS_BOT_APP_PASSWORD TEAMS_BOT_APP_PASSWORD_FILE
+  TEAMS_SERVICE_URL TEAMS_GRAPH_URL TEAMS_BOT_TARGETS_FILE
+  OAUTH_ATLASSIAN_CLIENT_ID OAUTH_ATLASSIAN_CLIENT_SECRET OAUTH_ATLASSIAN_CLIENT_SECRET_FILE
+  OAUTH_ATLASSIAN_CLOUD_ID OAUTH_ATLASSIAN_REDIRECT_URI
+  OAUTH_MICROSOFT_CLIENT_ID OAUTH_MICROSOFT_CLIENT_SECRET OAUTH_MICROSOFT_CLIENT_SECRET_FILE
+  OAUTH_MICROSOFT_TENANT_ID OAUTH_MICROSOFT_REDIRECT_URI
+  EVENT_LOG_TEAMS_CHANNEL ADMIN_API_TOKEN
 ].freeze
 
 POLLING_VARS = %w[
-  AICONSHELL_SELF_ACTOR_IDS JIRA_SERVICE_ACCOUNT_ID
+  AICONSHELL_SELF_ACTOR_IDS
 ].freeze
 
 compose_path = File.join(ROOT, "compose.yml")
@@ -125,14 +128,8 @@ check(failures, "execution root is explicit, outside app source, on a persisted 
   assert(compose.fetch("volumes").key?("ai_workspaces"), "missing named volume ai_workspaces")
 end
 
-check(failures, "unified worker holds integration/ClickHouse/polling settings in its Rails parent") do
+check(failures, "unified worker holds ClickHouse/polling settings in its Rails parent") do
   env = env_of.call("execution")
-  INTEGRATION_VARS.each do |var|
-    assert(env.key?(var), "execution is missing #{var} (polling/delivery/diagnostics need it)")
-  end
-  OAUTH_VARS.each do |var|
-    assert(env.key?(var), "execution is missing #{var} (delegated OAuth polling/delivery needs it)")
-  end
   POLLING_VARS.each do |var|
     assert(env.key?(var), "execution is missing #{var} (control-pool poll/outbound filtering)")
   end
@@ -144,31 +141,30 @@ check(failures, "unified worker holds integration/ClickHouse/polling settings in
   # This static check only verifies the Rails parent's Compose variables.
 end
 
-check(failures, "web has credentials but no polling-only vars; migrate has neither") do
-  INTEGRATION_VARS.each do |var|
-    assert(env_of.call("web").key?(var), "web is missing #{var} (admin diagnostics)")
+check(failures, "no service receives database-backed or removed integration variables") do
+  services.each do |name, svc|
+    keys = (svc["environment"] || {}).transform_keys(&:to_s).keys
+    present = keys & REMOVED_INTEGRATION_VARS
+    assert(present.empty?, "#{name} must not carry #{present.join(", ")} (database-backed or removed in issue #28)")
   end
-  OAUTH_VARS.each do |var|
-    assert(env_of.call("web").key?(var), "web is missing #{var} (OAuth admin diagnostics)")
+  raw = File.read(compose_path)
+  REMOVED_INTEGRATION_VARS.each do |var|
+    assert(!raw.include?(var), "compose.yml must not reference #{var} (removed in issue #28)")
   end
+  example = File.read(File.join(ROOT, ".env.example"))
+  REMOVED_INTEGRATION_VARS.each do |var|
+    assert(!example.match?(/^#{var}=/m), ".env.example must not define #{var} (removed in issue #28)")
+  end
+end
+
+check(failures, "web has no polling-only vars; migrate has neither polling nor ClickHouse") do
   POLLING_VARS.each do |var|
     assert(!env_of.call("web").key?(var), "web must not carry #{var} (worker control-pool only)")
   end
   forbidden = env_of.call("migrate").keys.select do |key|
-    key.match?(/\A(GITHUB_|JIRA_|TEAMS_|DISCORD_|OAUTH_|CLICKHOUSE_)/) || POLLING_VARS.include?(key)
+    key.match?(/\A(CLICKHOUSE_)/) || POLLING_VARS.include?(key)
   end
   assert(forbidden.empty?, "forbidden keys on migrate: #{forbidden.join(", ")}")
-end
-
-check(failures, "every emitting Rails process receives EVENT_LOG_TEAMS_CHANNEL (blank default)") do
-  app_services.each do |name|
-    env = env_of.call(name)
-    assert(env.key?("EVENT_LOG_TEAMS_CHANNEL"),
-      "#{name} is missing EVENT_LOG_TEAMS_CHANNEL (captured on outbox rows at emit time)")
-  end
-  example = File.read(File.join(ROOT, ".env.example"))
-  assert(example.match?(/^EVENT_LOG_TEAMS_CHANNEL=$/m),
-    ".env.example must default EVENT_LOG_TEAMS_CHANNEL to blank")
 end
 
 check(failures, "AI auth goes only to execution (corrected muse mapping, no MUSE_CONFIG_DIR)") do

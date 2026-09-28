@@ -6,10 +6,8 @@ test("builtin write preflight rejects impossible targets without credentials or 
   [
     ["github", "reply", { "resource_id" => "o/r", "body" => "hello" }],
     ["github", "create_issue", { "scope" => "invalid", "title" => "hello", "body" => "world" }],
-    ["jira", "reply", { "resource_id" => "PROJ", "body" => "hello" }],
-    ["jira", "create_issue", { "scope" => "invalid project", "title" => "hello", "body" => "world" }],
-    ["teams", "send_message", { "scope" => "team/t/channel/c", "body" => "hello" }],
-    ["teams", "send_message", { "scope" => "message:t/c/m", "body" => "hello" }]
+    ["discord", "reply", { "resource_id" => "message:1", "body" => "hello" }],
+    ["discord", "send_message", { "scope" => "channel:abc", "body" => "hello" }]
   ].each do |plugin, operation, input|
     expect { registry.validate_input(plugin: plugin, operation: operation, input: input) }
       .to raise_error(Aiconshell::Plugins::InputInvalid)
@@ -17,14 +15,12 @@ test("builtin write preflight rejects impossible targets without credentials or 
   expect(transport.requests).to eq([])
 end
 
-test("Teams write preflight validates syntax without opening a Bot target file") do |registry:, transport:, plugin_env:|
-  plugin_env["TEAMS_BOT_TARGETS_FILE"] = "/does/not/exist"
+test("Discord write preflight validates syntax without transport") do |registry:, transport:|
   [
-    ["send_message", { "scope" => "channel:t/c", "body" => "hello" }],
-    ["reply", { "resource_id" => "message:t/c/m", "body" => "hello" }],
-    ["send_message", { "scope" => "conversation:conversation-id", "body" => "hello" }]
+    ["send_message", { "scope" => "channel:130000000000000001", "body" => "hello" }],
+    ["reply", { "resource_id" => "message:130000000000000001/130000000000000002", "body" => "hello" }]
   ].each do |operation, input|
-    expect(registry.validate_input(plugin: "teams", operation: operation, input: input)).to eq(input)
+    expect(registry.validate_input(plugin: "discord", operation: operation, input: input)).to eq(input)
   end
   expect(transport.requests).to eq([])
 end

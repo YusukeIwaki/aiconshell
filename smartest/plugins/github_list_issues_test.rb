@@ -27,11 +27,12 @@ test("catalog marks latest_events and list_issues read_only, writes false by def
 
   expect(github["latest_events"]["read_only"]).to eq(true)
   expect(github["list_issues"]["read_only"]).to eq(true)
+  expect(github["health_check"]["read_only"]).to eq(true)
   expect(github["reply"]["read_only"]).to eq(false)
   expect(github["create_issue"]["read_only"]).to eq(false)
-  expect(by_id["jira"]["operations"].find { |op| op["name"] == "latest_events" }["read_only"]).to eq(true)
-  expect(by_id["teams"]["operations"].find { |op| op["name"] == "latest_events" }["read_only"]).to eq(true)
-  expect(by_id["teams"]["operations"].find { |op| op["name"] == "send_message" }["read_only"]).to eq(false)
+  expect(by_id["discord"]["operations"].find { |op| op["name"] == "latest_events" }["read_only"]).to eq(true)
+  expect(by_id["discord"]["operations"].find { |op| op["name"] == "health_check" }["read_only"]).to eq(true)
+  expect(by_id["discord"]["operations"].find { |op| op["name"] == "send_message" }["read_only"]).to eq(false)
 
   registry.catalog.each do |entry|
     entry["operations"].each do |op|

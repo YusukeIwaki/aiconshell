@@ -29,15 +29,11 @@ PostgreSQL / ClickHouse）を使うための手順書。全体設計は
   単一の優先順位付き queue や wildcard pool へまとめない。
   長い実作業・ログインが control の実行枠を消費しないことが目的であり、
   CPU/RAM の完全隔離ではない。
-- `execution` の Rails 親プロセスは Interaction / EventLog のため連携・
-  ClickHouse 資格情報も持つ。AI CLI 子プロセスの明示 env からは
-  `lib/aiconshell/ai/child_env.rb` が遮断する（子 env を scratch から
-  構築し、DB・連携資格情報を継承しない）。`bin/check-compose` が compose
-  上の親配置を検証する。
-  `EVENT_LOG_TEAMS_CHANNEL`（既定チャネル名。空が既定）は資格情報では
-  ないため全 Rails プロセスに渡す。`TEAMS_BOT_TARGETS_FILE` はパス指定
-  のみ web・execution に渡し、実ファイルは運営者が read-only マウントする
-  （「6. 資格情報ファイルのマウント」参照）。
+- `execution` の Rails 親プロセスは EventLog のため ClickHouse 資格情報も持つ。
+  連携アカウントの資格情報は DB に持ち、管理画面のアカウントページで設定する。
+  AI CLI 子プロセスの明示 env からは `lib/aiconshell/ai/child_env.rb` が
+  遮断する（子 env を scratch から構築し、DB・連携資格情報を継承しない）。
+  `bin/check-compose` が compose 上の親配置を検証する。
 - マイグレーションは `migrate` サービスの1プロセスのみ
   （`AICONSHELL_RUN_DB_SETUP=1`）。web/worker の起動時は実行しない。
 - EventLog は結果整合性: ClickHouse 障害は起動を止めない。web/worker は
@@ -257,64 +253,16 @@ muse login     # または公式フロー
 ソース外の永続領域で、uid 1000 所有。triage の `policy-coordination`
 と実行 run の作業ディレクトリがここに作られる。
 
-## 6. 資格情報ファイルのマウント
+## 6. 連携アカウントと管理APIキーの設定
 
-`GITHUB_PRIVATE_KEY_FILE`・`JIRA_API_TOKEN_FILE`・
-`TEAMS_CLIENT_SECRET_FILE`・`TEAMS_BOT_APP_PASSWORD_FILE`・
-`OAUTH_ATLASSIAN_CLIENT_SECRET_FILE`・`OAUTH_MICROSOFT_CLIENT_SECRET_FILE`・
-`TEAMS_BOT_TARGETS_FILE` はコンテナ内パスだけを環境変数で渡す。
-実ファイルの内容は compose・Railway・イメージ・Git のいずれにも
-入れない。プラグインは値（`GITHUB_PRIVATE_KEY` 等）とファイルの
-どちらか片方があれば動き、両方空なら「未設定」として実行時失敗する。
-委任 OAuth（`OAUTH_*`）も同じ扱いであり、値とファイルの混在・転用はしない。
+連携アカウント（GitHub Apps / Discord）の資格情報と JSON 管理 API のキーは
+DB に持ち、管理画面のアカウントページで設定する（issue #28）。環境変数・
+compose・Railway・イメージ・Git のいずれにも資格情報の値を入れない。
+GitHub Apps の秘密鍵は `.pem` ファイルを管理画面からアップロードし、
+RSA 秘密鍵として読めることを保存前に検証する。未設定のアカウントは
+poll・送信・接続確認が実行時失敗し、未発行の管理APIキーでは API が 401 を返す。
 個人 PAT の運用・PAT 入力 UI・PAT 専用 plugin は提供しない。
-
-Compose ではホストの private ファイルを対象サービスへ read-only で
-bind マウントする（`migrate`・`clickhouse-init` には付けない）。
-`compose.override.yml`（git 管理外）の例:
-
-```yaml
-services:
-  web:
-    volumes:
-      - type: bind
-        source: /srv/secrets/aiconshell/teams-bot-targets.json
-        target: /run/secrets/teams-bot-targets.json
-        read_only: true
-  execution:
-    volumes:
-      - type: bind
-        source: /srv/secrets/aiconshell/teams-bot-targets.json
-        target: /run/secrets/teams-bot-targets.json
-        read_only: true
-      - type: bind
-        source: /srv/secrets/aiconshell/github-app.pem
-        target: /run/secrets/github-app.pem
-        read_only: true
-```
-
-```sh
-# .env（git 管理外。パスだけ。内容は書かない）
-TEAMS_BOT_TARGETS_FILE=/run/secrets/teams-bot-targets.json
-GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
-```
-
-注意:
-
-- コンテナの UID 1000 が読める所有者・権限にする。たとえば所有者 UID 1000 の
-  `0600`、またはグループ GID 1000 の `0640` を使い、親ディレクトリの探索権限も確認する。
-  ホストの運営者だけが読める `0600` のままでは、コンテナから読めない場合がある。
-  `docker compose exec execution test -r /run/secrets/teams-bot-targets.json` で確認する。
-  AI 実行 workspace（`/workspaces`）やリポジトリ内には置かない。
-- `TEAMS_BOT_TARGETS_FILE` の JSON 形式は
-  `plugins/teams/README.md`「Bot 参照の対応表」が正。
-  Graph の team / channel ID と Bot conversation 参照の対応表であり、
-  受信済みの実際の参照だけを載せる。自動生成はしない。
-- Railway にはホスト bind が無い。execution の既存 `/data` volume に
-  `/data/integrations/teams-bot-targets.json` を UID 1000 が読める権限で配置し、
-  `TEAMS_BOT_TARGETS_FILE` にそのパスを指定する。他サービスとは共有されない。
-  通常の資格情報は値型の環境変数でも設定できる。Teams の対応表が未配置なら
-  Bot による送信は実行時に失敗する。
+Teams / Jira は後から同じアカウント方式で再サポートする。
 
 ## 7. Railway
 
@@ -376,16 +324,12 @@ volume / 個別ログインを使う。未認証の provider は未構成のま�
 | `CLICKHOUSE_DATABASE/USER/PASSWORD` | web / execution に利用環境専用の制限付き ClickHouse database / user 資格情報。operator 資格情報は ClickHouse 側だけに置き、アプリには渡さない |
 | `SECRET_KEY_BASE` | web / execution に `bin/rails secret` で生成した秘密値（利用環境ごとに別の値） |
 | `ADMIN_USERNAME/ADMIN_PASSWORD` | web の管理画面用（未設定は fail closed） |
-| `ADMIN_API_TOKEN` | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値（未設定は fail closed。UI 認証とは別。`docs/task-requests.md`） |
+| 管理APIキー | web の JSON 管理 API（`/api/admin/task_requests`）用 Bearer 値。管理画面のアカウントページで発行（未発行は fail closed。UI 認証とは別。`docs/task-requests.md`） |
 | `RAILS_ENV` | web / execution に `production` |
-| `EVENT_LOG_TEAMS_CHANNEL` | web / execution に同じ `channel:<team>/<channel>`。空なら通知しない |
-| `TEAMS_BOT_TARGETS_FILE` | execution の `/data/integrations/teams-bot-targets.json`（資格情報ファイル節参照） |
-| `DISCORD_BOT_TOKEN` | web / execution に Discord Bot のトークン。poll（`discord:channel/<channelId>`）・返信・通知に使う。値型の環境変数で渡し、Git に入れない（Bot 作成・招待・権限は `plugins/discord/README.md`） |
 | `AICONSHELL_EXECUTION_ROOT` | execution は `/data/workspaces`。web は `/workspaces`（image 内にある boot 設定用パス） |
 | ワークフロー設定 | `AICONSHELL_ALLOWED_SCOPES`・lease/timeout/attempts・`AICONSHELL_DEMO_MODE` は web / execution に同じ値 |
-| 連携資格情報 | execution / web（`GITHUB_*`・`JIRA_*`・`TEAMS_*`・委任 OAuth `OAUTH_*`）。AI CLI 子プロセスには継承させない（`ChildEnv` の契約）。`migrate` には付けない |
-| 委任 OAuth | execution / web に `OAUTH_ATLASSIAN_*`・`OAUTH_MICROSOFT_*`（`bin/check-compose` が検証）。運用名義は Bot 運用と OAuth2 代理運用の2種類のみで PAT 運用はなし |
-| 自アクタ ID | execution に `AICONSHELL_SELF_ACTOR_IDS`・`JIRA_SERVICE_ACCOUNT_ID`（委任 OAuth の自己投稿抑制は receipt 照合であり actor ではない） |
+| 連携資格情報 | DB のアカウントに持ち、管理画面のアカウントページで設定（「6. 連携アカウントと管理APIキーの設定」）。環境変数には置かない。AI CLI 子プロセスには継承させない（`ChildEnv` の契約） |
+| 自アクタ ID | execution に `AICONSHELL_SELF_ACTOR_IDS` |
 | `CLAUDE_CONFIG_DIR` | execution に `/data/auth/claude` |
 | `CODEX_HOME` | execution に `/data/auth/codex` |
 | `AICONSHELL_MUSE_HOME` | execution に `/data/auth/muse` |
@@ -494,9 +438,9 @@ project/volume だけを操作する。切替は次の順序で行う:
    execution の dashboard startCommand を
    `./bin/jobs --config-file=config/queue_execution.yml`（残っている
    `--skip-recurring` を除去）にしたうえで、`DATABASE_URL`・
-   ワークフロー設定・`EVENT_LOG_TEAMS_CHANNEL`・ClickHouse・連携資格情報・
-   自アクタ ID・AI auth・`AICONSHELL_WORKER_ROLE=execution`・
-   `RUNTIME_TARGET=ai` を揃える。`/data` volume
+   ワークフロー設定・ClickHouse・自アクタ ID・AI auth・
+   `AICONSHELL_WORKER_ROLE=execution`・`RUNTIME_TARGET=ai` を揃え、
+   連携アカウントと管理APIキーを管理画面で設定する。`/data` volume
    （`/data/auth/*`・`/data/workspaces`）は既存のまま継続使用する。
    旧 control の volume は消さず、認証 cache をコピーしない。
 3. execution をデプロイする。単一ワーカーが control / execution /
@@ -643,7 +587,7 @@ execution 枠の占有中も control 処理が進むことは、実 provider・�
 - Railway への実デプロイ・実ドメイン公開。
 - ngrok の実公開・外部 Webhook 受信。
 - 各 CLI のサブスクリプションログイン・トークン更新。
-- 実 GitHub / Jira / Teams / Discord への投稿・取得。
+- 実 GitHub / Discord への投稿・取得。
 
 ## 11. トラブルシュート
 

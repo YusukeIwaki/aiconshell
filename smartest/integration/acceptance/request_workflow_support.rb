@@ -31,7 +31,7 @@ module RequestAcceptance
     end
 
     def submit(http, key: "fixture-request", title: "Open issue review",
-               description: "Review o/r open issues and notify the configured Teams channel if urgent.")
+               description: "Review o/r open issues and notify the configured Discord channel if urgent.")
       body = api_post(http, { title: title, description: description }, key: key)
       raise "request fixture expected HTTP 202" unless http.last_response.status == 202
 
@@ -68,9 +68,9 @@ module RequestAcceptance
       }
     end
 
-    def teams_action(body, scope: TEAMS_WRITE_TARGET)
+    def discord_action(body, scope: DISCORD_WRITE_TARGET)
       {
-        "plugin" => "teams", "operation" => "send_message",
+        "plugin" => "discord", "operation" => "send_message",
         "input" => { "scope" => scope, "body" => body }
       }
     end

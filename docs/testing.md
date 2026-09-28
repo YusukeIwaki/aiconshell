@@ -13,7 +13,7 @@ HTTP 用は `smartest/support/boundary_fixtures.rb`、AI 用は
   実 ClickHouse がある場合にそれを使う。
 - `bin/test all`（無引数の既定も同じ）は unit の後に integration を実行する。
   どのモードでも全 `smartest/**/*_test.rb` がちょうど 1 つのスイートに属することを監査する。
-- ローカルの Postgres/ClickHouse への接続は、実 GitHub/Teams/AI アカウントへの
+- ローカルの Postgres/ClickHouse への接続は、実 GitHub/Discord/AI アカウントへの
   外部呼び出しとは別物である。後者はテストから行わない。
 
 ## 実行方法
@@ -114,7 +114,7 @@ ClickHouseと無関係な対象テストだけならPGのみでよいが、全su
 ## 境界フィクスチャ
 
 方針は「境界だけを差し替え、検証対象の内部サービスは実物を使う」である。
-実プラグインの `Registry`/`Github`/`Teams` には記録用トランスポートを注入し、
+実プラグインの `Registry`/`Github`/`Discord` には記録用トランスポートを注入し、
 業務サービスの深いモックは避ける。単独スイート用ヘルパー
 （`ai/ai_test_helper.rb`、`plugins/plugins_test_helper.rb`）を汎用ヘルパーに
 取り込まず、各テストは独立した fixture 登録を保つ。
@@ -170,14 +170,14 @@ end
 `integration/acceptance/request_workflow_test.rb` と
 `request_workflow_failures_test.rb` は、実コントローラ受付 → durable event →
 Coordination → GitHub 取得 → 設定済み AI Runner の判断 → 永続送信意図 →
-Teams 配送 → 完了確認を通す。`request_acceptance_helper.rb` は一時 Bot 対応表、
-合成認証、実 Registry / Github / Teams と境界フィクスチャを組み合わせる。
+Discord 配送 → 完了確認を通す。`request_acceptance_helper.rb` は合成認証、
+実 Registry / Github / Discord と境界フィクスチャを組み合わせる。
 AI の応答は脚本であり、実モデルの判断品質を保証するテストではない。
 
 UI の Basic 認証と実 CSRF、API の重複受付、通知不要時の無送信、
 部分取得・切り詰め情報、AI スキーマ拒否、許可外宛先、未知・重複タスク参照の
 全件拒否、GitHub 429、配送の一部失敗と未処理フィードバックを検証する。
-実プロバイダ・GitHub / Teams アカウントへ接続することはない。
+実プロバイダ・GitHub / Discord アカウントへ接続することはない。
 
 DB フィクスチャはテストごとに rollback する。受付の
 `after_all_transactions_commit` による EventLog・enqueue はそこで発火しないため、
@@ -190,7 +190,7 @@ DB フィクスチャはテストごとに rollback する。受付の
 - 正確なプロンプト文面や呼び出し順序は、安全契約でない限り固定しない。
 - 画面テストは対象のform・行・通知要素を特定して検証する。同じ文言が別の場所に
   表示されているだけで通らないようにし、説明文の登場回数など無関係な内容には依存しない。
-- OAuth/トークン取得の POST と、外部可視の Teams 書き込みは区別する。
-  後者は activity 書き込み URL への `requests_to` で数える。
+- GitHub の App トークン取得の POST と、外部可視の Discord 書き込みは区別する。
+  後者はチャネル投稿 URL への `requests_to` で数える。
 - 想定外呼び出しが rescue されても黙って通過させないため、
   新規テストは HTTP・AI の両スクリプト消費を必ずアサートする。

@@ -46,9 +46,8 @@ module AdminTestSupport
 
   def self.reset_admin_seams!
     Admin::AiStatus.reset!
-    Admin::PluginStatus.reset!
     Admin::EventLogSearch.reset!
-    Admin::OauthStatus.reset!
+    Accounts::HealthCheck.test_transport = nil
     ActionController::Base.allow_forgery_protection = false
   end
 
@@ -81,23 +80,6 @@ module AdminTestSupport
         home_present: found,
         configured: found
       }
-    end
-  end
-
-  # Fake plugins registry returning a fixed catalog.
-  class FakePluginRegistry
-    def initialize(catalog)
-      @catalog = catalog
-    end
-
-    def catalog
-      @catalog
-    end
-  end
-
-  class ExplodingPluginRegistry
-    def catalog
-      raise RuntimeError, "plugin lane exploded"
     end
   end
 
@@ -160,29 +142,6 @@ module AdminTestSupport
       "occurred_at" => row["occurred_at"],
       "version" => row["version"] || 1
     }
-  end
-
-  def self.sample_catalog
-    [
-      {
-        "id" => "github",
-        "operations" => [
-          { "name" => "latest_events", "scope" => "read", "unsupported" => false },
-          { "name" => "reply", "scope" => "write", "unsupported" => false }
-        ],
-        "required_env" => %w[GITHUB_APP_ID GITHUB_PRIVATE_KEY],
-        "configured" => false
-      },
-      {
-        "id" => "teams",
-        "operations" => [
-          { "name" => "send_message", "scope" => "write", "unsupported" => false },
-          { "name" => "create_issue", "scope" => nil, "unsupported" => true, "reason" => "not supported" }
-        ],
-        "required_env" => %w[TEAMS_TENANT_ID],
-        "configured" => true
-      }
-    ]
   end
 
   def self.sample_events

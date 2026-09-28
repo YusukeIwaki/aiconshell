@@ -8,14 +8,11 @@ module Interaction
   # A leased outbound intent. Only explicit rate-limit rejections are retried
   # automatically after a request starts; ambiguous delivery requires review.
   #
-  # Delegated OAuth writes (issue #26) use the binding snapshot fixed at
-  # enqueue time (stored on the action, never from user/AI input). Delivery
-  # fences it against the current connection before any external write: a
-  # disconnect/replacement fails closed instead of sending as a different
-  # principal or reviving with a stale result. Already-started HTTP cannot
-  # be cancelled; ambiguous writes stay `uncertain` and are never
-  # auto-resent. The actually sent body is persisted with the receipt so
-  # self-post matching ties content to the external id.
+  # Already-started HTTP cannot be cancelled; ambiguous writes stay
+  # `uncertain` and are never auto-resent. The actually sent body is
+  # persisted with the receipt. Plugin credentials come from the
+  # database-backed Accounts source and are passed per call; the registry
+  # environment is never a credential fallback.
   class OutboundService
     Result = Struct.new(:ok, :code, keyword_init: true)
     DRAFT_SCHEMA = {
@@ -25,9 +22,9 @@ module Interaction
 
     def initialize(registry: Aiconshell::Plugins::Registry.default,
                    ai_runner: Aiconshell::Ai::Runner.new, event_sink: WorkflowEvents, clock: Time,
-                   oauth_credential_provider: nil)
+                   credential_source: nil)
       @registry, @ai_runner, @event_sink, @clock = registry, ai_runner, event_sink, clock
-      @oauth_credential_provider = oauth_credential_provider
+      @credential_source = credential_source
     end
 
     def call(action_id)
@@ -37,21 +34,9 @@ module Interaction
       token, snapshot = claimed
       request_started = false
       input = snapshot.fetch(:input).transform_keys(&:to_s)
-      stored_binding = snapshot[:oauth_binding]
       scope = PluginAccess.destination(snapshot[:plugin], snapshot[:operation], input)
       unless WorkflowSettings.scope_allowed?(snapshot[:plugin], scope)
         return settle(action_id, token, status: "failed", code: :scope_not_allowed)
-      end
-      if snapshot[:plugin] == "jira" && PluginAccess.self_actor_ids("jira").empty?
-        return settle(action_id, token, status: "failed", code: :self_actor_not_configured)
-      end
-      if OauthContext.oauth_plugin?(snapshot[:plugin])
-        if stored_binding.nil? || stored_binding.empty?
-          return settle(action_id, token, status: "failed", code: :binding_missing)
-        end
-        unless OauthContext.snapshot_current?(stored_binding, snapshot[:plugin], credential_provider: oauth_provider)
-          return settle(action_id, token, status: "failed", code: :stale_binding)
-        end
       end
       validator = ActionValidator.new(registry: @registry)
       checked = validator.validate(plugin: snapshot[:plugin], operation: snapshot[:operation], input: input)
@@ -68,19 +53,9 @@ module Interaction
         return Result.new(ok: false, code: :stale_delivery)
       end
       request_started = true
-      # Re-fence after drafting (AI drafting takes time): a replacement
-      # during drafting still fails before any external write.
-      if OauthContext.oauth_plugin?(snapshot[:plugin]) &&
-          !OauthContext.snapshot_current?(stored_binding, snapshot[:plugin], credential_provider: oauth_provider)
-        return settle(action_id, token, status: "failed", code: :stale_binding)
-      end
-      context = if OauthContext.oauth_plugin?(snapshot[:plugin])
-        PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry).merge(
-          "oauth_binding" => stored_binding, "oauth_credential_provider" => oauth_provider
-        )
-      else
-        PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry)
-      end
+      context = PluginAccess.context(snapshot[:plugin], snapshot[:operation], registry: @registry).merge(
+        "env" => Accounts.invoke_env(snapshot[:plugin], registry: @registry, source: credential_source)
+      )
       output = @registry.invoke(plugin: snapshot[:plugin], operation: snapshot[:operation],
         input: input, context: context)
       unless Aiconshell::Plugins::Schemas.error_details(operation["output_schema"], output).empty? &&
@@ -93,18 +68,6 @@ module Interaction
     rescue Aiconshell::Plugins::RateLimited => error
       delay = [[error.retry_after.to_i, 30].max, 21_600].min
       settle(action_id, token, status: "pending", code: :rate_limited, retry_after: delay)
-    rescue Aiconshell::Oauth::BindingMismatch
-      settle(action_id, token, status: "failed", code: :stale_binding)
-    rescue Oauth::CredentialProvider::NotConnected
-      settle(action_id, token, status: "failed", code: :not_connected)
-    rescue Aiconshell::Oauth::RefreshBusy
-      settle(action_id, token, status: "pending", code: :refresh_busy, retry_after: 30)
-    rescue Aiconshell::Oauth::ProviderError => error
-      if error.code.to_s == "invalid_grant"
-        settle(action_id, token, status: "failed", code: :not_connected)
-      else
-        settle(action_id, token, status: "pending", code: :oauth_unavailable, retry_after: 60)
-      end
     rescue StandardError => error
       # Never persist provider/transport error text (it can echo credentials).
       rejected = error.class.name.match?(/Unknown|Unsupported|InputInvalid|CredentialsMissing|PermissionDenied|HostRejected/)
@@ -134,8 +97,8 @@ module Interaction
 
     def now = @clock.respond_to?(:current) ? @clock.current : @clock.now
 
-    def oauth_provider
-      @oauth_credential_provider ||= Oauth::CredentialProvider.new(event_sink: @event_sink)
+    def credential_source
+      @credential_source || Accounts
     end
 
     def claim(id)
@@ -152,8 +115,7 @@ module Interaction
         action.update!(status: "sending", attempts: action.attempts + 1, last_attempt_at: now,
           lease_token: token, lease_expires_at: now + WorkflowSettings.ai_timeout_seconds + 120,
           request_started_at: nil, next_attempt_at: nil)
-        [token, { plugin: action.plugin, operation: action.operation, input: action.input.deep_dup,
-                  oauth_binding: action.respond_to?(:oauth_binding) ? action.oauth_binding : nil }]
+        [token, { plugin: action.plugin, operation: action.operation, input: action.input.deep_dup }]
       end
     end
 

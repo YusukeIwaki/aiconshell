@@ -90,9 +90,8 @@ transaction; the current token is checked under the cursor lock before events
 and the cursor are committed atomically. Duplicate fingerprint inserts are
 idempotent. Invalid output or a stale lease cannot advance the cursor.
 
-`github.issue`, `jira.issue`, `teams.message`, `teams.reply`, and
-`discord.message` are semantic snapshots. Their adapter fingerprint is
-preserved as `source_fingerprint`;
+`github.issue` and `discord.message` are semantic snapshots. Their
+adapter fingerprint is preserved as `source_fingerprint`;
 the inbox `fingerprint` chains it to the preceding persisted revision. Thus
 observed A → B → A changes create three revisions, while consecutive A
 snapshots only advance `source_updated_at`, the greatest provider `occurred_at`
@@ -100,20 +99,9 @@ observed for that revision. Metadata timestamps in the payload do not create
 new work. Other event types retain their original fingerprint deduplication.
 
 Per-plugin/event-ID transaction advisory locks serialize snapshot writes across
-scopes, acquired in sorted order. Delegated OAuth sources scope event
-identity — the lock, watermark lookup, and DB uniqueness — by provider
-resource space (`oauth_event_space`: provider plus fixed tenant/cloud,
-raw provider IDs unchanged, never the fetching generation); legacy sources
-keep the global plugin/event lock. Re-fetching an identical handled
-revision after a reconnect dedups to the existing row and creates no new
-Task or reply; the same numeric IDs on a different cloud/tenant are a
-distinct space with distinct rows and watermarks. Task joins stay
-generation-pinned (`oauth_source_key`): a new post or edit fetched after a
-reconnect becomes current-generation work in its own Task without joining
-the old generation's Task. A batch is processed in timestamp order for
+scopes, acquired in sorted order. A batch is processed in timestamp order for
 each source. Snapshots older than the persisted watermark are ignored; equal
-timestamps are first-observed-wins within one provider space (batch input
-order breaks ties). Providers
+timestamps are first-observed-wins (batch input order breaks ties). Providers
 must supply the edit time as `occurred_at`; timestamps are compared at PostgreSQL
 microsecond precision. Conflicting changes at the same timestamp and changes
 that occur entirely between polls cannot be reconstructed. Existing rows retain
@@ -122,88 +110,29 @@ fingerprint algorithm can create one new baseline revision. All snapshot,
 watermark, and cursor changes commit together, with lease expiry rechecked after
 lock waits. No network request runs while these locks are held.
 
+Plugin credentials come from the database-backed `Accounts` source and are
+passed per call in the invoke context; the registry environment is never a
+credential fallback. Tests inject a fake source responding to
+`env_for(plugin)` instead of touching the database.
+
 Only known bots/self actors are pre-processed to prevent echo loops; other
 system events are retained as coordination context. Set
-`AICONSHELL_SELF_ACTOR_IDS=plugin:id,...` (or `JIRA_SERVICE_ACCOUNT_ID` for Jira).
-Jira outbound writes fail with `self_actor_not_configured` without a known self
-account identity. Delegated `jira_oauth` / `teams_oauth` never suppress by
-actor: the consenting user's manual posts stay eligible and only durable sent
-receipts suppress the app's own echo (see below).
+`AICONSHELL_SELF_ACTOR_IDS=plugin:id,...`.
 
-Delegated OAuth polling, typed reads, and outbound delivery share one trusted
-boundary (issue #26). The application fixes the secret-free `oauth_binding`
-(connection id, generation, provider, principal, tenant/cloud) with the
-`oauth_credential_provider` in the invoke context; adapters resolve the same
-binding just-in-time and never re-select the current user or fall back to
-service-account credentials. Binding/provider values never enter AI
-input/output JSON. The allowlist is per plugin id (`jira_oauth:PROJ`,
-`teams_oauth:team/...`); legacy `jira:` / `teams:` entries never authorize the
-delegated variant. Typed-read snapshots are reused for the following
-result, fetch-time external-event snapshots (the fetching binding stored on
-each `external_events` row and copied to its `tasks` row at creation, Task
-joins scoped by the generation-pinned `oauth_source_key`) for the following
-reply, and enqueue snapshots for
-delivery; a disconnect/replacement in between stops with `stale_binding` /
-`not_connected` instead of continuing as another principal, and each Task
-is fenced by its own stored binding so same-provider Tasks from different
-generations never mix. Same raw event/resource IDs on different
-clouds/tenants are distinct isolated spaces with distinct DB
-rows, watermarks, advisory locks, and Tasks; the same space re-fetched
-after a reconnect dedups to handled rows with no new work, while a new
-post or edit in the same space becomes a separate current-generation Task;
-legacy dedup stays global.
 External-event Tasks never gain typed reads: `admin_origin_required`
-still rejects them before HTTP, and that restriction is kept. A stale
-OAuth reply is fenced before any Task mutation and re-fenced before the
-write, so a rejected reply leaves Task state, dispatch runs, actions, and
-feedback acknowledgements untouched. Refresh never changes the generation. Cursors are
-isolated per connection (`integration_cursors.oauth_binding`): a changed
-connection restarts from no cursor and never reuses another site's cursor.
-Callback/refresh/send races discard stale results instead of reviving or
-sending with a new user's token. A stale poll releases only its own cursor
-lease token, never a successor's.
-
-Self-post receipts are the sent `outbound_actions` themselves (provider
-resource, `external_id`, and the actually sent body persisted on `sent` even
-when Interaction drafting rewrote it). Receipt identity is
-generation-independent: a poll candidate matching the same provider
-resource space (provider plus fixed tenant/cloud), resource, external id,
-and content is the app echo and is not ingested, even after a reconnect
-with a cursor reset; send permission itself stays generation-pinned. A
-different id, a different resource (same numeric ids on different
-resources, clouds, or tenants never suppress), edited content, or a later
-human edit of the app post stays eligible. The receipt lookup is scoped in
-the database (newest first, no row cap) so a confirmed self-post still
-matches past any number of older receipts. While a matching `pending` /
-`sending` / `uncertain` action exists, the candidate is held without
-advancing the cursor so it is neither lost
-nor auto-replied in a loop; a mixed batch still ingests unrelated
-candidates (held rows are partitioned per candidate, the pass set
-persists, and the cursor is retained rather than advanced past held
-rows). `pending` never holds another generation — even a rate-limited
-attempt that left `request_started_at` set is an explicit rejection with
-no unknown side effect; only already-started
-writes (`sending` with `request_started_at` set, or `uncertain`) hold across
-generations in the same provider resource space, so an unknown side
-effect survives reconnect until reconciled. `sending` before
-`request_started_at` holds only its own generation. Jira holds are per issue (a reply to one issue
-never holds another), Teams holds per channel/chat, and other spaces/destinations are unaffected.
-DB or matcher errors halt ingestion and the cursor advance instead of
-treating the batch as ordinary human events.
+still rejects them before HTTP, and that restriction is kept.
 
 The AI coordination prompt maps operator-allowlisted permission scopes to
-write input scopes: legacy `teams` and delegated `teams_oauth` channels
-`team/t/channel/c` map to `channel:t/c`, and `teams_oauth` chats `chat/c`
-map to `chat:c`; Jira project scopes are identical for poll and write.
+write input scopes: Discord channels `channel/<id>` map to `channel:<id>`;
+GitHub scopes are identical for poll and write.
 Read/poll permission scopes themselves are unchanged.
 
 Outbound actions have `pending`, `sending`, `sent`, `failed`, and `uncertain`
 states, plus lease, request-start, and retry timestamps. Interaction derives a
 reply's scope from its resource ID, checks the operator allowlist, and passes
-operation permission arrays to the real plugin registry. Write scopes use each
-plugin's own shape (`channel:<team>/<channel>` for Teams, `channel:<channelId>`
-for Discord) while the allowlist keeps the poll shape (`team/<team>/<channel>`
-and `channel/<channelId>`). Enabled interaction policies may draft the body.
+operation permission arrays to the real plugin registry. Discord write scopes
+use `channel:<channelId>` while the allowlist keeps the poll shape
+`channel/<channelId>`. Enabled interaction policies may draft the body.
 Plugin inputs and outputs remain schema validated. Discord bodies are limited
 to 2000 characters and overlong bodies are rejected before any request starts,
 so they fail instead of becoming `uncertain`; replies use `message_reference`
@@ -229,7 +158,7 @@ exactly one of these shapes, validated against `TriageService::DECISION_SCHEMA`:
 ```
 
 ```json
-{"rulings":[{"task_id":123,"result":{"summary":"An urgent issue needs review; notification requested.","actions":[{"plugin":"teams","operation":"send_message","input":{"scope":"channel:team-id/channel-id","body":"Please review the urgent issue."}}]}}]}
+{"rulings":[{"task_id":123,"result":{"summary":"An urgent issue needs review; notification requested.","actions":[{"plugin":"discord","operation":"send_message","input":{"scope":"channel:123456789","body":"Please review the urgent issue."}}]}}]}
 ```
 
 The AI may request at most three read rounds and ten total reads, with at most
@@ -364,7 +293,6 @@ injected only in tests. Web, workers, and Solid Queue share PostgreSQL.
 | `AICONSHELL_EXECUTION_ROOT` | `tmp/ai_workspaces` outside production | Canonical root for policy and task/run workspaces; required in production |
 | `AICONSHELL_ALLOWED_SCOPES` | empty | Comma-separated plugin destinations, e.g. `github:owner/repo`, `discord:channel/<channelId>` |
 | `AICONSHELL_SELF_ACTOR_IDS` | empty | Known self actors as `plugin:id,...` |
-| `JIRA_SERVICE_ACCOUNT_ID` | unset | Jira self actor identity required for outbound writes |
 | `AICONSHELL_LEASE_SECONDS` | `1800` | Must exceed AI timeout plus ten seconds |
 | `AICONSHELL_AI_TIMEOUT_SECONDS` | `600` | Bounded AI runtime |
 | `AICONSHELL_POLL_LEASE_SECONDS` | `300` | Poll cursor lease |

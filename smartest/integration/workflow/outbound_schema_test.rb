@@ -57,15 +57,15 @@ def custom_schema_delivery(plugin:, transport:)
 end
 
 test("action validation rejects malformed types and impossible builtin write targets before I/O") do |db:|
-  with_workflow_env(scopes: "teams:team/t1/channel/c1") do
+  with_workflow_env(scopes: "discord:channel/123456789012345678") do
     transport = CustomSchemaRecordingTransport.new
-    registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport).register(Aiconshell::Plugins::Teams.new)
+    registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport).register(Aiconshell::Plugins::Discord.new)
     validator = Interaction::ActionValidator.new(registry: registry)
-    expect(validator.validate(plugin: "teams", operation: "send_message", input: "invalid").code).to eq(:input_invalid)
-    expect(validator.validate(plugin: "teams", operation: "send_message",
-      input: { "scope" => "team/t1/channel/c1", "body" => "hello" }).code).to eq(:input_invalid)
-    expect(validator.validate(plugin: "teams", operation: "send_message",
-      input: { "scope" => "channel:t1/c1", "body" => "hello" }).ok?).to eq(true)
+    expect(validator.validate(plugin: "discord", operation: "send_message", input: "invalid").code).to eq(:input_invalid)
+    expect(validator.validate(plugin: "discord", operation: "send_message",
+      input: { "scope" => "channel:abc", "body" => "hello" }).code).to eq(:input_invalid)
+    expect(validator.validate(plugin: "discord", operation: "send_message",
+      input: { "scope" => "channel:123456789012345678", "body" => "hello" }).ok?).to eq(true)
     expect(transport.calls).to eq([])
   end
 end

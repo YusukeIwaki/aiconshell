@@ -40,8 +40,8 @@ def snapshot_poll(events, plugin: "github", scope: "inbox", **options)
 end
 
 test("semantic issue and message snapshots preserve observed content reversions without metadata work") do |db:|
-  with_workflow_env(scopes: "github:inbox,jira:inbox,teams:inbox,discord:inbox") do
-    %w[github.issue jira.issue teams.message teams.reply discord.message].each do |type|
+  with_workflow_env(scopes: "github:inbox,discord:inbox") do
+    %w[github.issue discord.message].each do |type|
       plugin = type.split(".").first
       events = [
         snapshot_event("open", seconds: 0, type: type, event_id: type),
@@ -108,8 +108,8 @@ test("conflicting snapshots tied at database timestamp precision keep the first 
 end
 
 test("comment change and workflow events keep original global fingerprint deduplication") do |db:|
-  with_workflow_env(scopes: "github:inbox,jira:inbox") do
-    %w[github.issue_comment github.pull_review github.review_comment github.workflow_run jira.comment jira.change].each do |type|
+  with_workflow_env(scopes: "github:inbox") do
+    %w[github.issue_comment github.pull_review github.review_comment github.workflow_run].each do |type|
       plugin = type.split(".").first
       original = snapshot_event("first", seconds: 3, type: type, event_id: type)
       older = snapshot_event("older", seconds: 1, type: type, event_id: type)

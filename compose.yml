@@ -61,71 +61,17 @@ x-clickhouse-client: &clickhouse-client
   CLICKHOUSE_USER: ${CLICKHOUSE_USER:-aiconshell}
   CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-aiconshell_dev}
 
-# EventLog emission default (lib/aiconshell/observability.rb). Read on every
-# Rails boot (config/initializers/event_log.rb) and captured on each outbox
-# row at emit time, so EVERY Rails process (web/execution/migrate)
-# receives it. Blank (default) keeps history searchable without Teams
-# notifications; channel:<teamId>/<channelId> enables the Teams sink.
-x-event-log: &event-log
-  EVENT_LOG_TEAMS_CHANNEL: ${EVENT_LOG_TEAMS_CHANNEL:-}
-
-# Plugin credentials + optional endpoint overrides (lib/aiconshell/plugins).
-# Web needs them for admin diagnostics; the unified execution worker needs
-# them for polling, outbound delivery, and the EventLog Teams sink (which
-# reuses the Teams plugin credentials). NEVER on migrate. They are visible
-# to the worker's Rails parent only: AI CLI child processes receive a
-# controlled env without them (lib/aiconshell/ai/child_env.rb).
-x-integration-credentials: &integration-credentials
-  DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
-  GITHUB_APP_ID: ${GITHUB_APP_ID:-}
-  GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
-  GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
-  GITHUB_PRIVATE_KEY_FILE: ${GITHUB_PRIVATE_KEY_FILE:-}
-  GITHUB_API_URL: ${GITHUB_API_URL:-}
-  JIRA_EMAIL: ${JIRA_EMAIL:-}
-  JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
-  JIRA_API_TOKEN_FILE: ${JIRA_API_TOKEN_FILE:-}
-  JIRA_SITE_URL: ${JIRA_SITE_URL:-}
-  JIRA_CLOUD_ID: ${JIRA_CLOUD_ID:-}
-  JIRA_BASE_URL: ${JIRA_BASE_URL:-}
-  TEAMS_TENANT_ID: ${TEAMS_TENANT_ID:-}
-  TEAMS_CLIENT_ID: ${TEAMS_CLIENT_ID:-}
-  TEAMS_CLIENT_SECRET: ${TEAMS_CLIENT_SECRET:-}
-  TEAMS_CLIENT_SECRET_FILE: ${TEAMS_CLIENT_SECRET_FILE:-}
-  TEAMS_BOT_APP_ID: ${TEAMS_BOT_APP_ID:-}
-  TEAMS_BOT_APP_PASSWORD: ${TEAMS_BOT_APP_PASSWORD:-}
-  TEAMS_BOT_APP_PASSWORD_FILE: ${TEAMS_BOT_APP_PASSWORD_FILE:-}
-  TEAMS_SERVICE_URL: ${TEAMS_SERVICE_URL:-}
-  TEAMS_GRAPH_URL: ${TEAMS_GRAPH_URL:-}
-  # Path ONLY (inside the container) to the private JSON mapping Graph
-  # channel/message references to Bot conversation references (see
-  # plugins/teams/README.md "Bot 参照の対応表"). The operator bind-mounts
-  # the host file read-only (see docs/deployment.md); the value is never
-  # committed and never baked into the image. Same read-only-mount pattern
-  # applies to the other *_FILE credential paths above.
-  TEAMS_BOT_TARGETS_FILE: ${TEAMS_BOT_TARGETS_FILE:-}
-  # User-delegated OAuth (issue #26): consented-user operation alongside the
-  # service-account/Bot operation above. Independent OAUTH_* variables; never
-  # mixed or reused. No PAT operation is provided. Web needs them for admin
-  # diagnostics; the worker's Rails parent needs them for delegated
-  # polling/delivery. NEVER on migrate. AI CLI children never inherit them.
-  OAUTH_ATLASSIAN_CLIENT_ID: ${OAUTH_ATLASSIAN_CLIENT_ID:-}
-  OAUTH_ATLASSIAN_CLIENT_SECRET: ${OAUTH_ATLASSIAN_CLIENT_SECRET:-}
-  OAUTH_ATLASSIAN_CLIENT_SECRET_FILE: ${OAUTH_ATLASSIAN_CLIENT_SECRET_FILE:-}
-  OAUTH_ATLASSIAN_CLOUD_ID: ${OAUTH_ATLASSIAN_CLOUD_ID:-}
-  OAUTH_ATLASSIAN_REDIRECT_URI: ${OAUTH_ATLASSIAN_REDIRECT_URI:-}
-  OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
-  OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
-  OAUTH_MICROSOFT_CLIENT_SECRET_FILE: ${OAUTH_MICROSOFT_CLIENT_SECRET_FILE:-}
-  OAUTH_MICROSOFT_TENANT_ID: ${OAUTH_MICROSOFT_TENANT_ID:-}
-  OAUTH_MICROSOFT_REDIRECT_URI: ${OAUTH_MICROSOFT_REDIRECT_URI:-}
+# Integration account credentials (GitHub Apps / Discord) live in the
+# database and are edited on the admin アカウント page (issue #28), so no
+# service receives them here. The JSON admin API token is database-backed
+# as well. AI CLI child processes receive a controlled env without
+# application credentials (lib/aiconshell/ai/child_env.rb).
 
 # Self-actor filtering for polling/outbound (control queue only, consumed
 # by the unified execution worker's control pool). Web never reads these,
 # so they stay off web.
 x-polling-only: &polling-only
   AICONSHELL_SELF_ACTOR_IDS: ${AICONSHELL_SELF_ACTOR_IDS:-}
-  JIRA_SERVICE_ACCOUNT_ID: ${JIRA_SERVICE_ACCOUNT_ID:-}
 
 x-ai-auth: &ai-auth
   # Private persisted auth homes (named volumes below) plus the executable
@@ -204,7 +150,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *event-log]
+      <<: [*app-database, *workflow]
       AICONSHELL_RUN_DB_SETUP: "1"
     command: ["true"]
 
@@ -238,13 +184,12 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials]
+      <<: [*app-database, *workflow, *clickhouse-client]
       PORT: "3000"
       # Rails' built-in development-only Host allowlist, read at boot.
       RAILS_DEVELOPMENT_HOSTS: ${RAILS_DEVELOPMENT_HOSTS:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
     command: ["./bin/rails", "server", "-b", "0.0.0.0", "-p", "3000"]
@@ -262,8 +207,9 @@ services:
   # `execution` (default 1 thread), and the 1-thread `ai_auth_execution`
   # pool. Pool separation keeps a long real job or login from occupying
   # control slots; it is not CPU/RAM isolation (see docs/deployment.md).
-  # The Rails parent holds the integration/ClickHouse settings for
-  # polling/delivery; AI CLI children never inherit them
+  # The Rails parent holds the ClickHouse settings for EventLog
+  # delivery; integration account credentials come from the database.
+  # AI CLI children never inherit application credentials
   # (lib/aiconshell/ai/child_env.rb).
   execution:
     build:
@@ -277,7 +223,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      <<: [*app-database, *workflow, *event-log, *clickhouse-client, *integration-credentials, *polling-only, *ai-auth]
+      <<: [*app-database, *workflow, *clickhouse-client, *polling-only, *ai-auth]
       AICONSHELL_WORKER_ROLE: "execution"
     volumes:
       - execution_claude_auth:/private/claude

@@ -2,7 +2,6 @@
 
 require "json"
 require_relative "plugin_access"
-require_relative "oauth_context"
 
 module Interaction
   # Sole safe on-demand read path from Coordination to plugin operations.
@@ -10,6 +9,10 @@ module Interaction
   # the exact registered JSON Schemas, destinations require the operator
   # AICONSHELL_ALLOWED_SCOPES allowlist, and capability scopes come from
   # PluginAccess.context. No IntegrationCursor or ExternalEvent writes.
+  #
+  # Plugin credentials come from the injected credential source
+  # (database-backed Accounts by default) and are passed per call; the
+  # registry environment is never a credential fallback.
   #
   #   service = Interaction::QueryService.new
   #   service.validate(plugin: "github", operation: "list_issues",
@@ -30,26 +33,11 @@ module Interaction
 
     def initialize(registry: Aiconshell::Plugins::Registry.default,
                    event_sink: WorkflowEvents, allowed_scopes: nil,
-                   oauth_credential_provider: nil)
+                   credential_source: nil)
       @registry = registry
       @event_sink = event_sink
       @allowed_scopes_override = allowed_scopes
-      @oauth_credential_provider = oauth_credential_provider
-    end
-
-    # Trusted binding snapshot for an OAuth read. The AI never supplies
-    # this; the application fixes it just-in-time and fences the result.
-    def oauth_snapshot(plugin)
-      return nil unless OauthContext.oauth_plugin?(plugin.to_s)
-
-      provider = oauth_provider
-      raise ArgumentError, "oauth credential provider is required" if provider.nil?
-
-      OauthContext.snapshot_binding(plugin.to_s, credential_provider: provider)
-    end
-
-    def oauth_binding_current?(snapshot, plugin)
-      OauthContext.snapshot_current?(snapshot, plugin.to_s, credential_provider: oauth_provider)
+      @credential_source = credential_source
     end
 
     # Full capability catalog (env names + configured flags only, no values).
@@ -107,53 +95,22 @@ module Interaction
 
     # Repeats validation, then invokes the plugin once. Output is validated
     # by the registry against the registered schema and bounded by serialized
-    # bytes. Failures never include upstream text. OAuth reads fix the
-    # trusted binding before HTTP and fence it after: a replacement in
-    # between fails instead of returning another principal's data.
-    # An explicit `binding:` fixes the snapshot for read→result fencing;
-    # otherwise a fresh snapshot is taken here.
-    def call(plugin:, operation:, input:, binding: nil)
+    # bytes. Failures never include upstream text.
+    def call(plugin:, operation:, input:)
       preflight = validate(plugin: plugin, operation: operation, input: input)
       unless preflight.ok?
         emit(preflight.code, plugin: plugin.to_s, operation: operation.to_s)
         return preflight
       end
 
-      snapshot = nil
-      if OauthContext.oauth_plugin?(plugin.to_s)
-        begin
-          snapshot = binding.nil? ? oauth_snapshot(plugin.to_s) : binding
-        rescue StandardError => error
-          name = error.class.name.to_s
-          if name.match?(/NotConnected/) || name.match?(/Oauth.*Error|BindingMismatch|ProviderError/)
-            emit(:not_connected, plugin: plugin.to_s, operation: operation.to_s)
-            return failure(:not_connected)
-          elsif error.is_a?(ArgumentError)
-            emit(:credentials_missing, plugin: plugin.to_s, operation: operation.to_s)
-            return failure(:credentials_missing)
-          else
-            emit(:credentials_missing, plugin: plugin.to_s, operation: operation.to_s)
-            return failure(:credentials_missing)
-          end
-        end
-      end
-
       normalized = normalize_input!(input)
-      context = if OauthContext.oauth_plugin?(plugin.to_s)
-        PluginAccess.context(plugin.to_s, operation.to_s, registry: @registry).merge(
-          "oauth_binding" => snapshot, "oauth_credential_provider" => oauth_provider
-        )
-      else
-        PluginAccess.context(plugin.to_s, operation.to_s, registry: @registry)
-      end
+      context = PluginAccess.context(plugin.to_s, operation.to_s, registry: @registry).merge(
+        "env" => Accounts.invoke_env(plugin.to_s, registry: @registry, source: credential_source)
+      )
       output = @registry.invoke(
         plugin: plugin.to_s, operation: operation.to_s, input: normalized,
         context: context
       )
-      if OauthContext.oauth_plugin?(plugin.to_s) && !oauth_binding_current?(snapshot, plugin.to_s)
-        emit(:stale_binding, plugin: plugin.to_s, operation: operation.to_s)
-        return failure(:stale_binding)
-      end
       bytes = begin
         JSON.generate(output).bytesize
       rescue JSON::GeneratorError
@@ -204,17 +161,16 @@ module Interaction
            Aiconshell::Plugins::TransportTimeout
       emit(:upstream_error, plugin: plugin.to_s, operation: operation.to_s)
       failure(:upstream_error)
-    rescue StandardError => error
-      if (code = oauth_failure_code(error))
-        emit(code, plugin: plugin.to_s, operation: operation.to_s)
-        failure(code)
-      else
-        emit(:internal_error, plugin: plugin.to_s, operation: operation.to_s)
-        failure(:internal_error)
-      end
+    rescue StandardError
+      emit(:internal_error, plugin: plugin.to_s, operation: operation.to_s)
+      failure(:internal_error)
     end
 
     private
+
+    def credential_source
+      @credential_source || Accounts
+    end
 
     def failure(code)
       Result.new(ok: false, code: code, data: nil)
@@ -240,34 +196,6 @@ module Interaction
       else
         value
       end
-    end
-
-    def oauth_provider
-      return @oauth_credential_provider unless @oauth_credential_provider.nil?
-      return nil unless defined?(::Oauth::CredentialProvider)
-
-      @oauth_credential_provider ||= begin
-        ::Oauth::CredentialProvider.new(event_sink: @event_sink)
-      rescue StandardError
-        nil
-      end
-    end
-
-    # Class-name based so standalone plugin unit tests (without the Rails
-    # Oauth lane loaded) still classify OAuth failures without constants.
-    def oauth_failure_code(error)
-      name = error.class.name.to_s
-      return :not_connected if name.match?(/NotConnected/)
-      return :stale_binding if name.match?(/BindingMismatch/)
-      return :refresh_busy if name.match?(/RefreshBusy/)
-      if name.match?(/ProviderError/)
-        code = error.respond_to?(:code) ? error.code.to_s : ""
-        return code == "invalid_grant" ? :not_connected : :upstream_error
-      end
-
-      nil
-    rescue StandardError
-      nil
     end
 
     def current_allowed_scopes

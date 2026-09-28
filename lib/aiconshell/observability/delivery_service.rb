@@ -4,12 +4,9 @@ require "logger"
 
 module Aiconshell
   module Observability
-    # Drains the outbox spool into ClickHouse and Teams with independent
-    # per-destination retry state. A Teams failure never re-sends to
-    # ClickHouse; a ClickHouse failure never blocks Teams. Each sink run is
-    # isolated: a failure listing, inserting, posting, or even marking rows
-    # for one destination is counted and logged while the other destination
-    # still runs.
+    # Drains the outbox spool into ClickHouse with per-destination retry
+    # state. A failure listing, inserting, or even marking rows is counted
+    # and logged while the summary stays accurate.
     #
     # Retries are bounded: after MAX_ATTEMPTS failures a row is marked
     # skipped (terminal, prunable) instead of retrying forever, so a
@@ -17,8 +14,7 @@ module Aiconshell
     #
     # Exactly-once is not promised: a crash between a successful sink call
     # and the delivered mark re-delivers. ClickHouse collapses replays by
-    # event_id (ReplacingMergeTree + FINAL reads); Teams has no provider
-    # idempotency, so replays may double-post.
+    # event_id (ReplacingMergeTree + FINAL reads).
     #
     # The service never emits events itself: all diagnostics go to the
     # injected logger, so a sink outage cannot recurse into the outbox.
@@ -29,27 +25,23 @@ module Aiconshell
       RETRY_MAX_SECONDS = 21_600
       MAX_ATTEMPTS = 25
 
-      Summary = Struct.new(:clickhouse, :teams, :error, keyword_init: true) do
+      Summary = Struct.new(:clickhouse, :error, keyword_init: true) do
         def to_h
-          { "clickhouse" => clickhouse, "teams" => teams, "error" => error }
+          { "clickhouse" => clickhouse, "error" => error }
         end
       end
 
-      def initialize(outbox:, clickhouse: nil, teams: nil,
+      def initialize(outbox:, clickhouse: nil,
                      logger: Logger.new(File::NULL), clock: Time)
         @outbox = outbox
         @clickhouse = clickhouse
-        @teams = teams
         @logger = logger
         @clock = clock
       end
 
       def deliver_pending(batch_size: DEFAULT_BATCH_SIZE)
         clickhouse_counts, clickhouse_error = isolated("clickhouse") { deliver_clickhouse(batch_size:) }
-        teams_counts, teams_error = isolated("teams") { deliver_teams(batch_size:) }
-        error = [clickhouse_error, teams_error].compact.join("; ")
-        Summary.new(clickhouse: clickhouse_counts, teams: teams_counts,
-                    error: error.empty? ? nil : error)
+        Summary.new(clickhouse: clickhouse_counts, error: clickhouse_error)
       end
 
       def prune(retention_days: DEFAULT_RETENTION_DAYS)
@@ -73,7 +65,6 @@ module Aiconshell
           return counts
         end
 
-        # A pending failure propagates to isolated(): Teams still runs.
         records = @outbox.pending("clickhouse", limit: batch_size, now: now)
         return counts if records.empty?
 
@@ -90,37 +81,9 @@ module Aiconshell
         counts
       end
 
-      def deliver_teams(batch_size:)
-        counts = zero_counts
-        records = @outbox.pending("teams", limit: batch_size, now: now)
-        return counts if records.empty?
-
-        if @teams.nil? || !@teams.enabled?
-          records.each { |record| mark_skipped_guarded(record, "teams", "teams sink disabled", counts) }
-          return counts
-        end
-
-        records.each do |record|
-          begin
-            outcome = @teams.deliver(record)
-          rescue StandardError => e
-            message = Redaction.sanitize_error(e)
-            @logger.warn("event_log teams delivery failed: #{message}")
-            fail_record(record, "teams", message, counts)
-            next
-          end
-          if outcome == :delivered
-            mark_delivered_guarded(record, "teams", counts)
-          else
-            mark_skipped_guarded(record, "teams", "teams sink skipped", counts)
-          end
-        end
-        counts
-      end
-
-      # Runs one sink, converting an unexpected raise (e.g. pending listing
-      # blew up) into zero counts plus an error string so the other sink
-      # still runs and the summary stays accurate.
+      # Runs the sink, converting an unexpected raise (e.g. pending listing
+      # blew up) into zero counts plus an error string so the summary stays
+      # accurate.
       def isolated(destination)
         [yield, nil]
       rescue StandardError => e

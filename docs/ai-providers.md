@@ -114,7 +114,7 @@ sessions expire through #20's ops entry in [AI connections](ai-connections.md)).
 | Muse Code | `muse login` | `<xdg>/muse` (`AICONSHELL_MUSE_HOME`, else `XDG_CONFIG_HOME`, else `~/.config`) | `XDG_CONFIG_HOME` + `MUSE_AUTH_PATH=<xdg>/muse/auth.json` |
 
 The child environment is built from scratch (`unsetenv_others`): database,
-GitHub, Jira, Teams and API-key variables are never inherited. Only a pinned
+integration-account and API-key variables are never inherited. Only a pinned
 `PATH`, locale, a neutral `HOME`, `TMPDIR` and the calling provider's home
 reach the CLI. Auth file contents are never read by this library and never
 appear in errors, the EventLog, the database or admin pages; failures carry

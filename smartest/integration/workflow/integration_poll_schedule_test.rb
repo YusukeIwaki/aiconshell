@@ -16,14 +16,26 @@ class PollScheduleForbiddenTransport
   end
 end
 
-def poll_schedule_registry(env)
+def poll_schedule_registry
   transport = PollScheduleForbiddenTransport.new
-  registry = Aiconshell::Plugins::Registry.new(env: env, transport: transport)
+  registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport)
   registry.register(Aiconshell::Plugins::Github.new)
-  registry.register(Aiconshell::Plugins::Jira.new)
-  registry.register(Aiconshell::Plugins::Teams.new)
   registry.register(Aiconshell::Plugins::Discord.new)
   [registry, transport]
+end
+
+def configure_poll_accounts(github: true, discord: true)
+  if github
+    account = GithubAppsAccount.current
+    account.update!(app_id: "123", installation_id: "456")
+    account.private_key = "fixture-key"
+    account.save!
+  end
+  if discord
+    account = DiscordAccount.current
+    account.bot_token = "not-a-token"
+    account.save!
+  end
 end
 
 def poll_schedule_job(registry)
@@ -38,25 +50,21 @@ end
 
 test("poll scheduler queues each configured concrete scope through the real plugin catalog") do |db:|
   expect(db.transaction_open?).to eq(true)
-  with_workflow_env(scopes: "github:owner/repo,github:owner/.github,github:owner/repo,jira:PROJECT,teams:team/team-id/channel/19:channel@thread.tacv2,discord:channel/130000000000000001") do
-    # Presence-only diagnostic fixtures; not usable credentials. The transport
-    # raises if any code accidentally tries to poll while scheduling.
-    registry, transport = poll_schedule_registry(
-      "GITHUB_APP_ID" => "fixture-app", "GITHUB_INSTALLATION_ID" => "fixture-installation", "GITHUB_PRIVATE_KEY" => "not-a-private-key",
-      "JIRA_EMAIL" => "fixture@example.invalid", "JIRA_API_TOKEN" => "not-a-token", "JIRA_SITE_URL" => "https://jira.example.invalid",
-      "TEAMS_TENANT_ID" => "fixture-tenant", "TEAMS_CLIENT_ID" => "fixture-client", "TEAMS_CLIENT_SECRET" => "not-a-secret",
-      "DISCORD_BOT_TOKEN" => "not-a-token"
-    )
+  with_workflow_env(scopes: "github:owner/repo,github:owner/.github,github:owner/repo,discord:channel/130000000000000001,jira:PROJECT,teams:team/t/channel/c") do
+    # Database-backed accounts (presence-only fixtures; not usable
+    # credentials). The transport raises if any code accidentally tries to
+    # poll while scheduling. Removed plugins (jira/teams) are skipped.
+    configure_poll_accounts
+    registry, transport = poll_schedule_registry
     # Disabling interaction AI drafting must not stop deterministic ingestion.
     LayerPolicy.create!(layer: "interaction", provider: "codex", enabled: false)
     prior_ids = SolidQueue::Job.where(class_name: "InteractionPollJob").pluck(:id)
 
-    expect(poll_schedule_job(registry).perform_now).to eq(5)
+    expect(poll_schedule_job(registry).perform_now).to eq(3)
 
     jobs = poll_schedule_rows(prior_ids)
     expect(jobs.map { |job| job.arguments.fetch("arguments") }).to eq([
-      ["github", "owner/repo"], ["github", "owner/.github"], ["jira", "PROJECT"],
-      ["teams", "team/team-id/channel/19:channel@thread.tacv2"],
+      ["github", "owner/repo"], ["github", "owner/.github"],
       ["discord", "channel/130000000000000001"]
     ])
     expect(jobs.all? { |job| job.queue_name == "control" && job.ready_execution.present? }).to eq(true)
@@ -72,33 +80,26 @@ test("poll scheduler skips wildcards malformed destinations unknown and unconfig
     "github:owner/*", "github:*/repo", "github:owner/re?o", "github:owner/[repo]",
     "github:owner/%2A", "github:issue:owner/repo#1", "github:https://github.com/owner/repo",
     "github:owner/..", "github:owner/with space", "github:owner/repo",
-    "jira:*", "jira:project", "jira:issue:PROJECT-1", "jira:PROJECT",
-    "teams:team/*/channel/channel-id", "teams:channel:team-id/channel-id",
-    "teams:conversation:channel-id", "teams:team/team-id/channel/channel-id",
     "discord:channel/*", "discord:channel:not-an-id", "discord:channel:130000000000000001",
     "discord:message:130000000000000001/130000000000000002",
     "discord:channel/130000000000000001/extra", "discord:https://discord.com/channels/1/2",
+    "discord:channel/130000000000000001",
     "unknown:owner/repo"
   ].join(",")
   with_workflow_env(scopes: scopes) do
-    environment = {
-      "GITHUB_APP_ID" => "fixture-app", "GITHUB_INSTALLATION_ID" => "fixture-installation", "GITHUB_PRIVATE_KEY_FILE" => "/not/read/by/catalog"
-    }
-    registry, transport = poll_schedule_registry(environment)
+    configure_poll_accounts(discord: false)
+    registry, transport = poll_schedule_registry
     prior_ids = SolidQueue::Job.where(class_name: "InteractionPollJob").pluck(:id)
     expect(poll_schedule_job(registry).perform_now).to eq(1)
     expect(poll_schedule_rows(prior_ids).map { |job| job.arguments.fetch("arguments") }).to eq([["github", "owner/repo"]])
 
-    # On the next tick newly configured plugins become eligible, but Jira's
-    # normally supported '*' and Teams wildcards/write targets remain barred.
-    environment.merge!(
-      "JIRA_EMAIL" => "fixture@example.invalid", "JIRA_API_TOKEN" => "not-a-token", "JIRA_SITE_URL" => "https://jira.example.invalid",
-      "TEAMS_TENANT_ID" => "fixture-tenant", "TEAMS_CLIENT_ID" => "fixture-client", "TEAMS_CLIENT_SECRET" => "not-a-secret"
-    )
+    # On the next tick the newly configured Discord account becomes
+    # eligible, but wildcards and write targets remain barred.
+    configure_poll_accounts(github: false, discord: true)
     next_prior_ids = SolidQueue::Job.where(class_name: "InteractionPollJob").pluck(:id)
-    expect(poll_schedule_job(registry).perform_now).to eq(3)
+    expect(poll_schedule_job(registry).perform_now).to eq(2)
     expect(poll_schedule_rows(next_prior_ids).map { |job| job.arguments.fetch("arguments") }).to eq([
-      ["github", "owner/repo"], ["jira", "PROJECT"], ["teams", "team/team-id/channel/channel-id"]
+      ["github", "owner/repo"], ["discord", "channel/130000000000000001"]
     ])
     expect(transport.calls).to eq([])
   end

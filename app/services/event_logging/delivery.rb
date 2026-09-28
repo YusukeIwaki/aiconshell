@@ -4,9 +4,9 @@ require "logger"
 require "aiconshell/observability" unless defined?(Aiconshell::Observability)
 
 module EventLogging
-  # Rails wiring for asynchronous delivery: ActiveRecord outbox, ClickHouse
-  # adapter from ENV, Teams sink through the plugins port. Called by
-  # EventLogDeliveryJob; never called synchronously from request paths.
+  # Rails wiring for asynchronous delivery: ActiveRecord outbox and the
+  # ClickHouse adapter from ENV. Called by EventLogDeliveryJob; never
+  # called synchronously from request paths.
   module Delivery
     module_function
 
@@ -20,7 +20,7 @@ module EventLogging
 
     def service(outbox: default_outbox, clock: Time)
       Aiconshell::Observability::DeliveryService.new(
-        outbox:, clickhouse: clickhouse_adapter, teams: teams_sink,
+        outbox:, clickhouse: clickhouse_adapter,
         logger: app_logger, clock:
       )
     end
@@ -36,20 +36,6 @@ module EventLogging
         username: presence(ENV["CLICKHOUSE_USER"]),
         password: presence(ENV["CLICKHOUSE_PASSWORD"])
       )
-    end
-
-    def teams_sink
-      Aiconshell::Observability::TeamsSink.new(registry: plugins_registry, logger: app_logger)
-    end
-
-    # The plugins port belongs to another lane (docs/architecture.md): resolve
-    # it defensively so EventLog keeps working before/after that integration.
-    def plugins_registry
-      return nil unless defined?(Aiconshell::Plugins::Registry)
-
-      Aiconshell::Plugins::Registry.default
-    rescue StandardError
-      nil
     end
 
     def default_outbox

@@ -30,9 +30,10 @@ class ReviewGithubTransport
   end
 end
 
-def review_sender(registry:, clock: Time)
+def review_sender(registry:, clock: Time, credential_source: nil)
   Interaction::OutboundService.new(registry: registry, clock: clock,
-    ai_runner: WorkflowFakes::FakeAiRunner.new, event_sink: WorkflowFakes::FakeEventSink.new)
+    ai_runner: WorkflowFakes::FakeAiRunner.new, event_sink: WorkflowFakes::FakeEventSink.new,
+    credential_source: credential_source || WorkflowFakes::FakeCredentialSource.new)
 end
 
 def review_action(plugin: "github", input: { "resource_id" => "issue:owner/repo#1", "body" => "Update" }, **attrs)
@@ -63,10 +64,11 @@ test("GitHub reply crosses the real registry with repository authorization") do 
     transport = ReviewGithubTransport.new
     env = { "GITHUB_APP_ID" => "123", "GITHUB_INSTALLATION_ID" => "456",
       "GITHUB_PRIVATE_KEY" => OpenSSL::PKey::RSA.new(2048).to_pem }
-    registry = Aiconshell::Plugins::Registry.new(env: env, transport: transport)
+    registry = Aiconshell::Plugins::Registry.new(env: {}, transport: transport)
       .register(Aiconshell::Plugins::Github.new)
+    source = WorkflowFakes::FakeCredentialSource.new("github" => env)
     action = review_action
-    expect(review_sender(registry: registry).call(action.id).ok).to eq(true)
+    expect(review_sender(registry: registry, credential_source: source).call(action.id).ok).to eq(true)
     expect(action.reload.external_id).to eq("456")
     expect(transport.calls.last[:url]).to eq("https://api.github.com/repos/owner/repo/issues/1/comments")
     expect(JSON.parse(transport.calls.last[:body])).to eq({ "body" => "Update" })
@@ -111,14 +113,14 @@ test("PostgreSQL insert failure retains cursor and does not poison the caller tr
   end
 end
 
-test("system context is preserved while configured service-account echoes are ignored") do |db:|
-  with_workflow_env(scopes: "jira:APP") do
-    with_review_env("AICONSHELL_SELF_ACTOR_IDS", "jira:service-account") do
+test("system context is preserved while configured self-actor echoes are ignored") do |db:|
+  with_workflow_env(scopes: "github:owner/repo") do
+    with_review_env("AICONSHELL_SELF_ACTOR_IDS", "github:service-account") do
       human = WorkflowFakes::FakePluginRegistry.human_event(actor_id: "service-account")
       system = WorkflowFakes::FakePluginRegistry.human_event(event_id: "status", actor_id: "system")
         .merge("actor_type" => "system")
-      registry = WorkflowFakes::FakePluginRegistry.new(events_by_scope: { "APP" => [human, system] })
-      Interaction::PollService.new(registry: registry).call(plugin: "jira", scope: "APP")
+      registry = WorkflowFakes::FakePluginRegistry.new(events_by_scope: { "owner/repo" => [human, system] })
+      Interaction::PollService.new(registry: registry).call(plugin: "github", scope: "owner/repo")
       expect(ExternalEvent.find_by(event_id: human["event_id"]).processed?).to eq(true)
       expect(ExternalEvent.find_by(event_id: "status").processed?).to eq(false)
     end

@@ -11,10 +11,9 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
 | --- | --- | --- |
 | 管理画面・APIからの依頼、受付と重複 | [task-requests.md](task-requests.md)、[admin.md](admin.md) | `app/services/interaction/`、`app/controllers/{admin,api}/`、`smartest/integration/acceptance/` |
 | タスク状態・優先度・dispatch・外部送信 | [workflow.md](workflow.md) | `app/services/{interaction,coordination,execution}/`、`smartest/integration/workflow/` |
-| GitHub / Teams / Jira / Discord の操作 | [architecture.md の Plugins](architecture.md#plugins)、[各 plugin README](../plugins/) | `lib/aiconshell/plugins/`、`plugins/`、`smartest/plugins/` |
+| GitHub / Discord の操作・アカウント | [architecture.md の Plugins](architecture.md#plugins)、[各 plugin README](../plugins/) | `lib/aiconshell/plugins/`、`plugins/`、`app/models/*_account.rb`、`app/services/accounts*`、`smartest/plugins/` |
 | AIの仕事・provider/model/effort・process分離 | [ai-providers.md](ai-providers.md) | `lib/aiconshell/ai/`、`smartest/ai/` |
 | AIポリシーの接続表示・ログイン・状態確認 | [ai-connections.md](ai-connections.md)、CLI変更時は [ai-auth-protocol.md](ai-auth-protocol.md) | `Admin::AiStatus`、`AiAuth::RequestService` / `WorkerService`、`AiConnection` / `AiAuthSession`、`smartest/integration/ai_auth/`、`smartest/integration/admin/` |
-| ユーザー委任OAuthの接続・token管理 | [oauth-connections.md](oauth-connections.md) | `Aiconshell::Oauth::*`、`Oauth::AuthService` / `TokenService` / `CredentialProvider`、`OauthConnection` / `OauthAuthAttempt`、`smartest/unit/oauth/`、`smartest/integration/oauth/` |
 | EventLog・検索・配送 | [event-log.md](event-log.md) | `lib/aiconshell/observability/`、`smartest/{unit,integration}/observability/` |
 | Docker・worker queue・Railway・環境分離 | [deployment.md](deployment.md)、[railway-environments.md](railway-environments.md) | `Dockerfile`、`compose.yml`、`config/queue_execution.yml`・`config/queue.yml`、`railway.execution.toml`、`bin/check-compose` |
 
@@ -38,7 +37,7 @@ Issue は「今回何を変えるか」、以下の資料は「継続して守�
   ネットワークやAI待ちの間にDB transactionを保持しない。
 - **受付・完了・不明を区別する。** queueへの受付を外部処理の成功と表示しない。
   `waiting_delivery` の確定は reconciler の責務。不確定な送信を自動で再送しない。
-- **ログには安全な分類だけ。** EventLogは PostgreSQL outbox → ClickHouse/任意Teams の
+- **ログには安全な分類だけ。** EventLogは PostgreSQL outbox → ClickHouse の
   結果整合。層名は interaction / coordination / execution の3つで、controlという層はない。
   認証URL・コード・CLI出力・生例外は記録しない。
 

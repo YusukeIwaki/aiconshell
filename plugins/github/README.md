@@ -4,18 +4,19 @@ GitHub App として動作する in-process プラグイン。resource API の p
 issue / comment / review / workflow 更新を取得し、コメント返信と issue 作成を行う。
 Events API（timeline）一本には依存しない。
 
-## 必要な環境変数
+## 認証情報（DB の GitHub Apps アカウント）
 
-| 変数 | 必須 | 説明 |
-| --- | --- | --- |
-| `GITHUB_APP_ID` | 必須 | GitHub App ID（数値） |
-| `GITHUB_INSTALLATION_ID` | 必須 | 対象 installation の ID（数値） |
-| `GITHUB_PRIVATE_KEY` | どちらか必須 | App の PEM 秘密鍵（PEM 本文） |
-| `GITHUB_PRIVATE_KEY_FILE` | どちらか必須 | PEM を格納した private ファイルのパス |
-| `GITHUB_API_URL` | 任意 | HTTPS API ベース URL。既定 `https://api.github.com`（GHES 用に変更可。userinfo・query・fragment は不可） |
+App ID・installation ID・秘密鍵・API ベース URL を管理画面のアカウント
+ページで設定する。環境変数では渡さない。秘密鍵は `.pem` ファイルを
+アップロードし、内容を DB へ暗号化保存する（RSA 秘密鍵として読めること
+を保存前に検証する）。アダプターが受け取る環境形ハッシュのキーは
+`GITHUB_APP_ID` / `GITHUB_INSTALLATION_ID` / `GITHUB_PRIVATE_KEY` /
+`GITHUB_API_URL` のまま（`GITHUB_PRIVATE_KEY_FILE` によるファイル参照も
+引き続き可能だが、通常運用では使わない）。
 
-秘密鍵は `GITHUB_PRIVATE_KEY` 直書きか `GITHUB_PRIVATE_KEY_FILE` のどちらかで渡す。
-両方ある場合は直書きが優先される。秘密の値はログ・EventLog・catalog に出さない。
+API ベース URL は既定 `https://api.github.com`（GHES 用に変更可。
+userinfo・query・fragment は不可）。秘密の値はログ・EventLog・catalog・
+管理画面に出さない。管理画面には公開鍵の指紋（非秘密）のみ表示する。
 
 ## 最小権限（App permissions）
 
@@ -36,12 +37,13 @@ poll のみの場合:
 
 ## 使用エンドポイント
 
-ベースは `GITHUB_API_URL`（既定 `https://api.github.com`）。
+ベースはアカウントの API ベース URL（既定 `https://api.github.com`）。
 `{owner}/{repo}` は `scope` の `owner/repo`。
 
 | 操作 | メソッド・パス |
 | --- | --- |
 | App JWT → installation token | `POST /app/installations/{installation_id}/access_tokens` |
+| health_check: 権限確認 | `GET /app/installations/{installation_id}`（App JWT 認証） |
 | latest_events: issues | `GET /repos/{owner}/{repo}/issues?state=all&sort=updated&direction=desc&per_page=25` |
 | latest_events: 全 issue コメント | `GET /repos/{owner}/{repo}/issues/comments?sort=updated&direction=desc&per_page=100&since=...` |
 | latest_events: 旧 issue 判定 | `GET /repos/{owner}/{repo}/issues/{number}`（親が一覧に無い場合のみ） |
@@ -61,6 +63,12 @@ poll のみの場合:
   途中で HTTP・検証エラーが発生した場合は例外を送出し、部分 cursor を返さない。
 - `reply`: `resource_id` は `issue:owner/repo#123` / `pr:owner/repo#123`。
 - `create_issue`: `scope` は `owner/repo`。
+- `health_check`（`read_only: true`）: installation を読み、疎通と必要権限
+  （`issues:write` / `pull_requests:write` / `actions:read`）の有無を確認する。
+  入力は `{}`、出力は `{"ok": bool, "missing": ["issues:write", ...]}`。
+  権限不足は `ok: false` で返し、認証・疎通の失敗は型付きエラーで送出する。
+  管理画面の接続確認から使い、AI の型付き読み取り対象にはしない（scope を
+  持たないため allowlist 検証で拒否される）。
 - `list_issues`（`read_only: true`）: 現在の open issue を 1 ページ分読む
   on-demand 照会。`pull_request` キーを持つ PR は除外する。入力は
   `{"scope": "owner/repo", "cursor": null または {"version":1,"scope":"owner/repo","page":N}}`。
@@ -188,7 +196,8 @@ issue の actor は元の作成者であり、最後の編集者を特定する�
 
 `RBENV_VERSION=3.4.9 rbenv exec bundle exec smartest smartest/plugins` で fake HTTP の
 契約テストを実行する。大量履歴の再開、stream ごとの進捗、古い再実行・review 編集、
-offset の削除変動、親 metadata による自己返信ループ、cursor の scope/URL 検証を含む。
+offset の削除変動、親 metadata による自己返信ループ、cursor の scope/URL 検証、
+health_check の権限確認を含む。
 実アカウントによる認証・API paging・投稿はこの単体テストでは確認しない。
 
 ## 公式ドキュメント

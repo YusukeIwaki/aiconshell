@@ -21,30 +21,13 @@ module Aiconshell
     # - input is schema-validated before any external I/O
     # - output is schema-validated before it is returned
     class Registry
-      OAUTH_PLUGINS = %w[jira_oauth teams_oauth].freeze
-      LEGACY_PLUGINS = %w[github jira teams].freeze
-
       def self.default
         @default ||= begin
           registry = new
           registry.register(Github.new)
-          registry.register(Jira.new)
-          registry.register(Teams.new)
-          # Delegated OAuth adapters (issue #26). Pure-Ruby registration
-          # only: no Rails credential provider is held here. Interaction
-          # services supply the trusted oauth_binding /
-          # oauth_credential_provider in the invoke context just-in-time.
-          # Catalog `configured` reflects OAUTH_* env presence only, never
-          # connection success (shown by #23/#26 status).
-          registry.register(JiraOauth.new)
-          registry.register(TeamsOauth.new)
           registry.register(Discord.new)
           registry
         end
-      end
-
-      def self.oauth_plugin?(plugin)
-        OAUTH_PLUGINS.include?(plugin.to_s)
       end
 
       def initialize(env: ENV, transport: nil, clock: Time)

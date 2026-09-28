@@ -52,28 +52,6 @@ module EventLogTestSupport
     end
   end
 
-  # Fake plugins registry following the docs/architecture.md port shape.
-  class FakePluginsRegistry
-    attr_reader :invocations
-
-    def initialize(catalog: nil, error: nil)
-      @catalog = catalog.nil? ? [{ "id" => "teams", "configured" => true }] : catalog
-      @error = error
-      @invocations = []
-    end
-
-    def catalog
-      @catalog
-    end
-
-    def invoke(plugin:, operation:, input:, context:)
-      @invocations << { plugin:, operation:, input:, context: }
-      raise @error if @error
-
-      { "external_id" => "msg-1", "url" => nil }
-    end
-  end
-
   class FakeClickHouseSink
     attr_reader :inserted
 
@@ -87,27 +65,6 @@ module EventLogTestSupport
 
       @inserted.concat(envelopes)
       envelopes.size
-    end
-  end
-
-  class FakeTeamsSink
-    attr_reader :delivered_records
-
-    def initialize(enabled: true, error: nil)
-      @enabled = enabled
-      @error = error
-      @delivered_records = []
-    end
-
-    def enabled?
-      @enabled
-    end
-
-    def deliver(record)
-      raise @error if @error
-
-      @delivered_records << record
-      :delivered
     end
   end
 

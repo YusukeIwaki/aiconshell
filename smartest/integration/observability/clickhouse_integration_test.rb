@@ -16,7 +16,7 @@ def seed_events(adapter)
     occurred_at: (CH_TEST_BASE_TIME + 3600).iso8601(3)
   )
   third = EventLogTestSupport.build_envelope(
-    layer: "interaction", kind: "message.received", message: "Hello from Teams",
+    layer: "interaction", kind: "message.received", message: "Hello from Discord",
     task_id: nil, correlation_id: nil, data: { "channel" => "general" },
     occurred_at: (CH_TEST_BASE_TIME + 7200).iso8601(3)
   )
@@ -31,7 +31,7 @@ test("shipped init SQL applies and round-trips envelopes newest-first") do |ch_e
 
   expect(rows.size).to eq(3)
   expect(rows.map { |row| row["event_id"] }).to eq([third["event_id"], rows[1]["event_id"], first["event_id"]])
-  expect(rows.first["message"]).to eq("Hello from Teams")
+  expect(rows.first["message"]).to eq("Hello from Discord")
   expect(rows.first["data"]).to eq({ "channel" => "general" })
   expect(rows.first["task_id"]).to be_nil
   expect(ch_event_log.exists?(third["event_id"])).to eq(true)

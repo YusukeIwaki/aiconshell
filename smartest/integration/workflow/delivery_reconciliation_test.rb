@@ -225,8 +225,8 @@ test("work context exposes bounded prior result and delivery metadata without bo
       idempotency_key: "ctx-1", delivery_batch_key: "result-ctx-1",
       status: "failed", error_code: "delivery_rejected", error: "Outbound delivery: delivery_rejected")
     OutboundAction.create!(
-      plugin: "teams", operation: "send_message", task: task,
-      input: { "scope" => "team/t1/channel/c1", "body" => "secret-body-ctx" },
+      plugin: "discord", operation: "send_message", task: task,
+      input: { "scope" => "channel:130000000000000001", "body" => "secret-body-ctx" },
       idempotency_key: "ctx-2", delivery_batch_key: "result-ctx-1",
       status: "sent", external_id: "ext-9")
 
@@ -236,8 +236,8 @@ test("work context exposes bounded prior result and delivery metadata without bo
     expect(context["deliveries"]).to eq([
       { "batch_key" => "result-ctx-1", "plugin" => "github", "operation" => "reply",
         "destination" => "owner/repo", "status" => "failed", "error_code" => "delivery_rejected" },
-      { "batch_key" => "result-ctx-1", "plugin" => "teams", "operation" => "send_message",
-        "destination" => "team/t1/channel/c1", "status" => "sent", "error_code" => nil }
+      { "batch_key" => "result-ctx-1", "plugin" => "discord", "operation" => "send_message",
+        "destination" => "channel/130000000000000001", "status" => "sent", "error_code" => nil }
     ])
     expect(JSON.generate(context).include?("secret-body-ctx")).to eq(false)
 
